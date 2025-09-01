@@ -30,23 +30,17 @@
     (println (str "   JSON string: " json-str))
     (println (str "   Parsed back: " (json/read-str json-str)))))
 
-(defn -main [& args]
+(defn -main 
+  "Main entry point for the application"
+  [& args]
   (println "Welcome to Clojure CLR with MSBuild Integration!")
   (println (str "Arguments received: " (vec args)))
   (demonstrate-nuget-integration)
-  (println "\n=== Example completed successfully! ===")
-  (System.Environment/Exit 0))
-
-;; Entry point for REPL testing
-(defn run []
-  (-main))
-
-;; Run the main function when this file is loaded
-(-main)
+  (println "\n=== Example completed successfully! ==="))
 
 (comment
   ;; REPL test commands:
-  (run)
+  (-main)
   (demonstrate-nuget-integration)
   
   ;; Test individual integrations:

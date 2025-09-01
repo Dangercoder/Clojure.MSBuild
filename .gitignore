@@ -1,3 +1,6 @@
 obj
 bin
-
+clojure-clr/
+*.dll
+tools
+*.exe

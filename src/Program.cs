@@ -53,6 +53,19 @@ class Program
         AppDomain.CurrentDomain.AssemblyResolve += AssemblyResolver;
         
         Console.WriteLine($"Assembly resolver configured for: {_outputDir}");
+        
+        // Set CLOJURE_LOAD_PATH to include src directory
+        var srcDir = Path.Combine(Environment.CurrentDirectory, "src");
+        Console.WriteLine($"Checking for src directory at: {srcDir}");
+        if (Directory.Exists(srcDir))
+        {
+            Environment.SetEnvironmentVariable("CLOJURE_LOAD_PATH", srcDir);
+            Console.WriteLine($"Set CLOJURE_LOAD_PATH to: {srcDir}");
+        }
+        else
+        {
+            Console.WriteLine($"src directory not found at: {srcDir}");
+        }
 
         // Pre-load package assemblies using deps.json if available
         var depsFile = Path.ChangeExtension(assemblyPath, ".deps.json");
@@ -120,7 +133,7 @@ class Program
                     Console.WriteLine("Error: --namespaces required for compile mode");
                     Environment.Exit(1);
                 }
-                CompileNamespaces(rtType, varMethod!, internSymbolMethod!, namespaces, compilePath ?? Path.Combine(_outputDir!, "compiled"));
+                CompileNamespaces(clojureAssembly, rtType, varMethod!, internSymbolMethod!, namespaces, compilePath ?? Path.Combine(_outputDir!, "compiled"));
                 break;
                 
             default:
@@ -333,7 +346,7 @@ class Program
         }
     }
     
-    static void CompileNamespaces(Type rtType, MethodInfo varMethod, MethodInfo internSymbolMethod, string namespaces, string compilePath)
+    static void CompileNamespaces(Assembly clojureAssembly, Type rtType, MethodInfo varMethod, MethodInfo internSymbolMethod, string namespaces, string compilePath)
     {
         Console.WriteLine($"Compiling namespaces to: {compilePath}");
         
@@ -348,14 +361,17 @@ class Program
             var requireInvokeMethod = require!.GetType().GetMethod("invoke", new[] { typeof(object) });
             requireInvokeMethod!.Invoke(require, new[] { clojureCoreSym });
             
+            // Get Var class for thread bindings
+            var varType = clojureAssembly.GetType("clojure.lang.Var");
+            
             // Get binding functions
-            var pushThreadBindings = rtType.GetMethod("pushThreadBindings", BindingFlags.Public | BindingFlags.Static);
-            var popThreadBindings = rtType.GetMethod("popThreadBindings", BindingFlags.Public | BindingFlags.Static);
+            var pushThreadBindings = varType!.GetMethod("pushThreadBindings", BindingFlags.Public | BindingFlags.Static);
+            var popThreadBindings = varType.GetMethod("popThreadBindings", BindingFlags.Public | BindingFlags.Static);
             var mapMethod = rtType.GetMethod("map", BindingFlags.Public | BindingFlags.Static);
             
             if (pushThreadBindings == null || popThreadBindings == null || mapMethod == null)
             {
-                throw new Exception("Could not find required RT methods for thread bindings");
+                throw new Exception("Could not find required methods for thread bindings");
             }
             
             // Get compile-path and compile-files vars
