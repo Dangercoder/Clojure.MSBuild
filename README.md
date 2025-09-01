@@ -1,4 +1,4 @@
-# Clojure.MSBuild
+# Clojure.MSBuild (Experimental)
 
 MSBuild integration for Clojure CLR projects with automatic entry point generation.
 
