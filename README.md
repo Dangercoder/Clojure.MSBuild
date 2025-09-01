@@ -1,4 +1,4 @@
-# Clojure.MSBuild
+# Clojure.MSBuild (Experimental)
 
 MSBuild integration for Clojure CLR projects, enabling seamless development with .NET tooling and full NuGet package support.
 
