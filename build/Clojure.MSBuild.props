@@ -18,4 +18,9 @@
     <!-- If not specified, defaults to finding namespace with -main function -->
     <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''"></ClojureNamespacesToCompile>
   </PropertyGroup>
+  
+  <!-- Make ClojureMainNamespace visible to source generators -->
+  <ItemGroup>
+    <CompilerVisibleProperty Include="ClojureMainNamespace" />
+  </ItemGroup>
 </Project>

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ClojureMainNamespace>main</ClojureMainNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Clojure.MSBuild" Version="0.3.0" />
+    <PackageReference Include="Clojure" Version="1.12.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="src/**/*.clj">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

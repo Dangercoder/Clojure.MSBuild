@@ -1,56 +1,17 @@
-# Clojure.MSBuild (Experimental)
+# Clojure.MSBuild
 
-MSBuild integration for Clojure CLR projects, enabling seamless development with .NET tooling and full NuGet package support.
+MSBuild integration for Clojure CLR projects with automatic entry point generation.
 
-## Features
+## Quick Start
 
-- 🚀 **Run Clojure REPL** with all NuGet dependencies automatically loaded
-- 📦 **NuGet Package Integration** - Use any .NET package from Clojure without manual assembly loading  
-- 🔧 **MSBuild Targets** for common Clojure development tasks
-- 🏗️ **AOT Compilation** support (experimental)
-- 🧪 **Test Runner** integration
-- 📜 **File Execution** with full dependency context
+### 1. Create a new .NET project
 
-## Installation
-
-Add to your `.csproj`:
-
-```xml
-<PackageReference Include="Clojure.MSBuild" Version="0.1.4" />
-```
-
-## Usage
-
-After adding the package, you get these MSBuild targets:
-
-### Start a REPL
 ```bash
-dotnet msbuild -t:ClojureRepl
+dotnet new console -n MyClojureApp
+cd MyClojureApp
 ```
 
-### Start nREPL server
-```bash
-dotnet msbuild -t:ClojureNRepl
-```
-
-### Run a Clojure file
-```bash
-dotnet msbuild -t:ClojureRun -p:File=my-file.clj
-```
-
-### Run tests
-```bash
-dotnet msbuild -t:ClojureTest
-```
-
-### AOT Compilation (Experimental)
-```bash
-dotnet msbuild -t:ClojureCompile -p:ClojureNamespacesToCompile=my.namespace
-```
-
-## Complete Project Setup
-
-### 1. Create a new project folder and `.csproj` file:
+### 2. Update your .csproj file
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
@@ -58,128 +19,85 @@ dotnet msbuild -t:ClojureCompile -p:ClojureNamespacesToCompile=my.namespace
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>
-    <!-- Important: Ensures all dependencies are copied to output -->
-    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <ClojureMainNamespace>main</ClojureMainNamespace>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Clojure.MSBuild provides the tooling -->
-    <PackageReference Include="Clojure.MSBuild" Version="0.1.4" />
-    
-    <!-- Clojure runtime -->
+    <PackageReference Include="Clojure.MSBuild" Version="0.3.0" />
     <PackageReference Include="Clojure" Version="1.12.2" />
-    
-    <!-- Add any NuGet packages you want to use from Clojure -->
-    <PackageReference Include="Npgsql" Version="8.0.6" />
-    <PackageReference Include="clojure.data.json" Version="2.4.1" />
-    <PackageReference Include="Serilog" Version="4.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="src/**/*.clj">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>
 ```
 
-### 2. Create a minimal `Program.cs` (required by .NET but not used):
+### 3. Create your Clojure code
 
-```csharp
-public class Program 
-{
-    public static void Main() 
-    {
-        System.Console.WriteLine("Use MSBuild targets to run Clojure code:");
-        System.Console.WriteLine("  dotnet msbuild -t:ClojureRepl");
-    }
-}
-```
+Create `src/main.clj`:
 
-### 3. Create your Clojure code in `src/` folder:
-
-**src/my_app/core.clj:**
 ```clojure
-(ns my-app.core
-  (:require [clojure.data.json :as json])
-  (:import [Npgsql NpgsqlConnection]
-           [Serilog Log LoggerConfiguration]))
+(ns main)
 
-(defn setup-logger []
-  (let [logger (-> (LoggerConfiguration.)
-                   (.WriteTo.Console)
-                   (.CreateLogger))]
-    (Log/set_Logger logger)
-    logger))
-
-(defn query-db [conn-string]
-  (with-open [conn (NpgsqlConnection. conn-string)]
-    (.Open conn)
-    ;; Your database code here
-    ))
-
-(defn -main [& args]
-  (setup-logger)
-  (Log/Information "Application started")
-  (println (json/write-str {:status "ready" :args args})))
+(defn -main 
+  [& args]
+  (println "Hello from Clojure CLR!")
+  (when (seq args)
+    (println "Arguments:" (vec args))))
 ```
 
-### 4. Build and run:
+### 4. Run your application
 
 ```bash
-# Build the project
+# Using dotnet run
+dotnet run
+dotnet run -- arg1 arg2
+
+# Or build and run the DLL directly
 dotnet build
-
-# Start a REPL with all dependencies loaded
-dotnet msbuild -t:ClojureRepl
-
-# Or run a file
-dotnet msbuild -t:ClojureRun -p:File=src/my_app/core.clj
+dotnet bin/Debug/net9.0/MyClojureApp.dll
+dotnet bin/Debug/net9.0/MyClojureApp.dll arg1 arg2
 ```
 
-## How it works
+## How It Works
 
-Clojure.MSBuild solves a fundamental problem in Clojure CLR: NuGet packages aren't automatically available to Clojure code.
+Clojure.MSBuild uses a source generator to automatically create the .NET entry point for your Clojure application. You just need to:
 
-**The Problem:** When you add a NuGet package to your project, Clojure's `RT.classForName` can't find the types because .NET doesn't automatically load assemblies from disk (unlike the JVM's ClassLoader).
+1. Set `ClojureMainNamespace` to your main namespace
+2. Define a `-main` function in that namespace
+3. Build and run like any .NET application
 
-**The Solution:** Clojure.MSBuild pre-loads all package assemblies from your project's `deps.json` file before initializing Clojure, making them immediately available for `import` statements.
+No manual Program.cs needed - the source generator handles everything behind the scenes.
 
-This means you can:
-- Use any NuGet package without manual assembly loading
-- Import types naturally: `(:import [Npgsql NpgsqlConnection])`
-- Leverage the entire .NET ecosystem from Clojure
+## REPL Support
+
+Start a REPL for interactive development:
+
+```bash
+dotnet msbuild /t:ClojureRepl
+```
 
 ## Configuration Options
 
-You can configure Clojure.MSBuild behavior in your `.csproj`:
+| Property | Description | Default |
+|----------|-------------|---------|
+| `ClojureMainNamespace` | Namespace containing your -main function | Required for executables |
+| `ClojureReplEnabled` | Enable REPL target | true |
+| `ClojureAutoLoadAssemblies` | Auto-load NuGet assemblies in REPL | true |
 
-```xml
-<PropertyGroup>
-  <!-- Enable AOT compilation during build -->
-  <ClojureCompileOnBuild>true</ClojureCompileOnBuild>
-  
-  <!-- Set compilation output path -->
-  <ClojureCompilePath>$(OutputPath)compiled</ClojureCompilePath>
-  
-  <!-- Specify namespaces to compile (semicolon-separated) -->
-  <ClojureNamespacesToCompile>my.app;my.lib</ClojureNamespacesToCompile>
-</PropertyGroup>
-```
+## Example Project
 
-## Troubleshooting
+See the `/examples/simple` folder for a minimal working example.
 
-**Issue:** Types from NuGet packages not found
-- **Solution:** Ensure `<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>` is set in your `.csproj`
+## Requirements
 
-**Issue:** REPL doesn't start
-- **Solution:** Run `dotnet build` first to ensure all dependencies are in the output directory
-
-**Issue:** AOT compilation creates DLLs but they don't run standalone
-- **Note:** This is a current limitation of Clojure CLR - compiled DLLs still require source files for initialization
+- .NET 9.0 SDK or later
+- Clojure CLR 1.12.2 or later
 
 ## License
 
-MIT License (or your chosen license)
-
-## Contributing
-
-Contributions welcome! The package is structured as:
-- `src/Clojure.MSBuild.Tool/` - Core tool that handles assembly loading
-- `build/` - MSBuild targets and props
-- `tools/` - Compiled tool binaries for packaging
+MIT

@@ -4,7 +4,7 @@
     <TargetFramework>netstandard2.0</TargetFramework>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>Clojure.MSBuild</PackageId>
-    <Version>0.2.1</Version>
+    <Version>0.3.0</Version>
     <Authors>Clojure CLR Contributors</Authors>
     <Description>MSBuild integration for Clojure CLR projects. Provides REPL, test, and build targets.</Description>
     <PackageTags>clojure;clr;msbuild;repl</PackageTags>
@@ -23,6 +23,12 @@
     
     <!-- Include the tool executable -->
     <Content Include="tools\**\*" PackagePath="tools\" />
+    
+    <!-- Include the source generator -->
+    <None Include="src\Clojure.MSBuild.SourceGenerators\bin\Release\netstandard2.0\Clojure.MSBuild.SourceGenerators.dll" 
+          Pack="true" 
+          PackagePath="analyzers/dotnet/cs" 
+          Visible="false" />
   </ItemGroup>
 
   <ItemGroup>

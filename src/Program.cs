@@ -54,7 +54,7 @@ class Program
         
         Console.WriteLine($"Assembly resolver configured for: {_outputDir}");
         
-        // Set CLOJURE_LOAD_PATH to include src directory
+        // Set CLOJURE_LOAD_PATH to include src directory BEFORE RT.Init()
         var srcDir = Path.Combine(Environment.CurrentDirectory, "src");
         Console.WriteLine($"Checking for src directory at: {srcDir}");
         if (Directory.Exists(srcDir))
@@ -360,6 +360,17 @@ class Program
             var clojureCoreSym = internSymbolMethod.Invoke(null, new[] { "clojure.core" });
             var requireInvokeMethod = require!.GetType().GetMethod("invoke", new[] { typeof(object) });
             requireInvokeMethod!.Invoke(require, new[] { clojureCoreSym });
+            
+            // Also load clojure.core.specs.alpha if available (required for some compilations)
+            try
+            {
+                var specsSym = internSymbolMethod.Invoke(null, new[] { "clojure.core.specs.alpha" });
+                requireInvokeMethod!.Invoke(require, new[] { specsSym });
+            }
+            catch
+            {
+                // Ignore if specs not available
+            }
             
             // Get Var class for thread bindings
             var varType = clojureAssembly.GetType("clojure.lang.Var");
