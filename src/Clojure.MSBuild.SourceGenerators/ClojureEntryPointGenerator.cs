@@ -51,56 +51,65 @@ namespace Clojure.MSBuild.SourceGenerators
 using System;
 using System.Reflection;
 using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Text.Json;
 
 namespace ClojureGenerated
 {{
     public class Program
     {{
+        static string _outputDir = null;
+        
         public static void Main(string[] args)
         {{
             try
             {{
-                // Initialize Clojure runtime
-                var clojureAssembly = Assembly.Load(""Clojure"");
+                _outputDir = AppDomain.CurrentDomain.BaseDirectory;
+                
+                // Set up assembly resolver BEFORE initializing Clojure
+                // This will load assemblies on-demand when Clojure needs them
+                AppDomain.CurrentDomain.AssemblyResolve += AssemblyResolver;
+                
+                // Set CLOJURE_LOAD_PATH to include src directory BEFORE RT.Init()
+                var srcDir = Path.Combine(Environment.CurrentDirectory, ""src"");
+                if (Directory.Exists(srcDir))
+                {{
+                    Environment.SetEnvironmentVariable(""CLOJURE_LOAD_PATH"", srcDir);
+                }}
+                
+                // Pre-load package assemblies using deps.json if available
+                var executablePath = Assembly.GetExecutingAssembly().Location;
+                var depsFile = Path.ChangeExtension(executablePath, "".deps.json"");
+                PreloadPackageAssemblies(_outputDir, depsFile);
+                
+                // Load Clojure assemblies - both the runtime and the source assemblies
+                var clojureAssembly = Assembly.LoadFrom(Path.Combine(_outputDir, ""Clojure.dll""));
+                var clojureSourceAssembly = Assembly.LoadFrom(Path.Combine(_outputDir, ""Clojure.Source.dll""));
+                
+                if (clojureAssembly == null || clojureSourceAssembly == null)
+                {{
+                    Console.WriteLine(""Error: Clojure.dll or Clojure.Source.dll not found in output directory"");
+                    Console.WriteLine(""Make sure your project references the Clojure NuGet package"");
+                    Environment.Exit(1);
+                }}
+                
+                // Get Clojure types via reflection
                 var rtType = clojureAssembly.GetType(""clojure.lang.RT"");
+                var symbolType = clojureAssembly.GetType(""clojure.lang.Symbol"");
+                
+                // Initialize Clojure runtime - it will use our assembly resolver when it needs types
                 var initMethod = rtType.GetMethod(""Init"", BindingFlags.Public | BindingFlags.Static);
                 initMethod.Invoke(null, null);
                 
-                // Set up load path for source files
-                var srcPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ""src"");
-                if (Directory.Exists(srcPath))
-                {{
-                    Environment.SetEnvironmentVariable(""CLOJURE_LOAD_PATH"", srcPath);
-                }}
-                
-                // Load the main namespace
+                // Get core Clojure functions we need
+                var varMethod = rtType.GetMethod(""var"", new[] {{ typeof(string), typeof(string) }});
                 var loadMethod = rtType.GetMethod(""load"", new[] {{ typeof(string) }});
                 
-                // Try different paths for the namespace
-                string[] paths = {{ ""src/{mainNamespace}"", ""{mainNamespace}"" }};
-                bool loaded = false;
-                
-                foreach (var path in paths)
-                {{
-                    try
-                    {{
-                        loadMethod.Invoke(null, new[] {{ path }});
-                        loaded = true;
-                        break;
-                    }}
-                    catch
-                    {{
-                        // Try next path
-                    }}
-                }}
-                
-                if (!loaded)
-                {{
-                    throw new Exception(""Could not load namespace {mainNamespace}"");
-                }}
+                // Load the main namespace
+                loadMethod.Invoke(null, new[] {{ ""{mainNamespace}"" }});
                 
                 // Get and invoke the -main function
-                var varMethod = rtType.GetMethod(""var"", new[] {{ typeof(string), typeof(string) }});
                 var mainFn = varMethod.Invoke(null, new[] {{ ""{mainNamespace}"", ""-main"" }});
                 
                 if (mainFn != null)
@@ -127,6 +136,107 @@ namespace ClojureGenerated
                 }}
                 Environment.Exit(1);
             }}
+        }}
+        
+        static void PreloadPackageAssemblies(string outputDir, string depsFile)
+        {{
+            var packageAssemblies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            
+            // Parse deps.json to find package assemblies
+            if (File.Exists(depsFile))
+            {{
+                try
+                {{
+                    var json = File.ReadAllText(depsFile);
+                    using var doc = JsonDocument.Parse(json);
+                    
+                    // Get libraries section which contains all dependencies
+                    if (doc.RootElement.TryGetProperty(""libraries"", out var libraries))
+                    {{
+                        foreach (var library in libraries.EnumerateObject())
+                        {{
+                            // Skip Microsoft.NETCore and system libraries
+                            if (library.Name.StartsWith(""Microsoft.NETCore"") || 
+                                library.Name.StartsWith(""runtime.""))
+                                continue;
+                            
+                            // Extract assembly names from library entries
+                            var parts = library.Name.Split('/');
+                            if (parts.Length > 0)
+                            {{
+                                packageAssemblies.Add(parts[0]);
+                            }}
+                        }}
+                    }}
+                }}
+                catch
+                {{
+                    // If we can't parse deps.json, continue without it
+                }}
+            }}
+            
+            // Always add System.Text.Json if it's a dependency
+            packageAssemblies.Add(""System.Text.Json"");
+            
+            // Pre-load the identified package assemblies
+            foreach (var dll in Directory.GetFiles(outputDir, ""*.dll""))
+            {{
+                var fileName = Path.GetFileNameWithoutExtension(dll);
+                
+                // Skip Microsoft.Dynamic and Microsoft.Scripting to avoid conflicts
+                if (fileName.Equals(""Microsoft.Dynamic"", StringComparison.OrdinalIgnoreCase) || 
+                    fileName.Equals(""Microsoft.Scripting"", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.Equals(""Microsoft.Scripting.Metadata"", StringComparison.OrdinalIgnoreCase))
+                {{
+                    continue;
+                }}
+                
+                // Check if this assembly matches any package
+                bool shouldLoad = false;
+                foreach (var package in packageAssemblies)
+                {{
+                    if (fileName.StartsWith(package, StringComparison.OrdinalIgnoreCase))
+                    {{
+                        shouldLoad = true;
+                        break;
+                    }}
+                }}
+                
+                if (shouldLoad)
+                {{
+                    try
+                    {{
+                        Assembly.LoadFrom(dll);
+                    }}
+                    catch
+                    {{
+                        // Skip if can't be loaded
+                    }}
+                }}
+            }}
+        }}
+        
+        static Assembly AssemblyResolver(object sender, ResolveEventArgs args)
+        {{
+            var assemblyName = new AssemblyName(args.Name);
+            var dllName = assemblyName.Name + "".dll"";
+            var fullPath = Path.Combine(_outputDir, dllName);
+            
+            if (File.Exists(fullPath))
+            {{
+                return Assembly.LoadFrom(fullPath);
+            }}
+            
+            // Try without version info (sometimes assemblies request specific versions)
+            var simpleName = args.Name.Split(',')[0] + "".dll"";
+            fullPath = Path.Combine(_outputDir, simpleName);
+            
+            if (File.Exists(fullPath))
+            {{
+                return Assembly.LoadFrom(fullPath);
+            }}
+            
+            return null;
         }}
     }}
 }}";

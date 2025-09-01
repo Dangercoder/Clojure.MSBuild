@@ -6,8 +6,21 @@
     <AssemblyName>Clojure.MSBuild.Tool</AssemblyName>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
-  <!-- No dependencies needed - we load everything dynamically -->
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Clojure.MSBuild.SourceGenerators/**" />
+    <Compile Remove="obj/**" />
+    <Compile Remove="bin/**" />
+  </ItemGroup>
 
 </Project>
