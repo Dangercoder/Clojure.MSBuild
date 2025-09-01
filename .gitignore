@@ -1,0 +1,14 @@
+obj
+bin
+.clj-kondo/
+.lsp/
+clojure-clr/
+potion/
+*.dll
+tools
+*.exe
+*.db
+packages/
+*.pdb
+*.swp
+.cpcache/

@@ -1,0 +1,98 @@
+(ns app.integration-test
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [clojure.spec.alpha :as s]
+            [clojure.data.json :as json]
+            [app.server :as server]
+            [clojure.dotnet.web :as web])
+  (:import [Microsoft.AspNetCore.TestHost HostBuilderTestServerExtensions]
+           [Microsoft.Extensions.Hosting HostingAbstractionsHostExtensions]))
+
+(defn- await! [task] (.GetResult (.GetAwaiter task)))
+
+(def ^:private test-client (atom nil))
+
+(defn start-test-server [f]
+  (let [app (-> (web/app [] (fn [builder]
+                  (Microsoft.AspNetCore.TestHost.WebHostBuilderExtensions/UseTestServer
+                    (.-WebHost builder))))
+                (server/configure-routes))
+        _ (HostingAbstractionsHostExtensions/Start app)
+        client (HostBuilderTestServerExtensions/GetTestClient app)]
+    (reset! test-client client)
+    (try
+      (f)
+      (finally
+        (.Dispose client)
+        (await! (.DisposeAsync app))))))
+
+(use-fixtures :once start-test-server)
+
+;; ── HTTP helpers ─────────────────────────────────────────────────
+
+(defn- GET [path]
+  (let [response (await! (.GetAsync @test-client path))
+        body (await! (.ReadAsStringAsync (.Content response)))]
+    {:status (.StatusCode response) :body body}))
+
+(defn- GET-json [path]
+  (json/read-str (:body (GET path))))
+
+(defn- POST-json [path data]
+  (let [content (System.Net.Http.StringContent.
+                  (json/write-str data)
+                  System.Text.Encoding/UTF8
+                  "application/json")
+        response (await! (.PostAsync @test-client path content))
+        body (await! (.ReadAsStringAsync (.Content response)))]
+    (json/read-str body)))
+
+;; ── Specs ────────────────────────────────────────────────────────
+
+(s/def ::title (s/and string? #(pos? (count %)) #(<= (count %) 200)))
+(s/def ::status #{"ok" "error"})
+(s/def ::message string?)
+(s/def ::response (s/keys :req-un [::status ::message]))
+
+;; ── Tests ────────────────────────────────────────────────────────
+
+(deftest test-index-page
+  (testing "GET / returns HTML"
+    (let [{:keys [status body]} (GET "/")]
+      (is (= System.Net.HttpStatusCode/OK status))
+      (is (.Contains body "ClojureCLR")))))
+
+(deftest test-db-init
+  (testing "GET /db/init seeds the database"
+    (let [result (GET-json "/db/init")]
+      (is (= "ok" (get result "status"))))))
+
+(deftest test-crud-flow
+  (testing "init -> add -> list"
+    (GET-json "/db/init")
+    (let [result (POST-json "/db/add" {:title "IntegrationTest"})]
+      (is (= "IntegrationTest" (get result "inserted"))))
+    (let [todos (GET-json "/db/list")]
+      (is (= 4 (count todos)))
+      (is (= "IntegrationTest" (get (last todos) "title"))))))
+
+;; ── Property-based: JSON round-trip ──────────────────────────────
+
+(defspec json-response-round-trip 100
+  (prop/for-all [resp (s/gen ::response)]
+    (let [parsed (json/read-str (json/write-str resp))]
+      (and (= (:status resp) (get parsed "status"))
+           (= (:message resp) (get parsed "message"))))))
+
+;; ── Property-based: random titles survive DB round-trip ──────────
+
+(defspec db-round-trip 30
+  (prop/for-all [title (s/gen ::title)]
+    (GET-json "/db/init")
+    (let [result (POST-json "/db/add" {:title title})
+          todos (GET-json "/db/list")]
+      (and (= title (get result "inserted"))
+           (= 4 (count todos))
+           (= title (get (last todos) "title"))))))

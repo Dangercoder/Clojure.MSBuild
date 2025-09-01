@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageId>Clojure.MSBuild</PackageId>
+    <Version>0.0.4</Version>
+    <Authors>Clojure CLR Contributors</Authors>
+    <Description>MSBuild integration for ClojureCLR. Build, test, and run Clojure on .NET with standard dotnet commands. Written entirely in ClojureCLR.</Description>
+    <PackageTags>clojure;clr;msbuild;repl;dotnet</PackageTags>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <NoWarn>NU5100;NU5128</NoWarn>
+    <DevelopmentDependency>true</DevelopmentDependency>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- MSBuild integration (auto-imported by NuGet) -->
+    <Content Include="build\Clojure.MSBuild.props" PackagePath="build\" />
+    <Content Include="build\Clojure.MSBuild.targets" PackagePath="build\" />
+
+    <!-- ClojureCLR source (tool, web framework) -->
+    <Content Include="src\clojure\**\*.cljr" PackagePath="build\clojure\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="" />
+    <None Include="LICENSE" Pack="true" PackagePath="" />
+  </ItemGroup>
+
+</Project>

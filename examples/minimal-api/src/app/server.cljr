@@ -1,0 +1,63 @@
+(ns app.server
+  (:require [clojure.async.task :as t]
+            [clojure.data.json :as json]
+            [honey.sql :as sql]
+            [clojure.dotnet.web :as web]
+            [clojure.dotnet.db :as db])
+  (:import [Microsoft.Data.Sqlite SqliteConnection]))
+
+(def ^:private conn-string "Data Source=app.db")
+(defn- open-conn [] (db/create-connection SqliteConnection conn-string))
+
+(def ^:private http-client (System.Net.Http.HttpClient.))
+
+(defn ^:async fetch-dog [ctx]
+  (t/await (.GetStringAsync http-client "https://dogapi.dog/api/v2/facts?limit=1")))
+
+(defn ^:async init-db [ctx]
+  (db/with-transaction [conn (open-conn)]
+    (t/await (db/execute! conn
+      "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done INTEGER DEFAULT 0)"))
+    (t/await (db/execute! conn (sql/format {:delete-from [:todos]})))
+    (t/await (db/execute! conn (sql/format {:insert-into [:todos]
+                                            :values [{:title "Buy groceries" :done 0}
+                                                     {:title "Write ClojureCLR app" :done 0}
+                                                     {:title "Patch GenDelegate" :done 1}]})))
+    (json/write-str {:status "ok" :message "table created and seeded"})))
+
+(defn ^:async list-todos [ctx]
+  (db/with-transaction [conn (open-conn)]
+    (let [todos (t/await (db/execute! conn (sql/format {:select [:id :title :done]
+                                                        :from [:todos]
+                                                        :order-by [[:id :asc]]})))]
+      (json/write-str todos))))
+
+(defn ^:async add-todo [ctx]
+  (let [body (json/read-str (t/await (web/read-body-async ctx)))
+        title (get body "title")]
+    (db/with-transaction [conn (open-conn)]
+      (t/await (db/execute! conn (sql/format {:insert-into [:todos]
+                                              :values [{:title title}]})))
+      (json/write-str {:status "ok" :inserted title}))))
+
+(defn configure-routes [app]
+  (-> app
+      (web/get "/" (fn [ctx]
+        (web/ok
+          "<html><body style='font-family:monospace;max-width:600px;margin:40px auto'>
+           <h2>ClojureCLR + .NET 11 + HoneySQL</h2>
+           <ul>
+             <li><a href='/dog'>/dog</a> — async HttpClient</li>
+             <li><a href='/db/init'>/db/init</a> — create + seed</li>
+             <li><a href='/db/list'>/db/list</a> — HoneySQL SELECT</li>
+             <li>POST /db/add {\"title\":\"...\"}</li>
+           </ul></body></html>")))
+      (web/get "/dog" fetch-dog)
+      (web/get "/db/init" init-db)
+      (web/get "/db/list" list-todos)
+      (web/post "/db/add" add-todo)))
+
+(defn -main [& args]
+  (-> (web/app)
+      (configure-routes)
+      (web/start!)))

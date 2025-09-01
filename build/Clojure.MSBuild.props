@@ -1,0 +1,24 @@
+<Project>
+  <PropertyGroup>
+    <!-- Default properties for Clojure CLR projects -->
+    <ClojureReplEnabled Condition="'$(ClojureReplEnabled)' == ''">true</ClojureReplEnabled>
+    <ClojureAutoLoadAssemblies Condition="'$(ClojureAutoLoadAssemblies)' == ''">true</ClojureAutoLoadAssemblies>
+
+    <!-- Main namespace — set this in your csproj to auto-generate an entry point -->
+    <ClojureMainNamespace Condition="'$(ClojureMainNamespace)' == ''"></ClojureMainNamespace>
+
+    <!-- Source directory for Clojure files (added to CLOJURE_LOAD_PATH) -->
+    <ClojureSourceDir Condition="'$(ClojureSourceDir)' == ''">src</ClojureSourceDir>
+
+    <!-- Extra source directories (pipe-separated, e.g. for vendor libs) -->
+    <ClojureExtraSourceDirs Condition="'$(ClojureExtraSourceDirs)' == ''"></ClojureExtraSourceDirs>
+
+    <!-- Path to Clojure.MSBuild package source (auto-set, don't override) -->
+    <ClojureMSBuildSourceDir>$(MSBuildThisFileDirectory)</ClojureMSBuildSourceDir>
+
+    <!-- Clojure AOT Compilation Settings -->
+    <ClojureCompileOnBuild Condition="'$(ClojureCompileOnBuild)' == ''">false</ClojureCompileOnBuild>
+    <ClojureCompilePath Condition="'$(ClojureCompilePath)' == ''"></ClojureCompilePath>
+    <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''"></ClojureNamespacesToCompile>
+  </PropertyGroup>
+</Project>

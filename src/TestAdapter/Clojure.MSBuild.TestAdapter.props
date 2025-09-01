@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)net11.0\Clojure.MSBuild.TestAdapter.ClojureTestAdapter.dll"
+          CopyToOutputDirectory="PreserveNewest" Link="Clojure.MSBuild.TestAdapter.ClojureTestAdapter.dll" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)net11.0\clojure.msbuild.test_adapter.cljr.dll"
+          CopyToOutputDirectory="PreserveNewest" Link="clojure.msbuild.test_adapter.cljr.dll" Visible="false" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+</Project>

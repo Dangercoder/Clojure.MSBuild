@@ -1,0 +1,150 @@
+(ns clojure.msbuild.tool
+  "ClojureCLR MSBuild tool — REPL, test runner, script runner, AOT compiler.
+   Runs in-process: the host project's entry point already loaded all assemblies
+   and set up CLOJURE_LOAD_PATH, so no bootstrap is needed here."
+  (:import [System Environment Console]
+           [System.IO Directory Path File SearchOption]))
+
+;; ── Test directory helpers ───────────────────────────────────────
+
+(defn- add-test-dir-to-load-path! []
+  (let [test-dir (Path/Combine (Environment/CurrentDirectory) "test")]
+    (when (Directory/Exists test-dir)
+      (let [current (or (Environment/GetEnvironmentVariable "CLOJURE_LOAD_PATH") "")
+            new-path (if (seq current)
+                       (str current Path/PathSeparator test-dir)
+                       test-dir)]
+        (Environment/SetEnvironmentVariable "CLOJURE_LOAD_PATH" new-path)))))
+
+(defn- discover-test-namespaces []
+  (let [test-dir (Path/Combine (Environment/CurrentDirectory) "test")]
+    (when (Directory/Exists test-dir)
+      (let [files (concat
+                    (Directory/GetFiles test-dir "*_test.cljr" SearchOption/AllDirectories)
+                    (Directory/GetFiles test-dir "*_test.cljc" SearchOption/AllDirectories)
+                    (Directory/GetFiles test-dir "*_test.clj" SearchOption/AllDirectories))]
+        (println (str "Found " (count files) " test files"))
+        (->> files
+             (map (fn [f]
+                    (let [rel (Path/GetRelativePath test-dir f)
+                          no-ext (subs rel 0 (- (count rel) (count (Path/GetExtension rel))))]
+                      (-> no-ext
+                          (.Replace (char Path/DirectorySeparatorChar) \.)
+                          (.Replace \_ \-)
+                          symbol))))
+             (doall))))))
+
+;; ── Modes ────────────────────────────────────────────────────────
+
+(defn run-repl
+  "Start interactive Clojure REPL."
+  []
+  (println "Starting Clojure REPL...")
+  (clojure.main/main))
+
+(defn run-nrepl
+  "Start nREPL server."
+  []
+  (println "Starting nREPL server...")
+  (try
+    ((requiring-resolve 'clojure.tools.nrepl/start-server!))
+    (println "nREPL started at port: 1667")
+    (Console/ReadLine)
+    (catch Exception e
+      (println (str "Error starting nREPL: " (.Message e)))
+      (println "Make sure clojure.tools.nrepl is in your project dependencies"))))
+
+(defn run-script
+  "Run a Clojure script file."
+  [path]
+  (println (str "Running script: " path))
+  (if (File/Exists path)
+    (load-file path)
+    (do (println (str "Error: Script file not found: " path))
+        (Environment/Exit 1))))
+
+(defn run-tests
+  "Discover and run all *_test.cljr test files."
+  []
+  (println "Running tests...")
+  (add-test-dir-to-load-path!)
+  (require 'clojure.test)
+  (let [run-tests-fn (resolve 'clojure.test/run-tests)
+        run-all-fn   (resolve 'clojure.test/run-all-tests)
+        test-nses    (discover-test-namespaces)
+        loaded       (doall
+                       (keep (fn [ns-sym]
+                               (println (str "Loading test namespace: " ns-sym))
+                               (try
+                                 (require ns-sym)
+                                 ns-sym
+                                 (catch Exception e
+                                   (println (str "Error loading namespace " ns-sym ": " (.Message e)))
+                                   nil)))
+                             test-nses))]
+    (if (seq loaded)
+      (apply run-tests-fn (map find-ns loaded))
+      (do (println "No test namespaces found, running all tests...")
+          (run-all-fn)))))
+
+(defn run-namespace-tests
+  "Run tests for a specific namespace."
+  [ns-name]
+  (println (str "Running tests for namespace: " ns-name))
+  (add-test-dir-to-load-path!)
+  (require 'clojure.test)
+  (let [ns-sym (symbol ns-name)]
+    (require ns-sym)
+    ((resolve 'clojure.test/run-tests) (find-ns ns-sym))))
+
+(defn compile-namespaces
+  "AOT compile semicolon-separated namespaces to compile-path.
+   Works around a ClojureCLR bug where PersistedAssemblyBuilder.Save()
+   writes to CWD instead of *compile-path* — we compile to CWD then
+   move the resulting DLLs to the target directory."
+  [namespaces compile-path]
+  (let [compile-path (if (Path/IsPathRooted compile-path)
+                       compile-path
+                       (Path/GetFullPath compile-path))
+        cwd (Environment/CurrentDirectory)]
+    (println (str "Compiling namespaces to: " compile-path))
+    (Directory/CreateDirectory compile-path)
+    (doseq [ns-str (.Split namespaces (char-array ";") StringSplitOptions/RemoveEmptyEntries)]
+      (let [ns-str (.Trim ns-str)]
+        (when (seq ns-str)
+          (println (str "  Compiling " ns-str "..."))
+          (try
+            (binding [*compile-path* compile-path
+                      *compile-files* true]
+              (compile (symbol ns-str)))
+            ;; Workaround: PersistedAssemblyBuilder.Save() writes to CWD.
+            ;; Move any new DLLs from CWD to compile-path.
+            (doseq [dll (Directory/GetFiles cwd "*.dll")
+                    :let [fname (Path/GetFileName dll)
+                          dest (Path/Combine compile-path fname)]
+                    :when (not= cwd compile-path)]
+              (when (File/Exists dest) (File/Delete dest))
+              (File/Move dll dest))
+            (println (str "  Compiled " ns-str))
+            (catch Exception e
+              (println (str "  Error: " (.Message e))))))))))
+
+;; ── Entry point (--clj-mode dispatch) ────────────────────────────
+
+(defn -main
+  "Dispatch based on --clj-mode argument. Called by the generated entry point
+   when the project is invoked with --clj-mode instead of normal app startup."
+  [& args]
+  (let [args-vec (vec args)
+        mode (first args-vec)
+        rest-args (rest args-vec)]
+    (case mode
+      "repl"           (run-repl)
+      "nrepl"          (run-nrepl)
+      "script"         (run-script (first rest-args))
+      "test"           (run-tests)
+      "test-namespace" (run-namespace-tests (first rest-args))
+      "compile"        (compile-namespaces (first rest-args) (second rest-args))
+      (do (println (str "Unknown mode: " mode))
+          (println "Valid modes: repl, nrepl, script, test, test-namespace, compile")
+          (Environment/Exit 1)))))

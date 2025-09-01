@@ -1,0 +1,203 @@
+(ns clojure.msbuild.test-adapter
+  "VSTest adapter for discovering and running Clojure tests.
+   Single gen-class implementing both ITestDiscoverer and ITestExecutor
+   so everything lands in one DLL for VSTest discovery."
+  (:import [System Uri]
+           [System.Diagnostics Process ProcessStartInfo]
+           [System.IO Directory Path File SearchOption]
+           [System.Text StringBuilder]
+           [System.Text.RegularExpressions Regex]
+           [Microsoft.VisualStudio.TestPlatform.ObjectModel
+            TestCase TestResult TestOutcome
+            FileExtensionAttribute DefaultExecutorUriAttribute ExtensionUriAttribute]
+           [Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter
+            ITestDiscoverer ITestExecutor
+            IDiscoveryContext IRunContext IFrameworkHandle ITestCaseDiscoverySink]
+           [Microsoft.VisualStudio.TestPlatform.ObjectModel.Logging
+            IMessageLogger TestMessageLevel]))
+
+;; ── Constants ────────────────────────────────────────────────────
+
+(def executor-uri-string "executor://clojuretestexecutor/v1")
+(def ^Uri executor-uri (Uri. executor-uri-string))
+
+;; ── Single gen-class: both discoverer + executor ─────────────────
+
+(gen-class
+  :name Clojure.MSBuild.TestAdapter.ClojureTestAdapter
+  :implements [Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter.ITestDiscoverer
+               Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter.ITestExecutor]
+  :class-attributes {FileExtensionAttribute #{ ".dll" ".exe" }
+                     DefaultExecutorUriAttribute "executor://clojuretestexecutor/v1"
+                     ExtensionUriAttribute "executor://clojuretestexecutor/v1"}
+  :state state
+  :init init
+  :prefix "adapter-")
+
+;; ── Test execution helpers ───────────────────────────────────────
+
+(defn- parse-test-results! [output tests framework-handle]
+  (let [summary (Regex/Match output "Ran (\\d+) tests.*?(\\d+) failures, (\\d+) errors")]
+    (when (.Success summary)
+      (let [failures (Int32/Parse (.Value (.get_Item (.Groups summary) 2)))
+            errors   (Int32/Parse (.Value (.get_Item (.Groups summary) 3)))
+            success? (and (zero? failures) (zero? errors))]
+        (doseq [test tests]
+          (let [result (TestResult. test)]
+            (set! (.-Outcome result) (if success? TestOutcome/Passed TestOutcome/Failed))
+            (set! (.-StartTime result) (DateTimeOffset/Now))
+            (set! (.-EndTime result) (DateTimeOffset/Now))
+            (set! (.-Duration result) TimeSpan/Zero)
+            (when-not success?
+              (set! (.-ErrorMessage result) "Test failed - see output for details"))
+            (.RecordResult framework-handle result)))))))
+
+(defn- run-namespace-tests! [assembly ns-name tests project-dir framework-handle]
+  (let [start-info (doto (ProcessStartInfo.)
+                     (-> .-FileName (set! "dotnet"))
+                     (-> .-Arguments (set! (str "\"" assembly "\" --clj-mode test-namespace " ns-name)))
+                     (-> .-WorkingDirectory (set! project-dir))
+                     (-> .-RedirectStandardOutput (set! true))
+                     (-> .-RedirectStandardError (set! true))
+                     (-> .-UseShellExecute (set! false))
+                     (-> .-CreateNoWindow (set! true)))
+        output (StringBuilder.)
+        errors (StringBuilder.)
+        process (Process/Start start-info)]
+    (.add_OutputDataReceived process
+      (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
+        (when-let [data (.-Data e)] (.AppendLine output data))))
+    (.add_ErrorDataReceived process
+      (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
+        (when-let [data (.-Data e)] (.AppendLine errors data))))
+    (.BeginOutputReadLine process)
+    (.BeginErrorReadLine process)
+    (.WaitForExit process)
+    (parse-test-results! (.ToString output) tests framework-handle)
+    (when (not= 0 (.ExitCode process))
+      (.SendMessage framework-handle TestMessageLevel/Error
+        (str "Test execution failed with exit code " (.ExitCode process) ": " errors)))))
+
+(defn- run-all-tests! [assembly project-dir framework-handle]
+  (let [start-info (doto (ProcessStartInfo.)
+                     (-> .-FileName (set! "dotnet"))
+                     (-> .-Arguments (set! (str "\"" assembly "\" --clj-mode test")))
+                     (-> .-WorkingDirectory (set! project-dir))
+                     (-> .-RedirectStandardOutput (set! true))
+                     (-> .-RedirectStandardError (set! true))
+                     (-> .-UseShellExecute (set! false))
+                     (-> .-CreateNoWindow (set! true)))
+        output (StringBuilder.)
+        process (Process/Start start-info)]
+    (.add_OutputDataReceived process
+      (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
+        (when-let [data (.-Data e)]
+          (.AppendLine output data)
+          (when (not (String/IsNullOrEmpty data))
+            (.SendMessage framework-handle TestMessageLevel/Informational data)))))
+    (.add_ErrorDataReceived process
+      (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
+        (when-let [data (.-Data e)]
+          (.AppendLine output data)
+          (when (not (String/IsNullOrEmpty data))
+            (.SendMessage framework-handle TestMessageLevel/Warning data)))))
+    (.BeginOutputReadLine process)
+    (.BeginErrorReadLine process)
+    (.WaitForExit process)
+    (let [summary (Regex/Match (.ToString output)
+                    "Ran (\\d+) tests containing (\\d+) assertions\\.\\s*(\\d+) failures, (\\d+) errors")]
+      (when (.Success summary)
+        (let [test-count (Int32/Parse (.Value (.get_Item (.Groups summary) 1)))
+              failures   (Int32/Parse (.Value (.get_Item (.Groups summary) 3)))
+              errors     (Int32/Parse (.Value (.get_Item (.Groups summary) 4)))
+              test-case  (TestCase. "ClojureTests.AllTests" executor-uri assembly)]
+          (set! (.-DisplayName test-case) (str "Clojure Tests (" test-count " tests)"))
+          (set! (.-CodeFilePath test-case) project-dir)
+          (.RecordStart framework-handle test-case)
+          (let [result (TestResult. test-case)]
+            (set! (.-Outcome result) (if (and (zero? failures) (zero? errors))
+                                       TestOutcome/Passed TestOutcome/Failed))
+            (set! (.-StartTime result) (DateTimeOffset/Now))
+            (set! (.-EndTime result) (DateTimeOffset/Now))
+            (set! (.-Duration result) (TimeSpan/FromMilliseconds 100))
+            (when (or (pos? failures) (pos? errors))
+              (set! (.-ErrorMessage result) (str "Tests failed: " failures " failures, " errors " errors"))
+              (.SendMessage framework-handle TestMessageLevel/Error (.-ErrorMessage result)))
+            (when (and (zero? failures) (zero? errors))
+              (.SendMessage framework-handle TestMessageLevel/Informational
+                (str "All " test-count " Clojure tests passed successfully")))
+            (.RecordEnd framework-handle test-case (.-Outcome result))
+            (.RecordResult framework-handle result)))))))
+
+;; ── Adapter implementation ───────────────────────────────────────
+
+(defn adapter-init []
+  [[] (atom false)])
+
+;; ITestDiscoverer.DiscoverTests
+(defn adapter-DiscoverTests [this sources discovery-context logger discovery-sink]
+  (.SendMessage logger TestMessageLevel/Informational "Clojure Test Discoverer: Starting test discovery")
+  (doseq [source sources]
+    (.SendMessage logger TestMessageLevel/Informational (str "Discovering tests in: " source))
+    (let [directory (Path/GetDirectoryName source)
+          project-dir (Path/GetFullPath (Path/Combine directory ".." ".." ".."))
+          test-dir (Path/Combine project-dir "test")]
+      (when (Directory/Exists test-dir)
+        (doseq [test-file (Directory/GetFiles test-dir "*_test.cljr" SearchOption/AllDirectories)]
+          (let [relative-path (Path/GetRelativePath test-dir test-file)
+                no-ext (subs relative-path 0 (- (count relative-path) (count (Path/GetExtension relative-path))))
+                ns-name (-> no-ext
+                            (.Replace (char Path/DirectorySeparatorChar) \.)
+                            (.Replace \_ \-))
+                content (File/ReadAllText test-file)
+                matches (Regex/Matches content "\\(deftest\\s+(\\S+)")]
+            (.SendMessage logger TestMessageLevel/Informational
+              (str "Found " (.Count matches) " tests in " ns-name))
+            (doseq [m matches]
+              (let [test-name (str (.Value (.get_Item (.Groups m) 1)))
+                    line-num (-> (.Substring content 0 (.Index m))
+                                (.Split (char-array "\n"))
+                                count)
+                    test-case (TestCase. (str ns-name "/" test-name) executor-uri source)]
+                (set! (.-DisplayName test-case) test-name)
+                (set! (.-CodeFilePath test-case) test-file)
+                (set! (.-LineNumber test-case) line-num)
+                (.Add (.-Traits test-case) "Namespace" ns-name)
+                (.SendTestCase discovery-sink test-case)))))))))
+
+;; ITestExecutor.Cancel
+(defn adapter-Cancel [this]
+  (reset! (.state this) true))
+
+;; ITestExecutor.RunTests (handles both overloads via type dispatch)
+(defn adapter-RunTests [this sources-or-tests run-context framework-handle]
+  (let [cancelled? (.state this)
+        first-item (first sources-or-tests)]
+    (if (instance? TestCase first-item)
+      ;; Overload: RunTests(IEnumerable<TestCase>, ...)
+      (do
+        (.SendMessage framework-handle TestMessageLevel/Informational
+          "Clojure Test Executor: Starting test execution")
+        (let [tests-by-source (group-by (fn [t] (.Source t)) sources-or-tests)]
+          (doseq [[source tests] tests-by-source
+                  :when (not @cancelled?)]
+            (let [directory (Path/GetDirectoryName source)
+                  project-dir (Path/GetFullPath (Path/Combine directory ".." ".." ".."))
+                  tests-by-ns (group-by (fn [t]
+                                          (let [trait (first (filter (fn [tr] (= "Namespace" (.Name tr))) (.-Traits t)))]
+                                            (when trait (.Value trait))))
+                                        tests)]
+              (doseq [[ns-name ns-tests] tests-by-ns
+                      :when (and (not @cancelled?) (some? ns-name))]
+                (run-namespace-tests! source ns-name (vec ns-tests) project-dir framework-handle)))))
+        (.SendMessage framework-handle TestMessageLevel/Informational "Clojure Test Execution completed"))
+
+      ;; Overload: RunTests(IEnumerable<string>, ...)
+      (do
+        (.SendMessage framework-handle TestMessageLevel/Informational
+          "Clojure Test Executor: Starting full test run")
+        (doseq [source sources-or-tests
+                :when (not @cancelled?)]
+          (let [directory (Path/GetDirectoryName source)
+                project-dir (Path/GetFullPath (Path/Combine directory ".." ".." ".."))]
+            (run-all-tests! source project-dir framework-handle)))))))

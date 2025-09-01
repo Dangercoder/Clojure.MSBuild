@@ -1,0 +1,199 @@
+(ns clojure.msbuild.gitlibs
+  "Minimal git dependency resolver for deps.edn.
+   Clones git repos to ~/.gitlibs and checks out source at specific SHAs.
+   Compatible with clojure.tools.gitlibs cache layout."
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str])
+  (:import [System Environment]
+           [System.Diagnostics Process ProcessStartInfo]
+           [System.IO Directory Path File]
+           [System.Threading Thread ThreadStart]))
+
+;; ── Config ───────────────────────────────────────────────────────
+
+(def ^:private gitlibs-dir
+  (delay
+    (let [env (Environment/GetEnvironmentVariable "GITLIBS")]
+      (or env
+          (Path/Join (Environment/GetFolderPath
+                       Environment+SpecialFolder/UserProfile)
+                     ".gitlibs")))))
+
+(defn- repos-dir [] (Path/Join @gitlibs-dir "_repos"))
+(defn- libs-dir [] (Path/Join @gitlibs-dir "libs"))
+
+;; ── Git command execution ────────────────────────────────────────
+
+(defn- read-stream [stream]
+  (let [sw (System.IO.StringWriter.)]
+    (loop []
+      (let [line (.ReadLine stream)]
+        (when line
+          (.WriteLine sw line)
+          (recur))))
+    (let [s (.ToString sw)]
+      (when-not (String/IsNullOrWhiteSpace s)
+        (.Trim s)))))
+
+(defn- run-git [& args]
+  (let [psi (doto (ProcessStartInfo.)
+              (-> .-FileName (set! "git"))
+              (-> .-Arguments (set! (String/Join " " (into-array String args))))
+              (-> .-RedirectStandardOutput (set! true))
+              (-> .-RedirectStandardError (set! true))
+              (-> .-UseShellExecute (set! false))
+              (-> .-CreateNoWindow (set! true)))
+        proc (Process/Start psi)
+        ;; Read stdout/stderr on background threads to avoid deadlock
+        out-p (promise)
+        err-p (promise)
+        out-t (doto (Thread. (gen-delegate ThreadStart [] (deliver out-p (read-stream (.StandardOutput proc))))) (.Start))
+        err-t (doto (Thread. (gen-delegate ThreadStart [] (deliver err-p (read-stream (.StandardError proc))))) (.Start))]
+    (.WaitForExit proc)
+    (.Join out-t)
+    (.Join err-t)
+    {:exit (.ExitCode proc)
+     :out @out-p
+     :err @err-p}))
+
+;; ── URL helpers ──────────────────────────────────────────────────
+
+(def ^:private git-services
+  {"io.github"      (fn [org repo] (str "https://github.com/" org "/" repo ".git"))
+   "com.github"     (fn [org repo] (str "https://github.com/" org "/" repo ".git"))
+   "io.gitlab"      (fn [org repo] (str "https://gitlab.com/" org "/" repo ".git"))
+   "com.gitlab"     (fn [org repo] (str "https://gitlab.com/" org "/" repo ".git"))
+   "org.bitbucket"  (fn [org repo] (str "https://bitbucket.org/" org "/" repo ".git"))
+   "ht.sr"          (fn [org repo] (str "https://git.sr.ht/~" org "/" repo))})
+
+(defn- auto-git-url [lib]
+  (let [lib-ns (namespace lib)
+        lib-name (name lib)]
+    (when lib-ns
+      (some (fn [[prefix url-fn]]
+              (when (.StartsWith lib-ns prefix)
+                (let [org (subs lib-ns (inc (count prefix)))]
+                  (url-fn org lib-name))))
+            git-services))))
+
+(defn- clean-url [url]
+  (let [;; Strip scheme
+        url (cond
+              (.StartsWith url "https://") (str "https/" (subs url 8))
+              (.StartsWith url "http://")  (str "http/" (subs url 7))
+              (.StartsWith url "ssh://")   (str "ssh/" (subs url 6))
+              (.StartsWith url "git@")     (str "ssh/" (subs url 4))
+              (.StartsWith url "file:///") (str "file/" (subs url 8))
+              :else url)
+        ;; Normalize ssh-style colon (only for ssh paths, not port numbers)
+        url (if (.StartsWith url "ssh/")
+              (.Replace url ":" "/")
+              url)]
+    ;; Strip trailing .git only at the end
+    (if (.EndsWith url ".git")
+      (subs url 0 (- (count url) 4))
+      url)))
+
+;; ── Cache operations ─────────────────────────────────────────────
+
+(defn- git-dir [url]
+  (Path/Join (repos-dir) (clean-url url)))
+
+(defn- lib-path [lib]
+  (Path/Join (libs-dir) (namespace lib) (name lib)))
+
+(defn- ensure-repo! [url]
+  (let [dir (git-dir url)]
+    (when-not (Directory/Exists dir)
+      (println (str "Cloning: " url))
+      (let [parent (Path/GetDirectoryName dir)]
+        (when (and parent (not (Directory/Exists parent)))
+          (Directory/CreateDirectory parent)))
+      (let [result (run-git "clone" "--quiet" "--mirror" url dir)]
+        (when (not= 0 (:exit result))
+          (throw (Exception. (str "git clone failed: " (:err result)))))))
+    dir))
+
+(defn- git-fetch! [git-dir-path]
+  (run-git "--git-dir" git-dir-path "fetch" "--quiet" "--all" "--tags" "--prune"))
+
+(defn- resolve-sha [git-dir-path rev]
+  (let [result (run-git "--git-dir" git-dir-path "rev-parse" (str rev "^{commit}"))]
+    (when (= 0 (:exit result))
+      (:out result))))
+
+(defn- procure! [url lib rev]
+  (let [gd (ensure-repo! url)
+        sha (or (resolve-sha gd rev)
+                (do (git-fetch! gd) (resolve-sha gd rev)))]
+    (when-not sha
+      (throw (Exception. (str "Could not resolve " rev " in " url))))
+    (let [sha-dir (Path/Join (lib-path lib) sha)]
+      (when-not (Directory/Exists sha-dir)
+        (println (str "Checking out: " url " at " rev))
+        (let [parent (Path/GetDirectoryName sha-dir)]
+          (when (and parent (not (Directory/Exists parent)))
+            (Directory/CreateDirectory parent)))
+        (let [result (run-git "--git-dir" gd "worktree" "add" "--force" "--detach" sha-dir sha)]
+          (when (not= 0 (:exit result))
+            (throw (Exception. (str "git checkout failed: " (:err result)))))))
+      sha-dir)))
+
+;; ── deps.edn resolution ─────────────────────────────────────────
+
+(defn- read-deps-edn [project-dir]
+  (let [deps-clr (Path/Join project-dir "deps-clr.edn")
+        deps     (Path/Join project-dir "deps.edn")]
+    (cond
+      (File/Exists deps-clr) (edn/read-string (File/ReadAllText deps-clr))
+      (File/Exists deps)     (edn/read-string (File/ReadAllText deps))
+      :else nil)))
+
+(defn- resolve-coord [lib coord]
+  (let [url (or (not-empty (:git/url coord)) (auto-git-url lib))
+        rev (or (not-empty (:git/tag coord)) (not-empty (:git/sha coord)))]
+    (when (and url rev)
+      (let [sha-dir (procure! url lib rev)
+            nested-deps (or (let [f (Path/Join sha-dir "deps-clr.edn")]
+                              (when (File/Exists f) (edn/read-string (File/ReadAllText f))))
+                            (let [f (Path/Join sha-dir "deps.edn")]
+                              (when (File/Exists f) (edn/read-string (File/ReadAllText f)))))
+            paths (or (:paths nested-deps) ["src"])]
+        (mapv #(Path/Join sha-dir %) paths)))))
+
+(defn- resolve-deps-map [deps-map]
+  (let [deps (:deps deps-map)]
+    (when (seq deps)
+      (into []
+        (mapcat (fn [[lib coord]]
+                  (try
+                    (let [paths (resolve-coord lib coord)]
+                      (when paths
+                        (println (str "  " lib " -> " (first paths)))
+                        paths))
+                    (catch Exception e
+                      (println (str "  Error resolving " lib ": " (.Message e)))
+                      nil))))
+        deps))))
+
+(defn resolve-deps!
+  "Reads deps.edn from project-dir, resolves all git dependencies,
+   returns a vector of source paths to add to CLOJURE_LOAD_PATH.
+   Note: does not resolve transitive git deps (deps of deps)."
+  [project-dir]
+  (when-let [deps-map (read-deps-edn project-dir)]
+    (let [deps (:deps deps-map)]
+      (when (seq deps)
+        (println (str "Resolving " (count deps) " git deps from deps.edn..."))
+        (resolve-deps-map deps-map)))))
+
+(defn resolve-deps-from-edn!
+  "Resolves git deps from an EDN string (e.g. embedded from .csproj).
+   Returns a vector of source paths."
+  [edn-str]
+  (when-not (str/blank? edn-str)
+    (let [deps-map (edn/read-string edn-str)
+          deps (:deps deps-map)]
+      (when (seq deps)
+        (println (str "Resolving " (count deps) " git deps from .csproj..."))
+        (resolve-deps-map deps-map)))))

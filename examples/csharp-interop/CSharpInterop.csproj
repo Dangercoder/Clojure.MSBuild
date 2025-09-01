@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <EnablePreviewFeatures>true</EnablePreviewFeatures>
+    <ClojureMainNamespace>app</ClojureMainNamespace>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Clojure.MSBuild" Version="0.0.3" />
+    <PackageReference Include="Clojure" Version="1.12.3-alpha5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="src/**/*.cljr" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

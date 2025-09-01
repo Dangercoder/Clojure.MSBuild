@@ -1,0 +1,173 @@
+<Project>
+
+  <!-- Build EDN string from ClojureGitDep items -->
+  <Target Name="_BuildClojureGitDepsEdn" BeforeTargets="GenerateClojureEntryPoint">
+    <PropertyGroup>
+      <_ClojureGitDepsEdn Condition="@(ClojureGitDep->Count()) > 0">{:deps {</_ClojureGitDepsEdn>
+    </PropertyGroup>
+    <PropertyGroup Condition="@(ClojureGitDep->Count()) > 0">
+      <_ClojureGitDepsEdn>$(_ClojureGitDepsEdn) @(ClojureGitDep-> '%(Identity) {:git/tag &quot;&quot;%(Tag)&quot;&quot; :git/sha &quot;&quot;%(Sha)&quot;&quot; :git/url &quot;&quot;%(Url)&quot;&quot;}', ' ')</_ClojureGitDepsEdn>
+      <_ClojureGitDepsEdn>$(_ClojureGitDepsEdn) }}</_ClojureGitDepsEdn>
+    </PropertyGroup>
+    <PropertyGroup Condition="@(ClojureGitDep->Count()) == 0">
+      <_ClojureGitDepsEdn></_ClojureGitDepsEdn>
+    </PropertyGroup>
+  </Target>
+
+  <!-- Auto-generate C# entry point from ClojureMainNamespace -->
+  <Target Name="GenerateClojureEntryPoint" BeforeTargets="CoreCompile"
+          Condition="'$(ClojureMainNamespace)' != ''" DependsOnTargets="_BuildClojureGitDepsEdn">
+    <PropertyGroup>
+      <_ClojureEntryFile>$(IntermediateOutputPath)ClojureEntry.g.cs</_ClojureEntryFile>
+      <_ClojureEntrySource>
+using System%3B
+using System.IO%3B
+using System.Linq%3B
+using System.Threading.Tasks%3B
+
+var paths = new System.Collections.Generic.List&lt;string&gt;()%3B
+// Add base directory so the app can find its own .cljr files
+var baseClj = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "$(ClojureSourceDir)")%3B
+if (Directory.Exists(baseClj)) paths.Add(baseClj)%3B
+var srcDir = Path.Combine(Environment.CurrentDirectory, "$(ClojureSourceDir)")%3B
+if (Directory.Exists(srcDir) &amp;&amp; !paths.Contains(srcDir)) paths.Add(srcDir)%3B
+foreach (var extra in "$(ClojureExtraSourceDirs)".Split('|', StringSplitOptions.RemoveEmptyEntries))
+{
+    var d = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, extra.Trim()))%3B
+    if (Directory.Exists(d)) paths.Add(d)%3B
+}
+// Add Clojure.MSBuild package source dir (for tool, web, test-adapter namespaces)
+var msbuildSrc = @"$(ClojureMSBuildSourceDir)"%3B
+if (Directory.Exists(msbuildSrc) &amp;&amp; !paths.Contains(msbuildSrc)) paths.Add(msbuildSrc)%3B
+if (paths.Count > 0)
+    Environment.SetEnvironmentVariable("CLOJURE_LOAD_PATH", string.Join(Path.PathSeparator.ToString(), paths))%3B
+// Pre-load all assemblies so Clojure's require can find NuGet-packaged libraries
+var baseDir = AppDomain.CurrentDomain.BaseDirectory%3B
+foreach (var dll in Directory.GetFiles(baseDir, "*.dll"))
+{
+    try { System.Reflection.Assembly.LoadFrom(dll)%3B } catch { }
+}
+clojure.lang.RT.Init()%3B
+// Resolve git deps from .csproj ClojureGitDep items and/or deps.edn
+{
+    var csprojDeps = @"$(_ClojureGitDepsEdn)"%3B
+    var depsFile = Path.Combine(Environment.CurrentDirectory, "deps.edn")%3B
+    var depsClrFile = Path.Combine(Environment.CurrentDirectory, "deps-clr.edn")%3B
+    var hasCsprojDeps = !string.IsNullOrWhiteSpace(csprojDeps)%3B
+    var hasDepsFile = File.Exists(depsClrFile) || File.Exists(depsFile)%3B
+    if (hasCsprojDeps || hasDepsFile)
+    {
+        try
+        {
+            clojure.lang.RT.var("clojure.core", "require").invoke(clojure.lang.Symbol.intern("clojure.msbuild.gitlibs"))%3B
+            var allPaths = new System.Collections.Generic.List&lt;object&gt;()%3B
+            if (hasCsprojDeps)
+            {
+                var resolveEdnFn = clojure.lang.RT.var("clojure.msbuild.gitlibs", "resolve-deps-from-edn!")%3B
+                var p = resolveEdnFn.invoke(csprojDeps)%3B
+                if (p != null) foreach (var x in (System.Collections.IEnumerable)p) allPaths.Add(x)%3B
+            }
+            if (hasDepsFile)
+            {
+                var resolveFn = clojure.lang.RT.var("clojure.msbuild.gitlibs", "resolve-deps!")%3B
+                var p = resolveFn.invoke(Environment.CurrentDirectory)%3B
+                if (p != null) foreach (var x in (System.Collections.IEnumerable)p) allPaths.Add(x)%3B
+            }
+            if (allPaths.Count > 0)
+            {
+                var currentPath = Environment.GetEnvironmentVariable("CLOJURE_LOAD_PATH") ?? ""%3B
+                var existingPaths = new System.Collections.Generic.HashSet&lt;string&gt;(currentPath.Split(Path.PathSeparator))%3B
+                foreach (var p in allPaths)
+                {
+                    var ps = p.ToString()%3B
+                    if (!string.IsNullOrEmpty(ps) &amp;&amp; existingPaths.Add(ps))
+                        currentPath = currentPath + Path.PathSeparator + ps%3B
+                }
+                Environment.SetEnvironmentVariable("CLOJURE_LOAD_PATH", currentPath)%3B
+            }
+        }
+        catch (Exception ex) { Console.Error.WriteLine("Warning: git deps resolution failed: " + ex.Message)%3B }
+    }
+}
+if (args.Length > 0 &amp;&amp; args[0] == "--clj-mode")
+{
+    // In-process tool mode: require the tool namespace and dispatch
+    clojure.lang.RT.var("clojure.core", "require").invoke(clojure.lang.Symbol.intern("clojure.msbuild.tool"))%3B
+    var toolMain = clojure.lang.RT.var("clojure.msbuild.tool", "-main")%3B
+    toolMain.applyTo(clojure.lang.RT.seq(args.Skip(1).ToArray()))%3B
+}
+else
+{
+    clojure.lang.RT.var("clojure.core", "require").invoke(clojure.lang.Symbol.intern("$(ClojureMainNamespace)"))%3B
+    var mainFn = clojure.lang.RT.var("$(ClojureMainNamespace)", "-main")%3B
+    var result = mainFn.applyTo(clojure.lang.RT.seq(args))%3B
+    if (result is Task task) task.GetAwaiter().GetResult()%3B
+}
+      </_ClojureEntrySource>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(_ClojureEntryFile)" Lines="$(_ClojureEntrySource)" Overwrite="true" />
+    <ItemGroup>
+      <Compile Include="$(_ClojureEntryFile)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Target to run Clojure REPL with all dependencies loaded -->
+  <Target Name="clj-repl" DependsOnTargets="Build">
+    <Message Text="Starting Clojure REPL with project dependencies..." Importance="high" />
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode repl"
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
+  <!-- Target to run Clojure nREPL server -->
+  <Target Name="clj-nrepl" DependsOnTargets="Build">
+    <Message Text="Starting Clojure nREPL server..." Importance="high" />
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode nrepl"
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
+  <!-- Target to run a Clojure file -->
+  <Target Name="clj-run" DependsOnTargets="Build">
+    <Error Text="Please provide a file path using -p:File=path/to/file.clj"
+           Condition="'$(File)' == ''" />
+    <Message Text="Running Clojure file: $(File)" Importance="high" />
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode script &quot;$(File)&quot;"
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
+  <!-- Hook Clojure tests into the standard test pipeline -->
+  <PropertyGroup>
+    <RunTestsDependsOn>$(RunTestsDependsOn);ClojureTest</RunTestsDependsOn>
+  </PropertyGroup>
+
+  <Target Name="ClojureTest" DependsOnTargets="Build" Condition="Exists('test')">
+    <Message Text="Running Clojure tests..." Importance="high" />
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode test"
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false"
+          ContinueOnError="false">
+      <Output TaskParameter="ExitCode" PropertyName="ClojureTestExitCode"/>
+    </Exec>
+    <Error Condition="'$(ClojureTestExitCode)' != '0'" Text="Clojure tests failed with exit code $(ClojureTestExitCode)" />
+  </Target>
+
+  <!-- Compile Clojure namespaces during build when ClojureCompileOnBuild is true -->
+  <Target Name="ClojureCompile" AfterTargets="Build" Condition="'$(ClojureCompileOnBuild)' == 'true'">
+    <PropertyGroup>
+      <ClojureCompilePath Condition="'$(ClojureCompilePath)' == ''">$(OutputPath)</ClojureCompilePath>
+      <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''">$(ClojureMainNamespace)</ClojureNamespacesToCompile>
+    </PropertyGroup>
+
+    <Message Text="Compiling Clojure namespaces: $(ClojureNamespacesToCompile)" Importance="high" />
+    <MakeDir Directories="$(ClojureCompilePath)" />
+
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode compile &quot;$(ClojureNamespacesToCompile)&quot; &quot;$(ClojureCompilePath)&quot;"
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+
+    <Message Text="Compilation complete. DLLs written to $(ClojureCompilePath)" Importance="high" />
+  </Target>
+
+</Project>

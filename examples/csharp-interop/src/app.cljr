@@ -1,0 +1,33 @@
+(ns app
+  (:import [CSharpInterop MathService ClojureBridge]))
+
+(defn transform-data [items]
+  (->> items
+       (filter odd?)
+       (map #(* % %))
+       (reduce +)))
+
+(defn analyze [fib-seq]
+  {:count (count fib-seq)
+   :sum (reduce + fib-seq)
+   :max (apply max fib-seq)
+   :evens (filterv even? fib-seq)
+   :odds (filterv odd? fib-seq)})
+
+(defn -main [& args]
+  ;; Clojure calling C#
+  (println "=== Clojure -> C# ===")
+  (println (MathService/Greet "ClojureCLR"))
+  (println (str "Circle area (r=5): " (MathService/CircleArea 5.0)))
+  (println (str "Fibonacci(10): " (vec (MathService/Fibonacci 10))))
+
+  ;; Clojure processing C# data
+  (println "\n=== Clojure processing C# data ===")
+  (let [fibs (vec (MathService/Fibonacci 15))]
+    (println (str "Fibonacci: " fibs))
+    (println (str "Analysis: " (analyze fibs)))
+    (println (str "Sum of squares of odd fibs: " (transform-data fibs))))
+
+  ;; C# calling Clojure via RT.var
+  (println "\n=== C# -> Clojure (RT.var) ===")
+  (println (str "C# called analyze: " (ClojureBridge/AnalyzeFromCSharp (MathService/Fibonacci 10)))))

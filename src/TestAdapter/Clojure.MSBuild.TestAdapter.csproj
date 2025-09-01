@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="../../build/Clojure.MSBuild.props" />
+  <Import Project="../../build/Clojure.MSBuild.targets" />
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <EnablePreviewFeatures>true</EnablePreviewFeatures>
+    <AssemblyName>Clojure.MSBuild.TestAdapter</AssemblyName>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <ClojureMainNamespace>clojure.msbuild.tool</ClojureMainNamespace>
+    <ClojureSourceDir>../clojure</ClojureSourceDir>
+    <ClojureCompileOnBuild>true</ClojureCompileOnBuild>
+    <ClojureNamespacesToCompile>clojure.msbuild.test-adapter</ClojureNamespacesToCompile>
+    <IsTestProject>false</IsTestProject>
+
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageId>Clojure.MSBuild.TestAdapter</PackageId>
+    <Version>0.0.4</Version>
+    <Authors>Clojure CLR Contributors</Authors>
+    <Description>VSTest adapter for running ClojureCLR tests with dotnet test.</Description>
+    <PackageTags>clojure;clr;test;vstest;adapter</PackageTags>
+    <DevelopmentDependency>true</DevelopmentDependency>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <NoWarn>NU5100;NU5128</NoWarn>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.TestPlatform.ObjectModel" Version="17.8.0" />
+    <PackageReference Include="Clojure" Version="1.12.3-alpha5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="../clojure/**/*.cljr" Link="clojure/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="" />
+  </ItemGroup>
+
+  <!-- Pack: include props + AOT DLLs from bin output -->
+  <ItemGroup>
+    <None Include="Clojure.MSBuild.TestAdapter.props" Pack="true" PackagePath="build\" />
+    <None Include="$(OutputPath)Clojure.MSBuild.TestAdapter.ClojureTestAdapter.dll" Pack="true" PackagePath="build\net11.0\" />
+    <None Include="$(OutputPath)clojure.msbuild.test_adapter.cljr.dll" Pack="true" PackagePath="build\net11.0\" />
+  </ItemGroup>
+
+</Project>
