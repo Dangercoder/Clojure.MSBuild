@@ -1,0 +1,74 @@
+<Project>
+
+  <!-- Target to run Clojure REPL with all dependencies loaded -->
+  <Target Name="ClojureRepl" DependsOnTargets="Build">
+    <Message Text="Starting Clojure REPL with project dependencies..." Importance="high" />
+    <Exec Command="dotnet &quot;$(ClojureMSBuildToolPath)&quot; --assembly &quot;$(TargetPath)&quot; --mode repl" 
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
+  <!-- Target to run Clojure nREPL server -->
+  <Target Name="ClojureNRepl" DependsOnTargets="Build">
+    <Message Text="Starting Clojure nREPL server..." Importance="high" />
+    <Exec Command="dotnet &quot;$(ClojureMSBuildToolPath)&quot; --assembly &quot;$(TargetPath)&quot; --mode nrepl" 
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
+  <!-- Target to run a Clojure file -->
+  <Target Name="ClojureRun" DependsOnTargets="Build">
+    <PropertyGroup>
+      <FilePath Condition="'$(File)' != ''">$(File)</FilePath>
+    </PropertyGroup>
+    <Error Text="Please provide a file path using -p:File=path/to/file.clj" 
+           Condition="'$(File)' == ''" />
+    <Message Text="Running Clojure file: $(FilePath)" Importance="high" />
+    <Exec Command="dotnet &quot;$(ClojureMSBuildToolPath)&quot; --assembly &quot;$(TargetPath)&quot; --mode script --script &quot;$(FilePath)&quot;" 
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
+  <!-- Target to run Clojure tests -->
+  <Target Name="ClojureTest" DependsOnTargets="Build">
+    <Message Text="Running Clojure tests..." Importance="high" />
+    <Exec Command="dotnet &quot;$(ClojureMSBuildToolPath)&quot; --assembly &quot;$(TargetPath)&quot; --mode test" 
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
+  <!-- Helper target to ensure assemblies are in output -->
+  <Target Name="EnsureClojureAssemblies" AfterTargets="Build">
+    <Message Text="Ensuring Clojure assemblies are available in output directory" 
+             Condition="'$(ClojureAutoLoadAssemblies)' == 'true'" />
+  </Target>
+
+  <!-- Target to compile Clojure namespaces to DLLs -->
+  <Target Name="ClojureCompile" DependsOnTargets="Build">
+    <PropertyGroup>
+      <!-- Default compile path if not specified -->
+      <ClojureCompilePath Condition="'$(ClojureCompilePath)' == ''">$(OutputPath)compiled</ClojureCompilePath>
+      <!-- Find main namespace if not specified -->
+      <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''">clj-api.main</ClojureNamespacesToCompile>
+    </PropertyGroup>
+    
+    <Message Text="Compiling Clojure namespaces: $(ClojureNamespacesToCompile)" Importance="high" />
+    <Message Text="Output directory: $(ClojureCompilePath)" Importance="high" />
+    
+    <!-- Create compile directory -->
+    <MakeDir Directories="$(ClojureCompilePath)" />
+    
+    <!-- Run Clojure.MSBuild.Tool in compile mode -->
+    <Exec Command="dotnet &quot;$(ClojureMSBuildToolPath)&quot; --assembly &quot;$(TargetPath)&quot; --mode compile --namespaces &quot;$(ClojureNamespacesToCompile)&quot; --compile-path &quot;$(ClojureCompilePath)&quot;" 
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+          
+    <Message Text="Compilation complete. DLLs written to $(ClojureCompilePath)" Importance="high" />
+  </Target>
+  
+  <!-- Optionally compile during build -->
+  <Target Name="ClojureCompileOnBuild" AfterTargets="Build" Condition="'$(ClojureCompileOnBuild)' == 'true'">
+    <CallTarget Targets="ClojureCompile" />
+  </Target>
+
+</Project>

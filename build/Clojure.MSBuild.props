@@ -1,0 +1,21 @@
+<Project>
+  <PropertyGroup>
+    <!-- Default properties for Clojure CLR projects -->
+    <ClojureReplEnabled Condition="'$(ClojureReplEnabled)' == ''">true</ClojureReplEnabled>
+    <ClojureAutoLoadAssemblies Condition="'$(ClojureAutoLoadAssemblies)' == ''">true</ClojureAutoLoadAssemblies>
+    
+    <!-- Path to Clojure.MSBuild tool -->
+    <ClojureMSBuildToolPath>$(MSBuildThisFileDirectory)..\tools\net9.0\Clojure.MSBuild.Tool.dll</ClojureMSBuildToolPath>
+    
+    <!-- Clojure AOT Compilation Settings -->
+    <!-- Set to true to automatically compile Clojure namespaces during build -->
+    <ClojureCompileOnBuild Condition="'$(ClojureCompileOnBuild)' == ''">false</ClojureCompileOnBuild>
+    
+    <!-- Path where compiled DLLs will be written (default: output/compiled) -->
+    <ClojureCompilePath Condition="'$(ClojureCompilePath)' == ''"></ClojureCompilePath>
+    
+    <!-- Semicolon-separated list of namespaces to compile -->
+    <!-- If not specified, defaults to finding namespace with -main function -->
+    <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''"></ClojureNamespacesToCompile>
+  </PropertyGroup>
+</Project>
