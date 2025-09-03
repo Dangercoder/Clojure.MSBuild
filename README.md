@@ -1,6 +1,15 @@
 # Clojure.MSBuild (Experimental)
 
-MSBuild integration for Clojure CLR projects with automatic entry point generation.
+MSBuild integration for Clojure CLR projects. Build, test, and run Clojure code using standard `dotnet` commands, with full REPL support.
+
+## What It Does
+
+- **Build** Clojure projects with `dotnet build`
+- **Run** Clojure applications with `dotnet run`
+- **Test** with `clojure.test` using `dotnet test`
+- **REPL** support (socket REPL and nREPL via MSBuild targets)
+- **C# Interop** - seamlessly use C# classes from Clojure
+- **Automatic entry point** generation via source generators
 
 ## Quick Start
 
@@ -109,11 +118,22 @@ dotnet msbuild /t:clj-run -p:File=src/script.clj
 
 ### Run Tests
 
-Run all Clojure tests in the project:
+#### Using dotnet test (Recommended)
+
+Clojure.MSBuild includes a VSTest adapter that integrates seamlessly with `dotnet test`:
 
 ```bash
-dotnet msbuild /t:clj-test
+# Run all tests
+dotnet test
+
+# Run with detailed output
+dotnet test --logger:"console;verbosity=detailed"
+
+# Run specific test files
+dotnet test --filter "FullyQualifiedName~main_test"
 ```
+
+The test adapter automatically discovers and runs all Clojure tests in `*_test.clj` files that use `clojure.test`.
 
 ### Build/Compile Namespaces
 
@@ -134,12 +154,48 @@ dotnet msbuild /t:clj-build
 
 ## Example Project
 
-See the `/examples/simple` folder for a minimal working example.
+See the `/examples/simple` folder for a minimal working example that demonstrates:
+- Basic Clojure CLR application
+- Integration with `dotnet test`
+- C# interop capabilities
+- JSON handling with clojure.data.json
+
+## Testing Support
+
+### Writing Tests
+
+Create test files with the `_test.clj` suffix in your project:
+
+```clojure
+(ns my-namespace-test
+  (:require [clojure.test :refer :all]
+            [my-namespace :refer [my-function]]))
+
+(deftest test-my-function
+  (testing "My function works correctly"
+    (is (= expected (my-function input)))))
+```
+
+### C# Interop in Tests
+
+You can test C# classes from your Clojure tests:
+
+```clojure
+(ns csharp-interop-test
+  (:require [clojure.test :refer :all])
+  (:import [MyApp.Services MyService]))
+
+(deftest test-csharp-service
+  (testing "C# service integration"
+    (let [service (MyService.)]
+      (is (= "expected" (.ProcessData service "input"))))))
+```
 
 ## Requirements
 
 - .NET 9.0 SDK or later
 - Clojure CLR 1.12.2 or later
+- For testing: Microsoft.NET.Test.Sdk (automatically included)
 
 ## License
 

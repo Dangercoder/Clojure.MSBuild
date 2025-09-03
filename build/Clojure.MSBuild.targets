@@ -29,14 +29,6 @@
           ConsoleToMSBuild="false" />
   </Target>
 
-  <!-- Target to run Clojure tests -->
-  <Target Name="clj-test" DependsOnTargets="Build">
-    <Message Text="Running Clojure tests..." Importance="high" />
-    <Exec Command="dotnet &quot;$(ClojureMSBuildToolPath)&quot; --assembly &quot;$(TargetPath)&quot; --mode test" 
-          WorkingDirectory="$(MSBuildProjectDirectory)"
-          ConsoleToMSBuild="false" />
-  </Target>
-
   <!-- Hook Clojure tests into the standard test pipeline -->
   <PropertyGroup>
     <RunTestsDependsOn>$(RunTestsDependsOn);ClojureTest</RunTestsDependsOn>
