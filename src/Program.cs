@@ -54,17 +54,33 @@ class Program
         
         Console.WriteLine($"Assembly resolver configured for: {_outputDir}");
         
-        // Set CLOJURE_LOAD_PATH to include src directory BEFORE RT.Init()
+        // Set CLOJURE_LOAD_PATH to include src and test directories BEFORE RT.Init()
+        var loadPaths = new List<string>();
         var srcDir = Path.Combine(Environment.CurrentDirectory, "src");
+        var testDir = Path.Combine(Environment.CurrentDirectory, "test");
+        
         Console.WriteLine($"Checking for src directory at: {srcDir}");
         if (Directory.Exists(srcDir))
         {
-            Environment.SetEnvironmentVariable("CLOJURE_LOAD_PATH", srcDir);
-            Console.WriteLine($"Set CLOJURE_LOAD_PATH to: {srcDir}");
+            loadPaths.Add(srcDir);
         }
         else
         {
             Console.WriteLine($"src directory not found at: {srcDir}");
+        }
+        
+        // Add test directory if in test mode
+        if (mode == "test" && Directory.Exists(testDir))
+        {
+            loadPaths.Add(testDir);
+            Console.WriteLine($"Added test directory to load path: {testDir}");
+        }
+        
+        if (loadPaths.Count > 0)
+        {
+            var pathString = string.Join(Path.PathSeparator.ToString(), loadPaths);
+            Environment.SetEnvironmentVariable("CLOJURE_LOAD_PATH", pathString);
+            Console.WriteLine($"Set CLOJURE_LOAD_PATH to: {pathString}");
         }
 
         // Pre-load package assemblies using deps.json if available
@@ -331,6 +347,34 @@ class Program
             var testSym = internSymbolMethod.Invoke(null, new[] { "clojure.test" });
             var invokeMethod = require!.GetType().GetMethod("invoke", new[] { typeof(object) });
             invokeMethod!.Invoke(require, new[] { testSym });
+            
+            // Look for test files in the test directory
+            var testDir = Path.Combine(Environment.CurrentDirectory, "test");
+            if (Directory.Exists(testDir))
+            {
+                var testFiles = Directory.GetFiles(testDir, "*_test.clj", SearchOption.AllDirectories);
+                Console.WriteLine($"Found {testFiles.Length} test files");
+                
+                foreach (var testFile in testFiles)
+                {
+                    // Convert file path to namespace (e.g. test/main_test.clj -> main-test)
+                    var relativePath = Path.GetRelativePath(testDir, testFile);
+                    var ns = Path.GetFileNameWithoutExtension(relativePath).Replace('_', '-');
+                    
+                    Console.WriteLine($"Loading test namespace: {ns}");
+                    
+                    try
+                    {
+                        // (require 'namespace)
+                        var nsSym = internSymbolMethod.Invoke(null, new[] { ns });
+                        invokeMethod!.Invoke(require, new[] { nsSym });
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error loading namespace {ns}: {ex.Message}");
+                    }
+                }
+            }
             
             // (clojure.test/run-all-tests)
             var runAllTests = varMethod.Invoke(null, new[] { "clojure.test", "run-all-tests" });

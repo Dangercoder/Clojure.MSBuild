@@ -46,6 +46,11 @@
     (.Add list "MSBuild")
     (println "ArrayList:" (vec list))))
 
+(defn get-status
+  "Simple function to test - returns a status map"
+  []
+  {:status :success})
+
 (defn -main 
   [& args]
   (println "JSON Interop Demo - Clojure CLR with MSBuild")

@@ -37,6 +37,14 @@
           ConsoleToMSBuild="false" />
   </Target>
 
+  <!-- Override Test target to run Clojure tests with dotnet test -->
+  <Target Name="Test" DependsOnTargets="Build" Condition="Exists('test')">
+    <Message Text="Running Clojure tests via dotnet test..." Importance="high" />
+    <Exec Command="dotnet &quot;$(ClojureMSBuildToolPath)&quot; --assembly &quot;$(TargetPath)&quot; --mode test" 
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
   <!-- Helper target to ensure assemblies are in output -->
   <Target Name="EnsureClojureAssemblies" AfterTargets="Build">
     <Message Text="Ensuring Clojure assemblies are available in output directory" 
