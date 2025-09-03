@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd">
+  <metadata>
+    <id>Clojure.MSBuild.Templates</id>
+    <version>0.3.0</version>
+    <title>Clojure MSBuild Templates</title>
+    <authors>Clojure.MSBuild</authors>
+    <description>Project templates for creating Clojure CLR applications with MSBuild integration</description>
+    <packageTypes>
+      <packageType name="Template" />
+    </packageTypes>
+    <tags>clojure dotnet template msbuild</tags>
+  </metadata>
+  <files>
+    <file src="clojure-app/**/*" target="content/clojure-app" />
+  </files>
+</package>

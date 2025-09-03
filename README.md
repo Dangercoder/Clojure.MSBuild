@@ -13,14 +13,67 @@ MSBuild integration for Clojure CLR projects. Build, test, and run Clojure code 
 
 ## Quick Start
 
-### 1. Create a new .NET project
+### Option 1: Using the Project Template (Recommended)
+
+#### Install the template
+
+```bash
+# From NuGet (when published)
+dotnet new install Clojure.MSBuild.Templates
+
+# Or install from local source during development
+dotnet new install /path/to/clojure-msbuild/templates/clojure-app
+```
+
+#### Create a new project
+
+```bash
+# Create a new Clojure CLR app with default settings
+dotnet new clojure-app -n MyClojureApp
+cd MyClojureApp
+
+# Run your app
+dotnet run
+
+# Run tests
+dotnet test
+```
+
+#### Template Options
+
+```bash
+# Create with .NET 8.0 instead of 9.0
+dotnet new clojure-app -n MyApp --framework net8.0
+
+# Use a specific Clojure version
+dotnet new clojure-app -n MyApp --clojureVersion 1.12.0
+
+# Create without test setup
+dotnet new clojure-app -n MyApp --enableTests false
+
+# See all options
+dotnet new clojure-app -h
+```
+
+#### What's Included
+
+The template creates a complete project structure:
+- **src/main.clj** - Main application entry point with JSON and .NET interop examples
+- **test/main_test.clj** - Sample test file using clojure.test
+- **.csproj** - Pre-configured with all required packages
+- **README.md** - Project-specific documentation
+- **.gitignore** - Common build artifacts excluded
+
+### Option 2: Manual Setup
+
+#### 1. Create a new .NET project
 
 ```bash
 dotnet new console -n MyClojureApp
 cd MyClojureApp
 ```
 
-### 2. Update your .csproj file
+#### 2. Update your .csproj file
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
@@ -45,7 +98,7 @@ cd MyClojureApp
 </Project>
 ```
 
-### 3. Create your Clojure code
+#### 3. Create your Clojure code
 
 Create `src/main.clj`:
 
@@ -59,7 +112,7 @@ Create `src/main.clj`:
     (println "Arguments:" (vec args))))
 ```
 
-### 4. Run your application
+#### 4. Run your application
 
 ```bash
 # Using dotnet run
@@ -196,6 +249,49 @@ You can test C# classes from your Clojure tests:
 - .NET 9.0 SDK or later
 - Clojure CLR 1.12.2 or later
 - For testing: Microsoft.NET.Test.Sdk (automatically included)
+
+## Project Templates
+
+### Installing Templates
+
+The project includes a `dotnet new` template for quick project scaffolding:
+
+```bash
+# Install from the local template directory
+dotnet new install ./templates/clojure-app
+
+# Uninstall if needed
+dotnet new uninstall clojure-app
+```
+
+### Creating Projects
+
+Once installed, create new Clojure CLR projects easily:
+
+```bash
+# Basic project
+dotnet new clojure-app -n MyProject
+
+# With options
+dotnet new clojure-app -n MyProject \
+  --framework net8.0 \
+  --clojureVersion 1.12.0 \
+  --enableTests true
+```
+
+### Template Development
+
+To package the template for distribution:
+
+```bash
+# Package as NuGet (when nuget CLI is available)
+cd templates
+nuget pack Clojure.MSBuild.Templates.nuspec
+
+# Or create a template package manually
+cd templates/clojure-app
+dotnet pack
+```
 
 ## License
 

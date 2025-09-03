@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>{FRAMEWORK}</TargetFramework>
+    <ClojureMainNamespace>main</ClojureMainNamespace>
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Clojure.MSBuild" Version="0.3.0" />
+    <PackageReference Include="Clojure" Version="{CLOJURE_VERSION}" />
+    <PackageReference Include="clojure.data.json" Version="2.5.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.13.0" />
+    <PackageReference Include="Clojure.MSBuild.TestAdapter" Version="0.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="src/**/*.clj">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="test/**/*.clj">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

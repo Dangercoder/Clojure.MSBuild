@@ -4,9 +4,9 @@
     <TargetFramework>net9.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
-    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <PackageId>Clojure.MSBuild.TestAdapter</PackageId>
-    <Version>0.3.3</Version>
+    <Version>0.3.0</Version>
     <Authors>ClojureMSBuild</Authors>
     <Description>VSTest adapter for running Clojure tests with dotnet test</Description>
     <PackageTags>clojure;test;vstest;adapter</PackageTags>
@@ -17,13 +17,14 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.TestPlatform.ObjectModel" Version="17.8.0" />
     <PackageReference Include="Clojure" Version="1.12.2" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
   </ItemGroup>
 
   <ItemGroup>
     <None Include="build\**\*" Pack="true" PackagePath="build\" />
   </ItemGroup>
   
-  <Target Name="PackBuildOutputs" DependsOnTargets="Build" BeforeTargets="Pack">
+  <Target Name="PackBuildOutputs" DependsOnTargets="Build" BeforeTargets="_GetPackageFiles">
     <ItemGroup>
       <!-- Package the adapter DLL to both lib and build folders for VSTest discovery -->
       <None Include="$(OutputPath)\Clojure.MSBuild.TestAdapter.dll" Pack="true" PackagePath="build\net9.0\" />

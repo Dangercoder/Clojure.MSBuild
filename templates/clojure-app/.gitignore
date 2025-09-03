@@ -1,0 +1,9 @@
+bin/
+obj/
+*.user
+.vs/
+*.suo
+*.cache
+*.log
+.idea/
+*.iml

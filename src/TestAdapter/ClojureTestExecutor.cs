@@ -107,13 +107,24 @@ namespace Clojure.MSBuild.TestAdapter
             {
                 if (pattern.Contains("*"))
                 {
-                    var dir = Path.GetDirectoryName(pattern);
-                    var searchPattern = Path.GetFileName(pattern);
-                    if (Directory.Exists(dir))
+                    // Handle wildcards in the path (for NuGet package versions)
+                    var parts = pattern.Split('*');
+                    if (parts.Length == 2)
                     {
-                        var files = Directory.GetFiles(dir, searchPattern, SearchOption.AllDirectories);
-                        if (files.Length > 0)
-                            return files.OrderByDescending(f => f).First(); // Get latest version
+                        var baseDir = parts[0].TrimEnd(Path.DirectorySeparatorChar);
+                        var remainingPath = parts[1].TrimStart(Path.DirectorySeparatorChar);
+                        
+                        if (Directory.Exists(baseDir))
+                        {
+                            // Find all version directories
+                            var versionDirs = Directory.GetDirectories(baseDir);
+                            foreach (var versionDir in versionDirs.OrderByDescending(d => d))
+                            {
+                                var toolPath = Path.Combine(versionDir, remainingPath);
+                                if (File.Exists(toolPath))
+                                    return toolPath;
+                            }
+                        }
                     }
                 }
                 else if (File.Exists(pattern))
