@@ -37,7 +37,7 @@ namespace Clojure.MSBuild.TestAdapter
                 }
                 
                 // Find all test files
-                var testFiles = Directory.GetFiles(testDir, "*_test.clj", SearchOption.AllDirectories);
+                var testFiles = Directory.GetFiles(testDir, "*_test.cljr", SearchOption.AllDirectories);
                 logger?.SendMessage(TestMessageLevel.Informational, $"Found {testFiles.Length} test files");
                 
                 foreach (var testFile in testFiles)

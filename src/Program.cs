@@ -368,12 +368,12 @@ class Program
             
             if (Directory.Exists(testDir))
             {
-                var testFiles = Directory.GetFiles(testDir, "*_test.clj", SearchOption.AllDirectories);
+                var testFiles = Directory.GetFiles(testDir, "*_test.cljr", SearchOption.AllDirectories);
                 Console.WriteLine($"Found {testFiles.Length} test files");
                 
                 foreach (var testFile in testFiles)
                 {
-                    // Convert file path to namespace (e.g. test/main_test.clj -> main-test)
+                    // Convert file path to namespace (e.g. test/main_test.cljr -> main-test)
                     var relativePath = Path.GetRelativePath(testDir, testFile);
                     var ns = Path.GetFileNameWithoutExtension(relativePath).Replace('_', '-');
                     

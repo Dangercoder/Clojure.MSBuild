@@ -25,7 +25,7 @@ dotnet msbuild /t:clj-nrepl
 
 ```
 src/
-  main.clj         # Main application entry point (main namespace)
+  main.cljr        # Main application entry point (main namespace)
 test/
-  main_test.clj    # Test file (main-test namespace)
+  main_test.cljr   # Test file (main-test namespace)
 ```

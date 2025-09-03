@@ -58,8 +58,8 @@ dotnet new clojure-app -h
 #### What's Included
 
 The template creates a complete project structure:
-- **src/main.clj** - Main application entry point with JSON and .NET interop examples
-- **test/main_test.clj** - Sample test file using clojure.test
+- **src/main.cljr** - Main application entry point with JSON and .NET interop examples
+- **test/main_test.cljr** - Sample test file using clojure.test
 - **.csproj** - Pre-configured with all required packages
 - **README.md** - Project-specific documentation
 - **.gitignore** - Common build artifacts excluded
@@ -90,7 +90,7 @@ cd MyClojureApp
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="src/**/*.clj">
+    <Content Include="src/**/*.cljr">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
@@ -100,7 +100,7 @@ cd MyClojureApp
 
 #### 3. Create your Clojure code
 
-Create `src/main.clj`:
+Create `src/main.cljr`:
 
 ```clojure
 (ns main)

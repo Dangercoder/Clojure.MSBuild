@@ -16,10 +16,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="src/**/*.clj">
+    <Content Include="src/**/*.cljr">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="test/**/*.clj">
+    <Content Include="test/**/*.cljr">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
