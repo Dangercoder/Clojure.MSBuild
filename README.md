@@ -217,11 +217,14 @@ You can create Clojure libraries that can be referenced by other .NET projects:
   <OutputType>Library</OutputType>
   <TargetFramework>net9.0</TargetFramework>
   <!-- No ClojureMainNamespace for libraries -->
+  <!-- Optional: AOT compile namespaces -->
+  <ClojureCompileOnBuild>true</ClojureCompileOnBuild>
+  <ClojureNamespacesToCompile>my-lib;my-utils</ClojureNamespacesToCompile>
 </PropertyGroup>
 ```
 
 2. Add your Clojure namespaces in the `src/` directory
-3. Build with `dotnet build` to create a DLL
+3. Build with `dotnet build` to create a DLL and optionally AOT-compiled namespaces
 
 ### Using Libraries
 
@@ -243,7 +246,9 @@ Or as a NuGet package:
 - Library projects don't need `ClojureMainNamespace` since they don't have an entry point
 - The source generator won't create a Program.cs for library projects
 - Consumer projects must ensure Clojure runtime is initialized before using library code
-- Clojure source files (*.cljr) are included in the output directory for runtime loading
+- When `ClojureCompileOnBuild` is true, namespaces are AOT-compiled to `.cljr.dll` files
+- Compiled DLLs are automatically copied to consuming projects via ProjectReference
+- Both source files (*.cljr) and compiled DLLs can be used for runtime loading
 
 ## Example Projects
 
@@ -253,8 +258,9 @@ See the `/examples` folder for working examples:
   - C# interop capabilities
   - JSON handling with clojure.data.json
 - `/examples/simple_library` - Library project demonstrating:
-  - Creating reusable Clojure libraries
+  - Creating reusable Clojure libraries with AOT compilation
   - Math and string utility functions
+  - Automatic DLL generation and distribution
   - Library testing with clojure.test
 
 ## Testing Support
