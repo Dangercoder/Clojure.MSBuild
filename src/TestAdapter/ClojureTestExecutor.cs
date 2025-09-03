@@ -200,7 +200,17 @@ namespace Clojure.MSBuild.TestAdapter
                     }
                 };
                 
+                process.ErrorDataReceived += (s, e) => 
+                {
+                    if (!string.IsNullOrEmpty(e.Data))
+                    {
+                        output.AppendLine(e.Data);
+                        frameworkHandle?.SendMessage(TestMessageLevel.Warning, e.Data);
+                    }
+                };
+                
                 process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
                 process.WaitForExit();
                 
                 // Parse summary line

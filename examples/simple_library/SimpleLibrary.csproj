@@ -20,7 +20,8 @@
     <!-- Using local source generator for testing -->
     <Analyzer Include="../../src/Clojure.MSBuild.SourceGenerators/bin/Release/netstandard2.0/Clojure.MSBuild.SourceGenerators.dll" />
     <PackageReference Include="Clojure" Version="1.12.2" />
-    <PackageReference Include="Clojure.MSBuild.TestAdapter" Version="0.3.0" />
+    <!-- Using local test adapter for testing -->
+    <ProjectReference Include="../../src/TestAdapter/Clojure.MSBuild.TestAdapter.csproj" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
   </ItemGroup>
 
