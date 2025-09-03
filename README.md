@@ -11,6 +11,12 @@ MSBuild integration for Clojure CLR projects. Build, test, and run Clojure code 
 - **C# Interop** - seamlessly use C# classes from Clojure
 - **Automatic entry point** generation via source generators
 
+## Requirements
+
+- .NET 9.0 SDK or later
+- Clojure CLR 1.12.2 or later
+- For testing: Microsoft.NET.Test.Sdk (automatically included)
+
 ## Quick Start
 
 ### Option 1: Using the Project Template (Recommended)
@@ -37,22 +43,6 @@ dotnet run
 
 # Run tests
 dotnet test
-```
-
-#### Template Options
-
-```bash
-# Create with .NET 8.0 instead of 9.0
-dotnet new clojure-app -n MyApp --framework net8.0
-
-# Use a specific Clojure version
-dotnet new clojure-app -n MyApp --clojureVersion 1.12.0
-
-# Create without test setup
-dotnet new clojure-app -n MyApp --enableTests false
-
-# See all options
-dotnet new clojure-app -h
 ```
 
 #### What's Included
@@ -293,12 +283,6 @@ You can test C# classes from your Clojure tests:
     (let [service (MyService.)]
       (is (= "expected" (.ProcessData service "input"))))))
 ```
-
-## Requirements
-
-- .NET 9.0 SDK or later
-- Clojure CLR 1.12.2 or later
-- For testing: Microsoft.NET.Test.Sdk (automatically included)
 
 ## Project Templates
 
