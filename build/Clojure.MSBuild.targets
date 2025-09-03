@@ -37,12 +37,20 @@
           ConsoleToMSBuild="false" />
   </Target>
 
-  <!-- Override Test target to run Clojure tests with dotnet test -->
-  <Target Name="Test" DependsOnTargets="Build" Condition="Exists('test')">
-    <Message Text="Running Clojure tests via dotnet test..." Importance="high" />
+  <!-- Hook Clojure tests into the standard test pipeline -->
+  <PropertyGroup>
+    <RunTestsDependsOn>$(RunTestsDependsOn);ClojureTest</RunTestsDependsOn>
+  </PropertyGroup>
+  
+  <Target Name="ClojureTest" DependsOnTargets="Build" Condition="Exists('test')">
+    <Message Text="Running Clojure tests..." Importance="high" />
     <Exec Command="dotnet &quot;$(ClojureMSBuildToolPath)&quot; --assembly &quot;$(TargetPath)&quot; --mode test" 
           WorkingDirectory="$(MSBuildProjectDirectory)"
-          ConsoleToMSBuild="false" />
+          ConsoleToMSBuild="false"
+          ContinueOnError="false">
+      <Output TaskParameter="ExitCode" PropertyName="ClojureTestExitCode"/>
+    </Exec>
+    <Error Condition="'$(ClojureTestExitCode)' != '0'" Text="Clojure tests failed with exit code $(ClojureTestExitCode)" />
   </Target>
 
   <!-- Helper target to ensure assemblies are in output -->

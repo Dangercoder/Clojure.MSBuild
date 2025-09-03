@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ItemGroup>
+    <!-- Copy the test adapter to output directory for VSTest discovery -->
+    <None Include="$(MSBuildThisFileDirectory)Clojure.MSBuild.TestAdapter.dll">
+      <Link>Clojure.MSBuild.TestAdapter.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+    <None Include="$(MSBuildThisFileDirectory)Clojure.MSBuild.TestAdapter.pdb" Condition="Exists('$(MSBuildThisFileDirectory)Clojure.MSBuild.TestAdapter.pdb')">
+      <Link>Clojure.MSBuild.TestAdapter.pdb</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+  
+  <!-- Mark this as a test project so VSTest knows to run -->
+  <PropertyGroup>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+</Project>

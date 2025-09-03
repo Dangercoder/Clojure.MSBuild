@@ -64,4 +64,4 @@
   (when (seq args)
     (println "\nCommand line arguments:" (vec args)))
   
-  (println "\n=== All tests completed successfully! ==="))
+  (println "\n=== Demo completed successfully! ==="))

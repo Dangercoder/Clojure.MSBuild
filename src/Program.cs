@@ -18,6 +18,7 @@ class Program
         string? scriptPath = null;
         string? namespaces = null;
         string? compilePath = null;
+        string? namespaceToTest = null;
 
         for (int i = 2; i < args.Length; i++)
         {
@@ -37,14 +38,18 @@ class Program
             {
                 compilePath = args[++i];
             }
+            else if (args[i] == "--namespace" && i + 1 < args.Length)
+            {
+                namespaceToTest = args[++i];
+            }
         }
 
-        RunClojure(assemblyPath, mode, scriptPath, namespaces, compilePath);
+        RunClojure(assemblyPath, mode, scriptPath, namespaces, compilePath, namespaceToTest);
     }
 
     static string? _outputDir = null;
     
-    static void RunClojure(string assemblyPath, string mode, string? scriptPath, string? namespaces = null, string? compilePath = null)
+    static void RunClojure(string assemblyPath, string mode, string? scriptPath, string? namespaces = null, string? compilePath = null, string? namespaceToTest = null)
     {
         _outputDir = Path.GetDirectoryName(assemblyPath) ?? ".";
         
@@ -143,6 +148,15 @@ class Program
                 RunTests(rtType, varMethod!, internSymbolMethod!);
                 break;
                 
+            case "test-namespace":
+                if (string.IsNullOrEmpty(namespaceToTest))
+                {
+                    Console.WriteLine("Error: --namespace required for test-namespace mode");
+                    Environment.Exit(1);
+                }
+                RunNamespaceTests(rtType, varMethod!, internSymbolMethod!, namespaceToTest);
+                break;
+                
             case "compile":
                 if (string.IsNullOrEmpty(namespaces))
                 {
@@ -154,7 +168,7 @@ class Program
                 
             default:
                 Console.WriteLine($"Error: Unknown mode '{mode}'");
-                Console.WriteLine("Valid modes: repl, nrepl, script, test, compile");
+                Console.WriteLine("Valid modes: repl, nrepl, script, test, test-namespace, compile");
                 Environment.Exit(1);
                 break;
         }
@@ -350,6 +364,8 @@ class Program
             
             // Look for test files in the test directory
             var testDir = Path.Combine(Environment.CurrentDirectory, "test");
+            var testNamespaces = new List<object>();
+            
             if (Directory.Exists(testDir))
             {
                 var testFiles = Directory.GetFiles(testDir, "*_test.clj", SearchOption.AllDirectories);
@@ -368,6 +384,7 @@ class Program
                         // (require 'namespace)
                         var nsSym = internSymbolMethod.Invoke(null, new[] { ns });
                         invokeMethod!.Invoke(require, new[] { nsSym });
+                        testNamespaces.Add(nsSym);
                     }
                     catch (Exception ex)
                     {
@@ -376,14 +393,60 @@ class Program
                 }
             }
             
-            // (clojure.test/run-all-tests)
-            var runAllTests = varMethod.Invoke(null, new[] { "clojure.test", "run-all-tests" });
-            var invoke0Method = runAllTests!.GetType().GetMethod("invoke", Type.EmptyTypes);
-            invoke0Method!.Invoke(runAllTests, null);
+            // Only run tests from our test namespaces, not all loaded namespaces
+            if (testNamespaces.Count > 0)
+            {
+                // (apply clojure.test/run-tests ['ns1 'ns2 ...])
+                var runTests = varMethod.Invoke(null, new[] { "clojure.test", "run-tests" });
+                var applyFn = varMethod.Invoke(null, new[] { "clojure.core", "apply" });
+                
+                // Create a vector of namespaces
+                var vectorMethod = rtType.GetMethod("vector", new[] { typeof(object[]) });
+                var nsVector = vectorMethod!.Invoke(null, new[] { testNamespaces.ToArray() });
+                
+                // Call (apply run-tests nsVector)
+                var applyInvokeMethod = applyFn!.GetType().GetMethod("invoke", new[] { typeof(object), typeof(object) });
+                applyInvokeMethod!.Invoke(applyFn, new[] { runTests, nsVector });
+            }
+            else
+            {
+                // Fall back to run-all-tests if no test files found
+                var runAllTests = varMethod.Invoke(null, new[] { "clojure.test", "run-all-tests" });
+                var invoke0Method = runAllTests!.GetType().GetMethod("invoke", Type.EmptyTypes);
+                invoke0Method!.Invoke(runAllTests, null);
+            }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Error running tests: {ex.Message}");
+        }
+    }
+    
+    static void RunNamespaceTests(Type rtType, MethodInfo varMethod, MethodInfo internSymbolMethod, string namespaceName)
+    {
+        Console.WriteLine($"Running tests for namespace: {namespaceName}");
+        
+        try
+        {
+            // (require 'clojure.test)
+            var require = varMethod.Invoke(null, new[] { "clojure.core", "require" });
+            var testSym = internSymbolMethod.Invoke(null, new[] { "clojure.test" });
+            var invokeMethod = require!.GetType().GetMethod("invoke", new[] { typeof(object) });
+            invokeMethod!.Invoke(require, new[] { testSym });
+            
+            // (require 'namespace)
+            var nsSym = internSymbolMethod.Invoke(null, new[] { namespaceName });
+            invokeMethod!.Invoke(require, new[] { nsSym });
+            
+            // (clojure.test/run-tests 'namespace)
+            var runTests = varMethod.Invoke(null, new[] { "clojure.test", "run-tests" });
+            var invoke1Method = runTests!.GetType().GetMethod("invoke", new[] { typeof(object) });
+            invoke1Method!.Invoke(runTests, new[] { nsSym });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error running tests for namespace {namespaceName}: {ex.Message}");
+            Environment.Exit(1);
         }
     }
     
