@@ -1,6 +1,7 @@
 obj
 bin
 clojure-clr/
+potion/
 *.dll
 tools
 *.exe

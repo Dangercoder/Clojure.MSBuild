@@ -271,28 +271,25 @@ class Program
         
         try
         {
-            // (require 'clojure.tools.nrepl.server)
+            // (require 'clojure.tools.nrepl)
             var require = varMethod.Invoke(null, new[] { "clojure.core", "require" });
-            var nreplSym = internSymbolMethod.Invoke(null, new[] { "clojure.tools.nrepl.server" });
+            var nreplSym = internSymbolMethod.Invoke(null, new[] { "clojure.tools.nrepl" });
             var invokeMethod = require!.GetType().GetMethod("invoke", new[] { typeof(object) });
             invokeMethod!.Invoke(require, new[] { nreplSym });
             
-            // (clojure.tools.nrepl.server/start-server :port 7888)
-            var startServer = varMethod.Invoke(null, new[] { "clojure.tools.nrepl.server", "start-server" });
-            var internKeywordMethod = keywordType.GetMethod("intern", new[] { typeof(string) });
-            var portKeyword = internKeywordMethod!.Invoke(null, new[] { "port" });
+            // (clojure.tools.nrepl/start-server!)
+            var startServer = varMethod.Invoke(null, new[] { "clojure.tools.nrepl", "start-server!" });
+            var invoke0Method = startServer!.GetType().GetMethod("invoke", Type.EmptyTypes);
+            invoke0Method!.Invoke(startServer, null);
             
-            var invoke2Method = startServer!.GetType().GetMethod("invoke", new[] { typeof(object), typeof(object) });
-            invoke2Method!.Invoke(startServer, new[] { portKeyword, 7888 });
-            
-            Console.WriteLine("nREPL server started on port 7888");
-            Console.WriteLine("Press Enter to stop...");
+            Console.WriteLine("nREPL started at port: 1667");
             Console.ReadLine();
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error starting nREPL: {ex.Message}");
-            Console.WriteLine("Make sure clojure.tools.nrepl is in your project dependencies");
+            var innerEx = ex.InnerException ?? ex;
+            Console.WriteLine($"Error starting nREPL: {innerEx.Message}");
+            Console.WriteLine("Make sure clojure.tools.nrepl version 0.1.0-alpha1 is in your project dependencies");
         }
     }
 

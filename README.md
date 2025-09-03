@@ -73,12 +73,54 @@ Clojure.MSBuild uses a source generator to automatically create the .NET entry p
 
 No manual Program.cs needed - the source generator handles everything behind the scenes.
 
-## REPL Support
+## Development Tools
 
-Start a REPL for interactive development:
+### REPL Support
+
+Start an interactive REPL with all project dependencies:
 
 ```bash
-dotnet msbuild /t:ClojureRepl
+dotnet msbuild /t:clj-repl
+```
+
+### nREPL Server
+
+Start an nREPL server for editor integration (port 1667):
+
+```bash
+# First, add the nREPL package to your project
+dotnet add package clojure.tools.nrepl --version 0.1.0-alpha1
+
+# Then start the nREPL server
+dotnet msbuild /t:clj-nrepl
+```
+
+Connect from your editor:
+- VS Code with Calva: Connect to Generic -> localhost:1667
+- Emacs/Vim: Connect to localhost:1667
+
+### Run Scripts
+
+Run a Clojure script file:
+
+```bash
+dotnet msbuild /t:clj-run -p:File=src/script.clj
+```
+
+### Run Tests
+
+Run all Clojure tests in the project:
+
+```bash
+dotnet msbuild /t:clj-test
+```
+
+### Build/Compile Namespaces
+
+Compile Clojure namespaces to .NET DLLs:
+
+```bash
+dotnet msbuild /t:clj-build
 ```
 
 ## Configuration Options
@@ -86,8 +128,9 @@ dotnet msbuild /t:ClojureRepl
 | Property | Description | Default |
 |----------|-------------|---------|
 | `ClojureMainNamespace` | Namespace containing your -main function | Required for executables |
-| `ClojureReplEnabled` | Enable REPL target | true |
-| `ClojureAutoLoadAssemblies` | Auto-load NuGet assemblies in REPL | true |
+| `ClojureAutoLoadAssemblies` | Auto-load NuGet assemblies | true |
+| `ClojureCompileOnBuild` | Compile namespaces during build | false |
+| `ClojureNamespacesToCompile` | Namespaces to compile (semicolon-separated) | main namespace |
 
 ## Example Project
 

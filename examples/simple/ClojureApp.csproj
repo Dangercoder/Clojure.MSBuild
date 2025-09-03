@@ -2,6 +2,7 @@
   
   <!-- Import the props to make ClojureMainNamespace visible to source generator -->
   <Import Project="../../build/Clojure.MSBuild.props" />
+  <Import Project="../../build/Clojure.MSBuild.targets" />
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -15,6 +16,7 @@
     <Analyzer Include="../../src/Clojure.MSBuild.SourceGenerators/bin/Release/netstandard2.0/Clojure.MSBuild.SourceGenerators.dll" />
     <PackageReference Include="Clojure" Version="1.12.2" />
     <PackageReference Include="clojure.data.json" Version="2.5.0" />
+    <PackageReference Include="clojure.tools.nrepl" Version="0.1.0-alpha1" />
     <PackageReference Include="System.Text.Json" Version="9.0.0" />
   </ItemGroup>
 
