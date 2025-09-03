@@ -1,0 +1,74 @@
+(ns math-utils)
+
+(defn factorial 
+  "Calculate factorial of n"
+  [n]
+  (if (<= n 1)
+    1
+    (* n (factorial (dec n)))))
+
+(defn fibonacci
+  "Calculate nth fibonacci number"
+  [n]
+  (cond
+    (= n 0) 0
+    (= n 1) 1
+    :else (+ (fibonacci (- n 1))
+             (fibonacci (- n 2)))))
+
+(defn prime?
+  "Check if a number is prime"
+  [n]
+  (cond
+    (<= n 1) false
+    (= n 2) true
+    (even? n) false
+    :else (not (some #(zero? (mod n %))
+                     (range 3 (inc (Math/Sqrt n)) 2)))))
+
+(defn gcd
+  "Calculate greatest common divisor"
+  [a b]
+  (if (zero? b)
+    a
+    (recur b (mod a b))))
+
+(defn lcm
+  "Calculate least common multiple"
+  [a b]
+  (/ (* a b) (gcd a b)))
+
+(defn power
+  "Calculate a raised to power b"
+  [a b]
+  (Math/Pow a b))
+
+(defn distance
+  "Calculate euclidean distance between two points"
+  [[x1 y1] [x2 y2]]
+  (Math/Sqrt (+ (Math/Pow (- x2 x1) 2)
+                (Math/Pow (- y2 y1) 2))))
+
+(defn average
+  "Calculate average of a collection of numbers"
+  [coll]
+  (when (seq coll)
+    (/ (reduce + coll) (count coll))))
+
+(defn median
+  "Calculate median of a collection of numbers"
+  [coll]
+  (let [sorted (sort coll)
+        cnt (count sorted)
+        mid (quot cnt 2)]
+    (if (odd? cnt)
+      (nth sorted mid)
+      (average [(nth sorted (dec mid)) (nth sorted mid)]))))
+
+(defn standard-deviation
+  "Calculate standard deviation"
+  [coll]
+  (let [avg (average coll)
+        squared-diffs (map #(Math/Pow (- % avg) 2) coll)
+        variance (average squared-diffs)]
+    (Math/Sqrt variance)))

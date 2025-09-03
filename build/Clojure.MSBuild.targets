@@ -51,13 +51,13 @@
              Condition="'$(ClojureAutoLoadAssemblies)' == 'true'" />
   </Target>
 
-  <!-- Target to compile Clojure namespaces to DLLs -->
-  <Target Name="clj-build" DependsOnTargets="Build">
+  <!-- Compile Clojure namespaces during build when ClojureCompileOnBuild is true -->
+  <Target Name="ClojureCompile" AfterTargets="Build" Condition="'$(ClojureCompileOnBuild)' == 'true'">
     <PropertyGroup>
-      <!-- Default compile path if not specified -->
-      <ClojureCompilePath Condition="'$(ClojureCompilePath)' == ''">$(OutputPath)compiled</ClojureCompilePath>
-      <!-- Find main namespace if not specified -->
-      <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''">clj-api.main</ClojureNamespacesToCompile>
+      <!-- Default compile path is the output directory itself so DLLs are picked up by ProjectReference -->
+      <ClojureCompilePath Condition="'$(ClojureCompilePath)' == ''">$(OutputPath)</ClojureCompilePath>
+      <!-- Use main namespace if not specified -->
+      <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''">$(ClojureMainNamespace)</ClojureNamespacesToCompile>
     </PropertyGroup>
     
     <Message Text="Compiling Clojure namespaces: $(ClojureNamespacesToCompile)" Importance="high" />
@@ -72,11 +72,6 @@
           ConsoleToMSBuild="false" />
           
     <Message Text="Compilation complete. DLLs written to $(ClojureCompilePath)" Importance="high" />
-  </Target>
-  
-  <!-- Optionally compile during build -->
-  <Target Name="ClojureCompileOnBuild" AfterTargets="Build" Condition="'$(ClojureCompileOnBuild)' == 'true'">
-    <CallTarget Targets="clj-build" />
   </Target>
 
 </Project>

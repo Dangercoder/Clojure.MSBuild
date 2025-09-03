@@ -1,0 +1,43 @@
+(ns string-utils-test
+  (:require [clojure.test :refer :all]
+            [string-utils :as str-utils]))
+
+(deftest test-palindrome?
+  (testing "Palindrome detection"
+    (is (true? (str-utils/palindrome? "racecar")))
+    (is (true? (str-utils/palindrome? "A man a plan a canal Panama")))
+    (is (false? (str-utils/palindrome? "hello")))
+    (is (true? (str-utils/palindrome? "")))))
+
+(deftest test-word-count
+  (testing "Word counting"
+    (is (= 5 (str-utils/word-count "The quick brown fox jumps")))
+    (is (= 1 (str-utils/word-count "Hello")))
+    (is (= 3 (str-utils/word-count "  Multiple   spaces   here  ")))))
+
+(deftest test-capitalize-words
+  (testing "Word capitalization"
+    (is (= "Hello World" (str-utils/capitalize-words "hello world")))
+    (is (= "The Quick Brown Fox" (str-utils/capitalize-words "the quick brown fox")))
+    (is (= "Already" (str-utils/capitalize-words "already")))))
+
+(deftest test-truncate
+  (testing "String truncation"
+    (is (= "Hello..." (str-utils/truncate "Hello World" 8)))
+    (is (= "Hi" (str-utils/truncate "Hi" 10)))
+    (is (= "12..." (str-utils/truncate "12345" 5)))))
+
+(deftest test-slug
+  (testing "Slug generation"
+    (is (= "hello-world" (str-utils/slug "Hello World")))
+    (is (= "this-that" (str-utils/slug "This & That")))
+    (is (= "multiple-spaces" (str-utils/slug "  Multiple   Spaces  ")))))
+
+(deftest test-extract-urls
+  (testing "URL extraction"
+    (let [text "Visit https://example.com and http://test.org for more info"]
+      (is (= ["https://example.com" "http://test.org"]
+             (str-utils/extract-urls text))))
+    (is (empty? (str-utils/extract-urls "No URLs here")))
+    (is (= ["https://single.url"]
+           (str-utils/extract-urls "Check https://single.url out!")))))

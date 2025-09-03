@@ -1,0 +1,11 @@
+(ns library-test)
+
+;; Direct load of library files
+(load-file "src/math_utils.cljr")
+(load-file "src/string_utils.cljr")
+
+(defn -main []
+  (println "Testing library functions:")
+  (println "5! =" (math-utils/factorial 5))
+  (println "Is 'racecar' a palindrome?" (string-utils/palindrome? "racecar"))
+  (println "Tests passed!"))

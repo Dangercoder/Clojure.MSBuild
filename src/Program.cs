@@ -452,6 +452,12 @@ class Program
     
     static void CompileNamespaces(Assembly clojureAssembly, Type rtType, MethodInfo varMethod, MethodInfo internSymbolMethod, string namespaces, string compilePath)
     {
+        // Make compile path absolute if it's relative
+        if (!Path.IsPathRooted(compilePath))
+        {
+            compilePath = Path.GetFullPath(compilePath);
+        }
+        
         Console.WriteLine($"Compiling namespaces to: {compilePath}");
         
         // Create compile directory if it doesn't exist

@@ -205,13 +205,57 @@ dotnet msbuild /t:clj-build
 | `ClojureCompileOnBuild` | Compile namespaces during build | false |
 | `ClojureNamespacesToCompile` | Namespaces to compile (semicolon-separated) | main namespace |
 
-## Example Project
+## Creating Libraries
 
-See the `/examples/simple` folder for a minimal working example that demonstrates:
-- Basic Clojure CLR application
-- Integration with `dotnet test`
-- C# interop capabilities
-- JSON handling with clojure.data.json
+You can create Clojure libraries that can be referenced by other .NET projects:
+
+### Library Project Setup
+
+1. Create a new project with `OutputType` set to `Library`:
+```xml
+<PropertyGroup>
+  <OutputType>Library</OutputType>
+  <TargetFramework>net9.0</TargetFramework>
+  <!-- No ClojureMainNamespace for libraries -->
+</PropertyGroup>
+```
+
+2. Add your Clojure namespaces in the `src/` directory
+3. Build with `dotnet build` to create a DLL
+
+### Using Libraries
+
+Reference the library from another project:
+```xml
+<ItemGroup>
+  <ProjectReference Include="../MyLibrary/MyLibrary.csproj" />
+</ItemGroup>
+```
+
+Or as a NuGet package:
+```xml
+<ItemGroup>
+  <PackageReference Include="MyClojureLibrary" Version="1.0.0" />
+</ItemGroup>
+```
+
+### Important Notes
+- Library projects don't need `ClojureMainNamespace` since they don't have an entry point
+- The source generator won't create a Program.cs for library projects
+- Consumer projects must ensure Clojure runtime is initialized before using library code
+- Clojure source files (*.cljr) are included in the output directory for runtime loading
+
+## Example Projects
+
+See the `/examples` folder for working examples:
+- `/examples/simple` - Basic executable application demonstrating:
+  - Integration with `dotnet test`
+  - C# interop capabilities
+  - JSON handling with clojure.data.json
+- `/examples/simple_library` - Library project demonstrating:
+  - Creating reusable Clojure libraries
+  - Math and string utility functions
+  - Library testing with clojure.test
 
 ## Testing Support
 

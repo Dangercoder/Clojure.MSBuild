@@ -5,29 +5,23 @@
   <Import Project="../../build/Clojure.MSBuild.targets" />
 
   <PropertyGroup>
-    <OutputType Condition="'$(Configuration)' != 'Test'">Exe</OutputType>
-    <OutputType Condition="'$(Configuration)' == 'Test'">Library</OutputType>
+    <!-- This is a library, not an executable -->
+    <OutputType>Library</OutputType>
     <TargetFramework>net9.0</TargetFramework>
-    <ClojureMainNamespace>main</ClojureMainNamespace>
+    <!-- No ClojureMainNamespace since this is a library -->
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-    <GenerateProgramFile>false</GenerateProgramFile>
+    <!-- Compile namespaces to DLL on build -->
+    <ClojureCompileOnBuild>true</ClojureCompileOnBuild>
+    <!-- Compile these namespaces -->
+    <ClojureNamespacesToCompile>math-utils;string-utils</ClojureNamespacesToCompile>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- Using local source generator for testing -->
     <Analyzer Include="../../src/Clojure.MSBuild.SourceGenerators/bin/Release/netstandard2.0/Clojure.MSBuild.SourceGenerators.dll" />
     <PackageReference Include="Clojure" Version="1.12.2" />
-    <PackageReference Include="clojure.data.json" Version="2.5.0" />
     <PackageReference Include="Clojure.MSBuild.TestAdapter" Version="0.3.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
-    <PackageReference Include="clojure.tools.nrepl" Version="0.1.0-alpha1" />
-    <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
-    <PackageReference Include="System.Text.Json" Version="9.0.0" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <!-- Reference the library project -->
-    <ProjectReference Include="../simple_library/SimpleLibrary.csproj" />
   </ItemGroup>
 
   <ItemGroup>

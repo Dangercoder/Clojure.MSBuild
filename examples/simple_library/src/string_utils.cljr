@@ -1,0 +1,92 @@
+(ns string-utils
+  (:require [clojure.string :as str]))
+
+(defn palindrome?
+  "Check if a string is a palindrome"
+  [s]
+  (let [clean (str/lower-case (str/replace s #"[^a-zA-Z0-9]" ""))]
+    (= clean (str/reverse clean))))
+
+(defn word-count
+  "Count words in a string"
+  [s]
+  (count (str/split s #"\s+")))
+
+(defn capitalize-words
+  "Capitalize first letter of each word"
+  [s]
+  (->> (str/split s #"\s+")
+       (map str/capitalize)
+       (str/join " ")))
+
+(defn truncate
+  "Truncate string to n characters with ellipsis"
+  [s n]
+  (if (<= (count s) n)
+    s
+    (str (subs s 0 (- n 3)) "...")))
+
+(defn slug
+  "Convert string to URL-friendly slug"
+  [s]
+  (-> s
+      str/lower-case
+      (str/replace #"[^a-z0-9]+" "-")
+      (str/replace #"^-|-$" "")))
+
+(defn remove-accents
+  "Remove accented characters from string"
+  [s]
+  ;; Simple version - in production you'd want a more comprehensive mapping
+  (-> s
+      (str/replace #"[àáäâ]" "a")
+      (str/replace #"[èéëê]" "e")
+      (str/replace #"[ìíïî]" "i")
+      (str/replace #"[òóöô]" "o")
+      (str/replace #"[ùúüû]" "u")))
+
+(defn levenshtein-distance
+  "Calculate Levenshtein distance between two strings"
+  [s1 s2]
+  (let [len1 (count s1)
+        len2 (count s2)]
+    (cond
+      (zero? len1) len2
+      (zero? len2) len1
+      :else
+      (let [cost (if (= (first s1) (first s2)) 0 1)]
+        (min (inc (levenshtein-distance (rest s1) s2))
+             (inc (levenshtein-distance s1 (rest s2)))
+             (+ cost (levenshtein-distance (rest s1) (rest s2))))))))
+
+(defn wrap-text
+  "Wrap text to specified line width"
+  [text width]
+  (let [words (str/split text #"\s+")]
+    (loop [lines []
+           current-line []
+           current-length 0
+           remaining words]
+      (if (empty? remaining)
+        (str/join "\n" (conj lines (str/join " " current-line)))
+        (let [word (first remaining)
+              word-length (count word)]
+          (if (> (+ current-length word-length) width)
+            (recur (conj lines (str/join " " current-line))
+                   [word]
+                   word-length
+                   (rest remaining))
+            (recur lines
+                   (conj current-line word)
+                   (+ current-length word-length 1)
+                   (rest remaining))))))))
+
+(defn extract-urls
+  "Extract all URLs from a string"
+  [s]
+  (re-seq #"https?://[^\s]+" s))
+
+(defn mask-sensitive
+  "Mask sensitive information in a string"
+  [s pattern replacement]
+  (str/replace s pattern replacement))

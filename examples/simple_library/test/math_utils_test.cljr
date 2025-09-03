@@ -1,0 +1,69 @@
+(ns math-utils-test
+  (:require [clojure.test :refer :all]
+            [math-utils :as math]))
+
+(deftest test-factorial
+  (testing "Factorial calculation"
+    (is (= 1 (math/factorial 0)))
+    (is (= 1 (math/factorial 1)))
+    (is (= 6 (math/factorial 3)))
+    (is (= 120 (math/factorial 5)))
+    (is (= 3628800 (math/factorial 10)))))
+
+(deftest test-fibonacci
+  (testing "Fibonacci sequence"
+    (is (= 0 (math/fibonacci 0)))
+    (is (= 1 (math/fibonacci 1)))
+    (is (= 1 (math/fibonacci 2)))
+    (is (= 2 (math/fibonacci 3)))
+    (is (= 3 (math/fibonacci 4)))
+    (is (= 5 (math/fibonacci 5)))
+    (is (= 8 (math/fibonacci 6)))))
+
+(deftest test-prime?
+  (testing "Prime number detection"
+    (is (false? (math/prime? 0)))
+    (is (false? (math/prime? 1)))
+    (is (true? (math/prime? 2)))
+    (is (true? (math/prime? 3)))
+    (is (false? (math/prime? 4)))
+    (is (true? (math/prime? 5)))
+    (is (false? (math/prime? 6)))
+    (is (true? (math/prime? 7)))
+    (is (false? (math/prime? 8)))
+    (is (false? (math/prime? 9)))
+    (is (true? (math/prime? 11)))
+    (is (true? (math/prime? 13)))))
+
+(deftest test-gcd
+  (testing "Greatest common divisor"
+    (is (= 6 (math/gcd 48 18)))
+    (is (= 1 (math/gcd 17 13)))
+    (is (= 12 (math/gcd 24 36)))
+    (is (= 5 (math/gcd 10 5)))))
+
+(deftest test-lcm
+  (testing "Least common multiple"
+    (is (= 12 (math/lcm 3 4)))
+    (is (= 18 (math/lcm 6 9)))
+    (is (= 15 (math/lcm 3 5)))))
+
+(deftest test-average
+  (testing "Average calculation"
+    (is (= 3 (math/average [1 2 3 4 5])))
+    (is (= 2.5 (math/average [1 2 3 4])))
+    (is (nil? (math/average [])))
+    (is (= 42 (math/average [42])))))
+
+(deftest test-median
+  (testing "Median calculation"
+    (is (= 3 (math/median [1 2 3 4 5])))
+    (is (= 2.5 (math/median [1 2 3 4])))
+    (is (= 42 (math/median [42])))
+    (is (= 3 (math/median [3 1 2 5 4])))))
+
+(deftest test-distance
+  (testing "Euclidean distance"
+    (is (= 5.0 (math/distance [0 0] [3 4])))
+    (is (= 0.0 (math/distance [1 1] [1 1])))
+    (is (< (Math/Abs (- 7.0710678 (math/distance [0 0] [5 5]))) 0.001))))

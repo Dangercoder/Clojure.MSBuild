@@ -1,5 +1,7 @@
 (ns main
-  (:require [clojure.data.json :as json])
+  (:require [clojure.data.json :as json]
+            [math-utils :as math]
+            [string-utils :as str-utils])
   (:import [System.Text.Json JsonSerializer JsonSerializerOptions JsonDocument]
            [System.Collections ArrayList]))
 
@@ -51,6 +53,22 @@
   []
   {:status :success})
 
+(defn demo-library-functions []
+  (println "\n=== Using Library Functions ===")
+  (println "Library demonstration:")
+  
+  ;; Try to dynamically load and use the library if available
+  (try
+    (load-file "src/math_utils.cljr")
+    (load-file "src/string_utils.cljr")
+    
+    (println "Successfully loaded library files!")
+    (println "Math: 5! =" ((resolve 'math-utils/factorial) 5))
+    (println "String: Is 'racecar' a palindrome?" ((resolve 'string-utils/palindrome?) "racecar"))
+    
+    (catch Exception e
+      (println "Library files not available in this context:" (.getMessage e)))))
+
 (defn -main 
   [& args]
   (println "JSON Interop Demo - Clojure CLR with MSBuild")
@@ -60,6 +78,11 @@
   (demo-system-text-json)
   (demo-mixed-approach)
   (demo-interop)
+  
+  ;; Test compiled library
+  (println "\n=== Using Compiled Library ===")
+  (println "5! =" (math/factorial 5))
+  (println "Is 'racecar' a palindrome?" (str-utils/palindrome? "racecar"))
   
   (when (seq args)
     (println "\nCommand line arguments:" (vec args)))
