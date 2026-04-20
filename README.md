@@ -4,8 +4,7 @@
 [![Clojure.MSBuild.TestAdapter](https://img.shields.io/nuget/v/Clojure.MSBuild.TestAdapter.svg?label=TestAdapter)](https://www.nuget.org/packages/Clojure.MSBuild.TestAdapter/)
 
 MSBuild integration for ClojureCLR. Build, test, and run Clojure on .NET with standard `dotnet` commands.
-
-Written entirely in ClojureCLR — no C# required.
+No non-dotnet tools needed.
 
 ## Requirements
 
