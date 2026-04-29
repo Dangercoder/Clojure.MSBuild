@@ -1,0 +1,76 @@
+(ns app.web
+  "Minimal ASP.NET Core wrapper. Handlers return data, framework serializes.
+   Sync and async handlers use the same routing functions."
+  (:refer-clojure :exclude [get])
+  (:require [clojure.data.json :as json])
+  (:import [Microsoft.AspNetCore.Builder WebApplication EndpointRouteBuilderExtensions]
+           [Microsoft.AspNetCore.Http HttpContext HttpResponse HttpRequest]
+           [Microsoft.Extensions.Hosting HostingAbstractionsHostExtensions]
+           [System.Threading.Tasks Task]))
+
+(set! *warn-on-reflection* true)
+
+(defn app
+  ([] (app []))
+  ([args] (app args nil))
+  ([args configure-fn]
+   (let [^|System.String[]| str-args (into-array String (remove nil? args))
+         ^Microsoft.AspNetCore.Builder.WebApplicationBuilder builder
+         (WebApplication/CreateBuilder str-args)]
+     (when configure-fn (configure-fn builder))
+     (.Build builder))))
+
+(defn start! [^WebApplication app]
+  (HostingAbstractionsHostExtensions/Run app))
+
+(defn ok [body] {:status 200 :body (str body)})
+
+(defn ^|System.Threading.Tasks.Task`1[System.String]| read-body-async [^HttpContext ctx]
+  (let [^HttpRequest req (.-Request ctx)]
+    (.ReadToEndAsync (System.IO.StreamReader. (.Body req)))))
+
+(defn- write-response [^HttpContext ctx response]
+  (let [^HttpResponse resp (.-Response ctx)
+        utf8 System.Text.Encoding/UTF8]
+    (cond
+      (nil? response)
+      (do (set! (.-StatusCode resp) 204)
+          (.WriteAsync (.Body resp) (byte-array 0) 0 0))
+
+      (and (map? response) (contains? response :status))
+      (let [bytes (.GetBytes utf8 (str (or (:body response) "")))]
+        (set! (.-StatusCode resp) (int (:status response)))
+        (.WriteAsync (.Body resp) bytes 0 (alength bytes)))
+
+      (or (map? response) (vector? response) (sequential? response))
+      (let [bytes (.GetBytes utf8 (json/write-str response))]
+        (set! (.-StatusCode resp) 200)
+        (.set_Item (.-Headers resp) "Content-Type"
+          (Microsoft.Extensions.Primitives.StringValues. "application/json"))
+        (.WriteAsync (.Body resp) bytes 0 (alength bytes)))
+
+      :else
+      (let [bytes (.GetBytes utf8 (str response))]
+        (set! (.-StatusCode resp) 200)
+        (.WriteAsync (.Body resp) bytes 0 (alength bytes))))))
+
+(defn- wrap-sync [handler]
+  (gen-delegate |System.Func`2[Microsoft.AspNetCore.Http.HttpContext,System.Threading.Tasks.Task]| [ctx]
+    (write-response ctx (handler ctx))))
+
+(defn- wrap-async [handler]
+  (gen-delegate |System.Func`2[Microsoft.AspNetCore.Http.HttpContext,System.Threading.Tasks.Task`1[System.Object]]| [ctx]
+    (handler ctx)))
+
+(defn- wrap [handler]
+  (if (boolean (:async (meta handler)))
+    (wrap-async handler)
+    (wrap-sync handler)))
+
+(defn get [^WebApplication app ^String path handler]
+  (EndpointRouteBuilderExtensions/MapGet app path ^System.Delegate (wrap handler))
+  app)
+
+(defn post [^WebApplication app ^String path handler]
+  (EndpointRouteBuilderExtensions/MapPost app path ^System.Delegate (wrap handler))
+  app)

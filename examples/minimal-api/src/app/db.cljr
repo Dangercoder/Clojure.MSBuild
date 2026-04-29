@@ -1,0 +1,74 @@
+(ns app.db
+  "Async ADO.NET wrapper. Works with any ADO.NET provider."
+  (:require [clojure.clr.async.task.alpha :as t])
+  (:import [System DBNull]
+           [System.Data.Common DbConnection DbCommand DbDataReader]
+           [System.Threading.Tasks Task]))
+
+(set! *warn-on-reflection* true)
+
+(defn create-connection
+  [connection-type ^String conn-string]
+  (let [^DbConnection conn (System.Activator/CreateInstance connection-type)]
+    (set! (.-ConnectionString conn) conn-string)
+    (.Open conn)
+    conn))
+
+(defn- reader->maps [^DbDataReader reader]
+  (let [col-count (.FieldCount reader)
+        col-names (mapv #(.GetName reader (int %)) (range col-count))]
+    (loop [rows []]
+      (if (.Read reader)
+        (recur (conj rows
+                 (persistent!
+                   (reduce (fn [m i]
+                             (assoc! m (col-names i)
+                               (let [v (.GetValue reader (int i))]
+                                 (if (instance? DBNull v) nil v))))
+                           (transient {})
+                           (range col-count)))))
+        rows))))
+
+(defn- prepare-command
+  ^DbCommand [^DbConnection conn sqlvec]
+  (let [sql (first sqlvec)
+        params (rest sqlvec)
+        ^DbCommand cmd (.CreateCommand conn)
+        indexed-sql (loop [^String s sql i 0]
+                      (let [idx (.IndexOf s "?")]
+                        (if (neg? idx)
+                          s
+                          (recur (str (subs s 0 idx) "@p" i (subs s (inc idx)))
+                                 (inc i)))))]
+    (set! (.-CommandText cmd) indexed-sql)
+    (doseq [[i v] (map-indexed vector params)]
+      (let [p (.CreateParameter cmd)]
+        (set! (.-ParameterName p) (str "@p" i))
+        (set! (.-Value p) (if (nil? v) DBNull/Value v))
+        (.Add (.Parameters cmd) p)))
+    cmd))
+
+(defn ^:async execute!
+  [^DbConnection conn sqlvec]
+  (let [sqlvec (if (string? sqlvec) [sqlvec] sqlvec)
+        ^DbCommand cmd (prepare-command conn sqlvec)
+        ^DbDataReader reader (t/await (.ExecuteReaderAsync cmd))
+        results (reader->maps reader)
+        affected (.RecordsAffected reader)]
+    (.Close reader)
+    (if (seq results)
+      results
+      [{"affected" affected}])))
+
+(defmacro with-transaction
+  [[conn-sym conn-expr] & body]
+  `(with-open [conn# ~conn-expr
+               txn# (.BeginTransaction conn#)]
+     (try
+       (let [~conn-sym conn#
+             result# (do ~@body)]
+         (.Commit txn#)
+         result#)
+       (catch Exception e#
+         (.Rollback txn#)
+         (throw e#)))))

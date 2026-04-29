@@ -6,7 +6,7 @@
             [clojure.spec.alpha :as s]
             [clojure.data.json :as json]
             [app.server :as server]
-            [clojure.dotnet.web :as web])
+            [app.web :as web])
   (:import [Microsoft.AspNetCore.TestHost HostBuilderTestServerExtensions]
            [Microsoft.Extensions.Hosting HostingAbstractionsHostExtensions]))
 

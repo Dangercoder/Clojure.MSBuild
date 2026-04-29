@@ -9,7 +9,7 @@ No non-dotnet tools needed.
 ## Requirements
 
 - .NET 11.0 SDK (preview) or later
-- Clojure CLR 1.12.3-alpha5 or later
+- Clojure CLR 1.12.3-alpha8 or later
 
 ## Quick Start
 
@@ -24,7 +24,7 @@ cd MyApp
 
 ```bash
 dotnet add package Clojure.MSBuild
-dotnet add package Clojure --version 1.12.3-alpha5
+dotnet add package Clojure --version 1.12.3-alpha8
 ```
 
 ### 3. Update your .csproj
@@ -40,8 +40,8 @@ dotnet add package Clojure --version 1.12.3-alpha5
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Clojure.MSBuild" Version="0.0.4" />
-    <PackageReference Include="Clojure" Version="1.12.3-alpha5" />
+    <PackageReference Include="Clojure.MSBuild" Version="0.0.6" />
+    <PackageReference Include="Clojure" Version="1.12.3-alpha8" />
   </ItemGroup>
 
   <ItemGroup>
@@ -75,7 +75,7 @@ Add Clojure libraries from git directly in your `.csproj` — no `deps.edn` need
 ```xml
 <ItemGroup>
   <!-- .NET deps from NuGet -->
-  <PackageReference Include="Clojure" Version="1.12.3-alpha5" />
+  <PackageReference Include="Clojure" Version="1.12.3-alpha8" />
   <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.3" />
 
   <!-- Clojure deps from git -->

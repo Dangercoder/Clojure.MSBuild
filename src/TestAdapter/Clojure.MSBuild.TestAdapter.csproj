@@ -18,7 +18,7 @@
 
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <PackageId>Clojure.MSBuild.TestAdapter</PackageId>
-    <Version>0.0.4</Version>
+    <Version>0.0.6</Version>
     <Authors>Clojure CLR Contributors</Authors>
     <Description>VSTest adapter for running ClojureCLR tests with dotnet test.</Description>
     <PackageTags>clojure;clr;test;vstest;adapter</PackageTags>
@@ -32,7 +32,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.TestPlatform.ObjectModel" Version="17.8.0" />
-    <PackageReference Include="Clojure" Version="1.12.3-alpha5" />
+    <PackageReference Include="Clojure" Version="1.12.3-alpha8" />
   </ItemGroup>
 
   <ItemGroup>

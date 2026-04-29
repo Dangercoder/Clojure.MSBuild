@@ -10,9 +10,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Clojure.MSBuild" Version="0.0.4" />
-    <PackageReference Include="Clojure.MSBuild.TestAdapter" Version="0.0.4" />
-    <PackageReference Include="Clojure" Version="1.12.3-alpha5" />
+    <PackageReference Include="Clojure.MSBuild" Version="0.0.6" />
+    <PackageReference Include="Clojure.MSBuild.TestAdapter" Version="0.0.6" />
+    <PackageReference Include="Clojure" Version="1.12.3-alpha8" />
     <PackageReference Include="clojure.tools.nrepl" Version="0.1.0-alpha2" />
     <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.5" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.3" />
@@ -20,7 +20,6 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
 
     <ClojureGitDep Include="com.github.seancorfield/honeysql" Tag="v2.7.1368" Sha="b8332fc" />
-    <ClojureGitDep Include="io.github.Dangercoder/Clojure.Dotnet" Tag="v0.0.2" Sha="86200a6" />
   </ItemGroup>
 
   <ItemGroup>

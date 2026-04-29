@@ -4,7 +4,7 @@
     <TargetFramework>netstandard2.0</TargetFramework>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>Clojure.MSBuild</PackageId>
-    <Version>0.0.4</Version>
+    <Version>0.0.6</Version>
     <Authors>Clojure CLR Contributors</Authors>
     <Description>MSBuild integration for ClojureCLR. Build, test, and run Clojure on .NET with standard dotnet commands. Written entirely in ClojureCLR.</Description>
     <PackageTags>clojure;clr;msbuild;repl;dotnet</PackageTags>

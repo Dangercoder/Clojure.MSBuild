@@ -10,8 +10,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Clojure.MSBuild" Version="0.0.3" />
-    <PackageReference Include="Clojure" Version="1.12.3-alpha5" />
+    <PackageReference Include="Clojure.MSBuild" Version="0.0.6" />
+    <PackageReference Include="Clojure" Version="1.12.3-alpha8" />
   </ItemGroup>
 
   <ItemGroup>

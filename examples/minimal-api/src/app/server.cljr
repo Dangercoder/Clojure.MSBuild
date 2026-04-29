@@ -1,15 +1,15 @@
 (ns app.server
-  (:require [clojure.async.task :as t]
+  (:require [clojure.clr.async.task.alpha :as t]
             [clojure.data.json :as json]
             [honey.sql :as sql]
-            [clojure.dotnet.web :as web]
-            [clojure.dotnet.db :as db])
+            [app.web :as web]
+            [app.db :as db])
   (:import [Microsoft.Data.Sqlite SqliteConnection]))
 
 (def ^:private conn-string "Data Source=app.db")
 (defn- open-conn [] (db/create-connection SqliteConnection conn-string))
 
-(def ^:private http-client (System.Net.Http.HttpClient.))
+(def ^:private ^System.Net.Http.HttpClient http-client (System.Net.Http.HttpClient.))
 
 (defn ^:async fetch-dog [ctx]
   (t/await (.GetStringAsync http-client "https://dogapi.dog/api/v2/facts?limit=1")))
