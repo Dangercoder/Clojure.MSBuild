@@ -1,0 +1,202 @@
+(ns mission.core
+  "Demo entry point: boots the fleet + gateway in one process, takes a
+   status snapshot, load-tests the gateway with hundreds of concurrent
+   requests, and renders everything with Spectre.Console."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [clojure.data.json :as json]
+            [mission.gateway :as gateway]
+            [mission.services :as services]
+            [mission.stats :as stats])
+  (:import [System.Diagnostics Stopwatch]
+           [System.Net.Http HttpClient]
+           [System.Threading CancellationToken Thread]
+           [System.Threading.Channels Channel]
+           [System.Threading.Tasks Task]
+           [Spectre.Console AnsiConsole BarChart BarChartItem Color FigletText
+            Markup Table TableColumn TableExtensions]))
+
+(set! *warn-on-reflection* false) ; DLR call sites are fine here; this ns is glue + rendering
+
+(alias-type TaskObj |System.Threading.Tasks.Task`1[System.Object]|)
+(alias-type ObjChannelReader |System.Threading.Channels.ChannelReader`1[System.Object]|)
+(alias-type ObjChannelWriter |System.Threading.Channels.ChannelWriter`1[System.Object]|)
+
+(def base-port
+  (if-let [p (Environment/GetEnvironmentVariable "MC_BASE_PORT")]
+    (Int32/Parse p)
+    6161))
+
+(def concurrent-requests 150)
+(def sequential-requests 15)
+
+(def ^:private ^HttpClient client (HttpClient.))
+
+(defn- fmt1
+  "Rounds to one decimal (avoids relying on printf-style format)."
+  [x]
+  (/ (Math/Round (* 10.0 (double x))) 10.0))
+
+;; ── Mission log: System.Threading.Channels producer/consumer ─────
+
+(defn ^:async consume-log
+  "Background consumer: drains mission-log events until the writer
+   completes. An async loop — no thread is parked while waiting."
+  [^ObjChannelReader reader counters]
+  (loop [n 0]
+    (if (t/await (.AsTask (.WaitToReadAsync reader CancellationToken/None)))
+      (let [evt (t/await (.AsTask (.ReadAsync reader CancellationToken/None)))]
+        (swap! counters update (:overall evt) (fnil inc 0))
+        (recur (inc n)))
+      n)))
+
+;; ── Load test ────────────────────────────────────────────────────
+
+(defn ^:async timed-request
+  "One timed GET against the gateway."
+  [^String url]
+  (let [sw (Stopwatch/StartNew)
+        body (t/await (.GetStringAsync client url))]
+    {:ms (.ElapsedMilliseconds sw)
+     :overall (:overall (json/read-str body :key-fn keyword))}))
+
+(defn ^:async run-concurrent
+  "Fires n requests at once, then awaits Task.WhenAll."
+  [url n]
+  (let [sw (Stopwatch/StartNew)
+        tasks (mapv (fn [_] (timed-request url)) (range n))]
+    (t/await (Task/WhenAll ^|System.Threading.Tasks.Task[]| (into-array Task tasks)))
+    {:wall-ms (.ElapsedMilliseconds sw)
+     :results (mapv t/result tasks)}))
+
+(defn ^:async run-sequential
+  "Awaits n requests one at a time — the baseline the fan-out beats."
+  [url n]
+  (let [sw (Stopwatch/StartNew)]
+    (loop [i 0 acc []]
+      (if (< i n)
+        (let [^TaskObj task (timed-request url)
+              r (t/await task)]
+          (recur (inc i) (conj acc r)))
+        {:wall-ms (.ElapsedMilliseconds sw)
+         :results acc}))))
+
+;; ── Rendering (Spectre.Console) ──────────────────────────────────
+
+(defn- status-markup [status]
+  (case status
+    "ok"       "[green]ok[/]"
+    "degraded" "[yellow]degraded[/]"
+    "[red]error[/]"))
+
+(defn- add-row! [^Table table & cells]
+  (TableExtensions/AddRow table (into-array String (map str cells))))
+
+(defn- render-snapshot! [snap]
+  (let [table (doto (Table.)
+                (.AddColumn (TableColumn. "[bold]Service[/]"))
+                (.AddColumn (TableColumn. "[bold]Status[/]"))
+                (.AddColumn (TableColumn. "[bold]Sensor ms[/]"))
+                (.AddColumn (TableColumn. "[bold]Payload[/]")))]
+    (doseq [{:keys [service status sensor-ms note] :as svc} (:services snap)]
+      (add-row! table
+                service
+                (status-markup status)
+                (or sensor-ms "-")
+                (Markup/Escape (or note (pr-str (dissoc svc :service :status :sensor-ms))))))
+    (AnsiConsole/Write table)
+    (AnsiConsole/MarkupLine
+      (str "Overall: "
+           (if (= "NOMINAL" (:overall snap))
+             "[bold green]NOMINAL[/]"
+             "[bold yellow]DEGRADED[/]")
+           "  [grey](gateway fan-out took " (:gateway-ms snap)
+           "ms — three services, one await)[/]"))))
+
+(defn- render-loadtest! [conc seq-run]
+  (let [lat (mapv :ms (:results conc))
+        s (stats/summarize lat)
+        degraded (count (remove #(= "NOMINAL" (:overall %)) (:results conc)))
+        conc-wall (:wall-ms conc)
+        seq-wall (:wall-ms seq-run)
+        seq-per-req (fmt1 (/ (double seq-wall) (max 1 (count (:results seq-run)))))
+        conc-per-req (fmt1 (/ (double conc-wall) (max 1 (count lat))))
+        speedup (fmt1 (/ (double seq-per-req) (max 0.001 (double conc-per-req))))
+        table (doto (Table.)
+                (.AddColumn (TableColumn. "[bold]Metric[/]"))
+                (.AddColumn (TableColumn. "[bold]Value[/]")))]
+    (doseq [[k v] [["Requests" (str (:count s) " concurrent")]
+                   ["Wall time" (str conc-wall " ms")]
+                   ["Throughput" (str (stats/throughput (:count s) conc-wall) " req/s")]
+                   ["Latency p50 / p95 / p99" (str (:p50 s) " / " (:p95 s) " / " (:p99 s) " ms")]
+                   ["Latency min / max" (str (:min s) " / " (:max s) " ms")]
+                   ["Degraded snapshots" (str degraded " (life-support spikes caught by the timeout race)")]]]
+      (add-row! table k v))
+    (AnsiConsole/Write table)
+    (let [chart (BarChart.)]
+      (.Add (.Data chart) (BarChartItem. "p50" (double (:p50 s)) Color/Green))
+      (.Add (.Data chart) (BarChartItem. "p95" (double (:p95 s)) Color/Yellow))
+      (.Add (.Data chart) (BarChartItem. "p99" (double (:p99 s)) Color/Red))
+      (set! (.Label chart) "[grey]latency (ms)[/]")
+      (AnsiConsole/Write chart))
+    (AnsiConsole/MarkupLine
+      (str (count (:results seq-run)) " sequential requests: [yellow]" seq-wall "ms[/] ("
+           seq-per-req " ms/req) — " (count lat) " concurrent: [green]" conc-wall "ms[/] ("
+           conc-per-req " ms/req) → [bold green]" speedup "× throughput[/]"))))
+
+;; ── Boot + readiness ─────────────────────────────────────────────
+
+(defn- wait-ready!
+  "Blocking readiness poll — startup only."
+  [urls]
+  (doseq [^String url urls]
+    (loop [n 0]
+      (let [ok (try (t/result (.GetStringAsync client url))
+                    (catch Exception _ nil))]
+        (when (and (nil? ok) (< n 100))
+          (Thread/Sleep 100)
+          (recur (inc n)))))))
+
+(defn -main [& args]
+  (AnsiConsole/Write (FigletText. "MISSION CTRL"))
+  (AnsiConsole/MarkupLine "[grey]ClojureCLR async/await on .NET 11 runtime async — 4 Kestrel servers, 1 process, 0 blocked threads[/]\n")
+  (let [ch (Channel/CreateUnbounded (type-args Object))
+        ^ObjChannelWriter log-writer (.Writer ch)
+        ^ObjChannelReader log-reader (.Reader ch)
+        counters (atom {})
+        ^TaskObj log-task (consume-log log-reader counters)
+        svcs (services/start-all! base-port)
+        gw-url (str "http://127.0.0.1:" (+ base-port 3))
+        gw-task (gateway/start! svcs gw-url log-writer)]
+    (AnsiConsole/MarkupLine (str "[aqua]-[/] services: "
+                                 (apply str (interpose ", " (map #(str (:name %) " " (:url %)) svcs)))))
+    (AnsiConsole/MarkupLine (str "[aqua]-[/] gateway:  " gw-url "/snapshot\n"))
+    (wait-ready! (map #(str (:url %) "/status") svcs))
+    (wait-ready! [(str gw-url "/snapshot")])
+
+    (if (= (first args) "--serve")
+      (do (AnsiConsole/MarkupLine (str "[green]Serving. Try:[/] curl " gw-url "/snapshot"))
+          (t/wait-all [gw-task]))
+      (do
+        ;; 1. One snapshot, rendered
+        (AnsiConsole/MarkupLine "[bold underline]Mission snapshot[/] — concurrent fan-out with per-service timeout race\n")
+        (let [snap (json/read-str (t/result (.GetStringAsync client (str gw-url "/snapshot")))
+                                  :key-fn keyword)]
+          (render-snapshot! snap))
+
+        ;; 2. Load test
+        (AnsiConsole/MarkupLine (str "\n[bold underline]Load test[/] — " concurrent-requests
+                                     " concurrent snapshots (each fans out to 3 services → "
+                                     (* 4 concurrent-requests) " HTTP calls in flight)\n"))
+        (let [seq-run (t/result (run-sequential (str gw-url "/snapshot") sequential-requests))
+              conc (t/result (run-concurrent (str gw-url "/snapshot") concurrent-requests))]
+          (render-loadtest! conc seq-run))
+
+        ;; 3. Drain the mission log (Channels)
+        (.Complete log-writer nil)
+        (let [n (t/result log-task)]
+          (AnsiConsole/MarkupLine
+            (str "\n[aqua]-[/] mission log consumed [bold]" (long n)
+                 "[/] events via System.Threading.Channels: "
+                 (Markup/Escape (pr-str @counters)))))
+        (AnsiConsole/MarkupLine "\n[bold green]Mission complete.[/]")
+        (Environment/Exit 0)))))

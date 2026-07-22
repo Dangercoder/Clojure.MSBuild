@@ -1,0 +1,47 @@
+(ns mission.services
+  "Three tiny in-process Kestrel microservices, defined as data.
+   Each /status endpoint is a real .NET async state machine: it awaits
+   simulated sensor latency without blocking a thread."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [clojure.data.json :as json]
+            [mission.web :as web]))
+
+(def specs
+  "The service fleet as plain data. life-support occasionally spikes to
+   ~400ms so the gateway's timeout/fallback race has something to catch."
+  [{:name "telemetry" :offset 0 :base-ms 20 :jitter-ms 40
+    :payload #(hash-map :radiation-msv 0.31
+                        :solar-flux-wm2 1361
+                        :battery-pct (+ 88 (rand-int 10)))}
+   {:name "navigation" :offset 1 :base-ms 30 :jitter-ms 50
+    :payload #(hash-map :orbit "LEO"
+                        :altitude-km 408
+                        :velocity-kms 7.66
+                        :heading-deg (rand-int 360))}
+   {:name "life-support" :offset 2 :base-ms 25 :jitter-ms 45
+    :spike-chance 0.18 :spike-ms 400
+    :payload #(hash-map :o2-pct 20.9
+                        :co2-ppm (+ 400 (rand-int 40))
+                        :pressure-kpa 101.3)}])
+
+(defn- ^:async status-response
+  "Awaits simulated sensor latency (with occasional spikes), then returns
+   the service's JSON payload. Compiles to a .NET async state machine."
+  [{:keys [name base-ms jitter-ms spike-chance spike-ms payload]}]
+  (let [spike? (and spike-chance (< (rand) spike-chance))
+        ms (+ base-ms (rand-int jitter-ms) (if spike? spike-ms 0))]
+    (t/await (t/delay-task ms))
+    (json/write-str (assoc (payload) :service name :sensor-ms ms))))
+
+(defn start-all!
+  "Boots one Kestrel server per spec without blocking.
+   Returns [{:name .. :url .. :task ..} ...]."
+  [base-port]
+  (mapv (fn [{:keys [name offset] :as spec}]
+          (let [url (str "http://127.0.0.1:" (+ base-port offset))]
+            {:name name
+             :url url
+             :task (-> (web/app)
+                       (web/get-async "/status" (fn [_ctx] (status-response spec)))
+                       (web/start! url))}))
+        specs))

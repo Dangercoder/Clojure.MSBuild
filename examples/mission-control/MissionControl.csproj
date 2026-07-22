@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <EnablePreviewFeatures>true</EnablePreviewFeatures>
+    <Features>$(Features);runtime-async=on</Features>
+    <ClojureMainNamespace>mission.core</ClojureMainNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Clojure.MSBuild" Version="0.0.6" />
+    <PackageReference Include="Clojure.MSBuild.TestAdapter" Version="0.0.6" />
+    <PackageReference Include="Clojure" Version="1.12.3-alpha8" />
+    <PackageReference Include="clojure.data.json" Version="2.5.1" />
+    <PackageReference Include="Spectre.Console" Version="0.50.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="src/**/*.cljr" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="test/**/*.cljr" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

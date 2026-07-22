@@ -1,0 +1,32 @@
+(ns mission.stats-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [mission.stats :as stats]))
+
+(deftest percentile-test
+  (testing "nearest-rank percentiles"
+    (let [xs (vec (range 1 101))] ; 1..100
+      (is (= 50 (stats/percentile xs 50)))
+      (is (= 95 (stats/percentile xs 95)))
+      (is (= 99 (stats/percentile xs 99)))
+      (is (= 100 (stats/percentile xs 100)))))
+  (testing "edge cases"
+    (is (nil? (stats/percentile [] 50)))
+    (is (= 7 (stats/percentile [7] 99)))))
+
+(deftest summarize-test
+  (let [s (stats/summarize [10 20 30 40 50])]
+    (is (= 5 (:count s)))
+    (is (= 10 (:min s)))
+    (is (= 50 (:max s)))
+    (is (= 30.0 (:mean s)))
+    (is (= 30 (:p50 s)))))
+
+(deftest overall-status-test
+  (is (= "NOMINAL" (stats/overall-status ["ok" "ok" "ok"])))
+  (is (= "DEGRADED" (stats/overall-status ["ok" "degraded" "ok"])))
+  (is (= "DEGRADED" (stats/overall-status ["ok" "error" "ok"])))
+  (is (= "DEGRADED" (stats/overall-status []))))
+
+(deftest throughput-test
+  (is (= 100.0 (stats/throughput 100 1000)))
+  (is (= 0.0 (stats/throughput 100 0))))

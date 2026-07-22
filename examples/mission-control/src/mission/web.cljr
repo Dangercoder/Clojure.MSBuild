@@ -1,0 +1,33 @@
+(ns mission.web
+  "Tiny ASP.NET Core (Kestrel) wrapper — just enough for the demo.
+   Async handlers are (fn [ctx]) -> Task<Object>; a string result is
+   written to the response body by ASP.NET as-is."
+  (:import [Microsoft.AspNetCore.Builder WebApplication EndpointRouteBuilderExtensions]
+           [Microsoft.AspNetCore.Http HttpContext]
+           [System.Threading.Tasks Task]))
+
+(set! *warn-on-reflection* true)
+
+(defn app
+  "Creates a WebApplication. Logging is quieted via appsettings.json."
+  ^WebApplication []
+  (let [^|System.String[]| no-args (into-array String [])
+        ^Microsoft.AspNetCore.Builder.WebApplicationBuilder builder
+        (WebApplication/CreateBuilder no-args)]
+    (.Build builder)))
+
+(defn- wrap-async [handler]
+  (gen-delegate |System.Func`2[Microsoft.AspNetCore.Http.HttpContext,System.Threading.Tasks.Task`1[System.Object]]| [ctx]
+    (handler ctx)))
+
+(defn get-async
+  "Maps GET path to an async handler: (fn [ctx]) -> Task<Object>.
+   Build the Task with (t/async ...) or by calling a ^:async fn."
+  [^WebApplication app ^String path handler]
+  (EndpointRouteBuilderExtensions/MapGet app path ^System.Delegate (wrap-async handler))
+  app)
+
+(defn start!
+  "Starts the app on url without blocking. Returns the server's run Task."
+  ^Task [^WebApplication app ^String url]
+  (.RunAsync app url))

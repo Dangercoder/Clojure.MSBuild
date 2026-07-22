@@ -1,0 +1,72 @@
+(ns mission.gateway
+  "API gateway: fans out to every service concurrently, races each call
+   against a timeout (Task.WhenAny), and degrades gracefully instead of
+   failing the whole snapshot when one subsystem is slow."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [clojure.data.json :as json]
+            [mission.stats :as stats]
+            [mission.web :as web])
+  (:import [System.Diagnostics Stopwatch]
+           [System.Net.Http HttpClient]
+           [System.Threading.Tasks Task]))
+
+(alias-type TaskObj |System.Threading.Tasks.Task`1[System.Object]|)
+(alias-type ObjChannelWriter |System.Threading.Channels.ChannelWriter`1[System.Object]|)
+
+(def timeout-ms
+  "Per-dependency budget. Anything slower gets a degraded placeholder."
+  200)
+
+(def ^:private ^HttpClient client (HttpClient.))
+
+(defn- ^:async fetch-status
+  "One awaited HttpClient call: GET a service's /status and parse it."
+  [url]
+  (let [body (t/await (.GetStringAsync client (str url "/status")))]
+    (assoc (json/read-str body :key-fn keyword) :status "ok")))
+
+(defn- ^:async fetch-with-timeout
+  "Races fetch-status against the timeout budget. A slow service yields a
+   :degraded placeholder; an exploding one yields :error. Either way the
+   snapshot survives."
+  [{:keys [name url]}]
+  (try
+    (let [^TaskObj fetch (fetch-status url)
+          ^TaskObj timer (t/async (t/await (t/delay-task timeout-ms)) ::timeout)
+          winner (t/await (Task/WhenAny ^|System.Threading.Tasks.Task[]| (into-array Task [fetch timer])))
+          value (t/result winner)]
+      (if (= value ::timeout)
+        {:service name :status "degraded" :note (str "no response in " timeout-ms "ms")}
+        value))
+    (catch Exception e
+      {:service name :status "error" :note (.Message e)})))
+
+(defn ^:async snapshot
+  "Fan-out/fan-in: starts every service call at once, awaits Task.WhenAll,
+   then assembles the aggregate mission status."
+  [services]
+  (let [sw (Stopwatch/StartNew)
+        tasks (mapv fetch-with-timeout services)] ; all requests in flight before we await
+    (t/await (Task/WhenAll ^|System.Threading.Tasks.Task[]| (into-array Task tasks)))
+    (let [results (mapv t/result tasks)]
+      {:overall (stats/overall-status (map :status results))
+       :gateway-ms (.ElapsedMilliseconds sw)
+       :services results})))
+
+(defn- make-handler
+  "The /snapshot handler. Every snapshot is also pushed onto the mission-log
+   channel (System.Threading.Channels) for the background consumer."
+  [services ^ObjChannelWriter log-writer]
+  (fn [_ctx]
+    (t/async
+      (let [^TaskObj task (snapshot services)
+            snap (t/await task)]
+        (.TryWrite log-writer {:overall (:overall snap) :gateway-ms (:gateway-ms snap)})
+        (json/write-str snap)))))
+
+(defn start!
+  "Boots the gateway app without blocking. Returns its run Task."
+  [services url log-writer]
+  (-> (web/app)
+      (web/get-async "/snapshot" (make-handler services log-writer))
+      (web/start! url)))

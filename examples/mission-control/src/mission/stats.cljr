@@ -1,0 +1,37 @@
+(ns mission.stats
+  "Pure statistics + aggregation helpers. No I/O — unit-tested via `dotnet test`.")
+
+(defn percentile
+  "Nearest-rank percentile of an already-sorted vector."
+  [sorted-xs p]
+  (when (seq sorted-xs)
+    (let [n (count sorted-xs)
+          rank (long (Math/Ceiling (* (/ p 100.0) n)))]
+      (nth sorted-xs (min (dec n) (max 0 (dec rank)))))))
+
+(defn summarize
+  "Latency summary: count, min/max/mean and p50/p95/p99."
+  [latencies]
+  (let [sorted (vec (sort latencies))
+        n (count sorted)]
+    {:count n
+     :min (first sorted)
+     :max (peek sorted)
+     :mean (if (pos? n) (/ (reduce + 0.0 sorted) n) 0.0)
+     :p50 (percentile sorted 50)
+     :p95 (percentile sorted 95)
+     :p99 (percentile sorted 99)}))
+
+(defn overall-status
+  "NOMINAL only when every subsystem reported ok."
+  [statuses]
+  (if (and (seq statuses) (every? #(= % "ok") statuses))
+    "NOMINAL"
+    "DEGRADED"))
+
+(defn throughput
+  "Requests per second, one decimal."
+  [n wall-ms]
+  (if (pos? wall-ms)
+    (/ (Math/Round (* 10.0 (/ (* n 1000.0) wall-ms))) 10.0)
+    0.0))

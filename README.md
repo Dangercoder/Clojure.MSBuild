@@ -168,6 +168,7 @@ Compile namespaces to .NET DLLs during build:
 
 ## Examples
 
+- [`examples/mission-control`](examples/mission-control) — async/await showcase: 4 Kestrel servers in one process, `Task.WhenAll` fan-out, `Task.WhenAny` timeout races, `System.Threading.Channels`, Spectre.Console, load test with latency percentiles
 - [`examples/minimal-api`](examples/minimal-api) — ASP.NET web API with HoneySQL, async ADO.NET, integration tests
 - [`examples/csharp-interop`](examples/csharp-interop) — Bidirectional C#/Clojure interop in one project
 
