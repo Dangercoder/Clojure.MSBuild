@@ -1,0 +1,133 @@
+(ns baremetal.core
+  "SIMD, reified generics, P/Invoke, and a mixed C#/Clojure build —
+   the .NET platform features JVM Clojure people don't get to touch."
+  (:import [System.Diagnostics Stopwatch]
+           [System.Linq Enumerable]
+           [System.Numerics Vector]
+           [BareMetal Native Baseline]))
+
+(set! *warn-on-reflection* true)
+(set! *unchecked-math* true)
+
+(alias-type FloatVector |System.Numerics.Vector`1[System.Single]|)
+(alias-type DoubleList |System.Collections.Generic.List`1[System.Double]|)
+
+(def N 10000000)
+(def boxed-n 1000000)
+
+;; ── Act 1: the dot-product ladder ────────────────────────────────
+
+(defn boxed-dot
+  "Rung 0: idiomatic Clojure — boxed seqs, lazy map, generic +."
+  [v1 v2]
+  (reduce + (map * v1 v2)))
+
+(defn scalar-dot
+  "Rung 1: type-hinted loop over float arrays."
+  ^double [^floats xs ^floats ys]
+  (let [n (alength xs)]
+    (loop [i 0 acc 0.0]
+      (if (< i n)
+        (recur (inc i) (+ acc (* (double (aget xs i)) (double (aget ys i)))))
+        acc))))
+
+(defn simd-dot
+  "Rung 2: hardware SIMD (NEON/AVX) from pure Clojure.
+   Vector<float> is a value type; ops go through the constructed type's
+   operator methods so everything binds statically. Note the CLR-style
+   array hints — ^floats doesn't propagate into the Vector ctor overload."
+  ^double [^|System.Single[]| xs ^|System.Single[]| ys]
+  (let [n (alength xs)
+        vn (FloatVector/Count)]
+    (loop [i (int 0) acc FloatVector/Zero]
+      (if (<= (+ i vn) n)
+        (recur (+ i vn)
+               (FloatVector/op_Addition acc
+                 (FloatVector/op_Multiply (FloatVector. xs i) (FloatVector. ys i))))
+        (double (Vector/Dot (type-args System.Single) acc FloatVector/One))))))
+
+;; Rung 3 is Baseline/SimdDot — C# in the same project, same build.
+
+;; ── Act 2: reified generics ──────────────────────────────────────
+
+(defn boxed-sum [v] (reduce + v))
+
+(defn list-sum
+  "Sum a List<double> — real generic containers, zero boxing, no erasure."
+  ^double [^DoubleList l]
+  (let [n (.Count l)]
+    (loop [i 0 acc 0.0]
+      (if (< i n)
+        (recur (inc i) (+ acc (.get_Item l i)))
+        acc))))
+
+;; ── Tiny bench harness ───────────────────────────────────────────
+
+(defn- bench1 [f]
+  (f) (f) ; warmup / JIT
+  (let [a0 (GC/GetAllocatedBytesForCurrentThread)
+        sw (Stopwatch/StartNew)
+        r (f)
+        ms (.ElapsedMilliseconds sw)
+        alloc (- (GC/GetAllocatedBytesForCurrentThread) a0)]
+    {:result r :ms ms :alloc alloc}))
+
+(defn- pad [s n]
+  (let [s (str s)]
+    (str s (apply str (repeat (max 0 (- n (count s))) " ")))))
+
+(defn- row! [label n {:keys [ms alloc]} baseline-ns-per]
+  (let [ns-per (/ (* ms 1000000.0) n)
+        b-per (long (/ (double alloc) n))
+        speedup (when baseline-ns-per
+                  (/ (double baseline-ns-per) (max 0.001 ns-per)))]
+    (println (str "  " (pad label 34) (pad (str ms " ms") 10)
+                  (pad (str (/ (Math/Round (* ns-per 100.0)) 100.0) " ns/elem") 15)
+                  (pad (str b-per " B/elem") 12)
+                  (if speedup (str (/ (Math/Round (* speedup 10.0)) 10.0) "x faster") "baseline")))
+    ns-per))
+
+(defn -main [& args]
+  (println "════════════════════════════════════════════════════════════════")
+  (println " BARE METAL —" (Native/CpuBrand)
+           "| SIMD" (str (FloatVector/Count) "-wide")
+           "| hw-accel:" Vector/IsHardwareAccelerated)
+  (println " (CPU name fetched via raw sysctlbyname P/Invoke, by the way)")
+  (println "════════════════════════════════════════════════════════════════")
+
+  (let [xs (float-array N) ys (float-array N)
+        bx (vec (repeatedly boxed-n #(double (rand))))
+        by (vec (repeatedly boxed-n #(double (rand))))
+        dl (DoubleList. (int N))]
+    (dotimes [i N] (aset xs i (float 0.5)) (aset ys i (float 2.0)))
+    (dotimes [_ N] (.Add dl 1.0))
+
+    (println "\nAct 1 — dot product ladder (10M floats; boxed rung uses 1M)")
+    (let [b (row! "idiomatic (boxed seqs, 1M)" boxed-n (bench1 #(boxed-dot bx by)) nil)
+          r1 (bench1 #(scalar-dot xs ys))
+          r2 (bench1 #(simd-dot xs ys))
+          r3 (bench1 #(Baseline/SimdDot xs ys))]
+      (row! "hinted loop (Clojure)" N r1 b)
+      (row! "SIMD Vector<float> (Clojure!)" N r2 b)
+      (row! "SIMD C# (same project)" N r3 b)
+      (println "  results agree:" (== (:result r1) (:result r2) (:result r3))
+               "=" (:result r2)))
+
+    (println "\nAct 2 — reified generics: List<double>, no erasure, no boxing")
+    (println "  runtime type:" (.FullName (class dl)))
+    (let [b (row! "sum boxed PersistentVector (1M)" boxed-n (bench1 #(boxed-sum bx)) nil)]
+      (row! "sum List<double> (10M)" N (bench1 #(list-sum dl)) b))
+
+    (println "\nAct 3 — LINQ over that list with a Clojure lambda:")
+    (let [big? (gen-delegate |System.Func`2[System.Double,System.Boolean]| [x] (> x 0.5))]
+      (println "  (Enumerable/Count (Enumerable/Where dl big?)) =>"
+               (Enumerable/Count (type-args System.Double)
+                                 (Enumerable/Where (type-args System.Double) dl big?))))
+
+    (println "\nAct 4 — P/Invoke: the OS is one attribute away")
+    (let [payload (.GetBytes System.Text.Encoding/UTF8 "ClojureCLR speaks zlib")]
+      (println "  zlib crc32 =>" (str "0x" (.ToString (Native/Crc32 0 payload (uint (alength payload))) "X8"))
+               "(libz.dylib, called directly)"))
+    (println "  sysctl     =>" (Native/CpuBrand) "(raw Darwin syscall)")
+
+    (println "\nDone. Same REPL, same nREPL, same dotnet build for all of it.")))
