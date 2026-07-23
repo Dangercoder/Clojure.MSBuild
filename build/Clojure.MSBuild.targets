@@ -107,6 +107,10 @@ else
     </PropertyGroup>
     <WriteLinesToFile File="$(_ClojureEntryFile)" Lines="$(_ClojureEntrySource)" Overwrite="true" />
     <ItemGroup>
+      <!-- The template's Program.cs would conflict with the generated entry point
+           (CS8802: only one compilation unit can have top-level statements).
+           Setting ClojureMainNamespace means Clojure owns the entry point. -->
+      <Compile Remove="@(Compile)" Condition="'%(Filename)%(Extension)' == 'Program.cs'" />
       <Compile Include="$(_ClojureEntryFile)" />
     </ItemGroup>
   </Target>

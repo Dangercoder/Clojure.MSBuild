@@ -20,12 +20,19 @@ dotnet new console -n MyApp
 cd MyApp
 ```
 
+> Make sure `dotnet --version` reports an 11.x preview SDK. If you have a stable
+> SDK on your PATH as well, put the preview first:
+> `export DOTNET_ROOT="$HOME/.dotnet" PATH="$HOME/.dotnet:$PATH"`
+
 ### 2. Add packages
 
 ```bash
-dotnet add package Clojure.MSBuild
+dotnet add package Clojure.MSBuild --version 0.0.6
 dotnet add package Clojure --version 1.12.3-alpha8
 ```
+
+The template's `Program.cs` can stay or go — once `ClojureMainNamespace` is set,
+Clojure owns the entry point and `Program.cs` is excluded automatically.
 
 ### 3. Update your .csproj
 
