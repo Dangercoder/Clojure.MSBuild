@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json.schemastore.org/template",
+  "author": "Dangercoder",
+  "classifications": ["Console", "Clojure"],
+  "identity": "Clojure.MSBuild.Console",
+  "name": "ClojureCLR Console Application",
+  "shortName": "clojure-clr-console",
+  "description": "A ClojureCLR console application built and run with the dotnet CLI (Clojure.MSBuild).",
+  "tags": { "language": "Clojure", "type": "project" },
+  "sourceName": "ClojureApp",
+  "preferNameDirectory": true,
+  "forms": {
+    "underscore": { "identifier": "replace", "pattern": "-", "replacement": "_" },
+    "slash": { "identifier": "replace", "pattern": "\\.", "replacement": "/" },
+    "dirForm": { "identifier": "chain", "steps": ["underscore", "slash"] },
+    "nsForm": { "identifier": "chain", "steps": ["lowerCase", "safe_namespace"] }
+  },
+  "symbols": {
+    "RootNamespace": {
+      "type": "parameter",
+      "datatype": "string",
+      "description": "Root of the generated Clojure namespaces, e.g. constructly.se (default: the project name, lower-cased)."
+    },
+    "nameNs": { "type": "derived", "valueSource": "name", "valueTransform": "nsForm" },
+    "rootNs": {
+      "type": "generated",
+      "generator": "coalesce",
+      "parameters": { "sourceVariableName": "RootNamespace", "fallbackVariableName": "nameNs" },
+      "replaces": "cljapp"
+    },
+    "rootNsDir": { "type": "derived", "valueSource": "rootNs", "valueTransform": "dirForm", "fileRename": "cljapp" },
+    "assemblyName": { "type": "derived", "valueSource": "name", "valueTransform": "safe_namespace", "replaces": "CLJASSEMBLYNAME" }
+  },
+  "sources": [
+    { "modifiers": [ { "exclude": ["**/bin/**", "**/obj/**", "**/.cpcache/**", "**/*.db", "**/.template.config/**"] } ] }
+  ]
+}

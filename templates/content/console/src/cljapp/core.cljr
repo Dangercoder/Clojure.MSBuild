@@ -1,0 +1,4 @@
+(ns cljapp.core)
+
+(defn -main [& args]
+  (println "Hello from ClojureCLR!" (vec args)))

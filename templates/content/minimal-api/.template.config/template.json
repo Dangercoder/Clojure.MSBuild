@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json.schemastore.org/template",
+  "author": "Dangercoder",
+  "classifications": ["Web", "API", "Clojure"],
+  "identity": "Clojure.MSBuild.MinimalApi",
+  "name": "ClojureCLR Minimal API",
+  "shortName": "clojure-clr-minimal-api",
+  "description": "ASP.NET Core minimal API in ClojureCLR with SQLite, HoneySQL, OpenTelemetry, a Dockerfile and end-to-end tests. Built, tested and run with the dotnet CLI (Clojure.MSBuild).",
+  "tags": { "language": "Clojure", "type": "project" },
+  "sourceName": "ClojureApi",
+  "preferNameDirectory": true,
+  "forms": {
+    "underscore": { "identifier": "replace", "pattern": "-", "replacement": "_" },
+    "slash": { "identifier": "replace", "pattern": "\\.", "replacement": "/" },
+    "dirForm": { "identifier": "chain", "steps": ["underscore", "slash"] },
+    "nsForm": { "identifier": "chain", "steps": ["lowerCase", "safe_namespace"] }
+  },
+  "symbols": {
+    "RootNamespace": {
+      "type": "parameter",
+      "datatype": "string",
+      "description": "Root of the generated Clojure namespaces, e.g. constructly.se (default: the project name, lower-cased)."
+    },
+    "nameNs": { "type": "derived", "valueSource": "name", "valueTransform": "nsForm" },
+    "rootNs": {
+      "type": "generated",
+      "generator": "coalesce",
+      "parameters": { "sourceVariableName": "RootNamespace", "fallbackVariableName": "nameNs" },
+      "replaces": "cljapi"
+    },
+    "rootNsDir": { "type": "derived", "valueSource": "rootNs", "valueTransform": "dirForm", "fileRename": "cljapi" },
+    "assemblyName": { "type": "derived", "valueSource": "name", "valueTransform": "safe_namespace", "replaces": "CLJASSEMBLYNAME" },
+    "nameLower": { "type": "derived", "valueSource": "name", "valueTransform": "lowerCase", "replaces": "cljimagename" }
+  },
+  "sources": [
+    { "modifiers": [ { "exclude": ["**/bin/**", "**/obj/**", "**/.cpcache/**", "**/*.db", "**/*.db-*", "**/.template.config/**"] } ] }
+  ]
+}

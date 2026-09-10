@@ -12,3 +12,4 @@ packages/
 *.pdb
 *.swp
 .cpcache/
+.smoke/

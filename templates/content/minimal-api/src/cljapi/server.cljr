@@ -1,0 +1,33 @@
+(ns cljapi.server
+  "Application entry point. `dotnet run` starts it; the tests build the same
+   application through build-app with a test server and a temporary database."
+  (:require [cljapi.web :as web]
+            [cljapi.db :as db]
+            [cljapi.todos :as todos]
+            [cljapi.routes :as routes]
+            [cljapi.telemetry :as telemetry])
+  (:import [Microsoft.AspNetCore.Builder WebApplication]
+           [Microsoft.Extensions.Configuration ConfigurationExtensions]))
+
+(set! *warn-on-reflection* true)
+
+(defn- connection-string [^WebApplication app]
+  (or (ConfigurationExtensions/GetConnectionString (.-Configuration app) "Default")
+      "Data Source=todos.db"))
+
+(defn build-app
+  "Builds the configured WebApplication. configure-fn may adjust the
+   WebApplicationBuilder (used by the tests to add the test server and to
+   override configuration)."
+  ([] (build-app []))
+  ([args] (build-app args nil))
+  ([args configure-fn]
+   (let [^WebApplication app (web/app args (fn [builder]
+                                             (telemetry/configure! builder)
+                                             (when configure-fn (configure-fn builder))))
+         db (db/db (connection-string app))]
+     (todos/init-schema! db)
+     (routes/configure app db))))
+
+(defn -main [& args]
+  (web/start! (build-app (vec args))))

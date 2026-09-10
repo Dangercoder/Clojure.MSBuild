@@ -1,0 +1,185 @@
+(ns cljapi.todos-test
+  "End-to-end tests: the real application runs in-process on the ASP.NET Core
+   test server with its own temporary SQLite database, and every test goes
+   through HTTP. Responses are checked against the specs in cljapi.todo.model,
+   and the property-based tests generate their input from those specs."
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.spec.alpha :as s]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [clojure.data.json :as json]
+            [cljapi.server :as server]
+            [cljapi.db :as db]
+            [cljapi.todo.model :as model]
+            [cljapi.todos :as todos])
+  (:import [System.IO Path File]
+           [System.Net.Http HttpClient StringContent]
+           [Microsoft.AspNetCore.TestHost HostBuilderTestServerExtensions WebHostBuilderExtensions]
+           [Microsoft.Extensions.Configuration MemoryConfigurationBuilderExtensions]
+           [Microsoft.Extensions.Hosting HostingAbstractionsHostExtensions]))
+
+;; ── Test server ──────────────────────────────────────────────────
+
+(def ^:private state (atom nil))
+
+(defn- await! [task] (.GetResult (.GetAwaiter task)))
+
+(defn- temp-db-file []
+  (Path/Combine (Path/GetTempPath) (str "todos-test-" (System.Guid/NewGuid) ".db")))
+
+(defn- test-configuration [db-file]
+  (doto (|System.Collections.Generic.Dictionary[String,String]|.)
+    (.Add "ConnectionStrings:Default" (str "Data Source=" db-file))))
+
+(defn with-server [f]
+  (let [db-file (temp-db-file)
+        app (server/build-app []
+              (fn [builder]
+                (MemoryConfigurationBuilderExtensions/AddInMemoryCollection
+                  (.-Configuration builder) (test-configuration db-file))
+                (WebHostBuilderExtensions/UseTestServer (.-WebHost builder))))
+        _ (HostingAbstractionsHostExtensions/Start app)
+        client (HostBuilderTestServerExtensions/GetTestClient app)]
+    (reset! state {:client client :db (db/db (str "Data Source=" db-file))})
+    (try
+      (f)
+      (finally
+        (.Dispose client)
+        (await! (.DisposeAsync app))
+        (reset! state nil)
+        (when (File/Exists db-file) (File/Delete db-file))))))
+
+(defn with-empty-table [f]
+  (await! (todos/clear! (:db @state)))
+  (f))
+
+(use-fixtures :once with-server)
+(use-fixtures :each with-empty-table)
+
+;; ── HTTP helpers ─────────────────────────────────────────────────
+
+(defn- client ^HttpClient [] (:client @state))
+
+(defn- response->map [response]
+  (let [body (await! (.ReadAsStringAsync (.Content response)))]
+    {:status (System.Convert/ToInt32 (.StatusCode response))
+     :content-type (some-> (.-ContentType (.-Headers (.Content response))) str)
+     :body (when-not (empty? body) (json/read-str body :key-fn keyword))}))
+
+(defn- GET [path]
+  (response->map (await! (.GetAsync (client) ^String path))))
+
+(defn- json-content [data]
+  (StringContent. (if (string? data) data (json/write-str data)) System.Text.Encoding/UTF8 "application/json"))
+
+(defn- POST [path data]
+  (response->map (await! (.PostAsync (client) ^String path (json-content data)))))
+
+(defn- PUT [path data]
+  (response->map (await! (.PutAsync (client) ^String path (json-content data)))))
+
+(defn- DELETE [path]
+  (response->map (await! (.DeleteAsync (client) ^String path))))
+
+(defn- valid-todo? [body]
+  (or (s/valid? ::model/todo body)
+      (println (model/explain ::model/todo body))))
+
+;; ── Tests ────────────────────────────────────────────────────────
+
+(deftest health
+  (let [{:keys [status body]} (GET "/health")]
+    (is (= 200 status))
+    (is (= {:status "ok"} body))))
+
+(deftest list-is-empty-at-start
+  (let [{:keys [status body content-type]} (GET "/todos")]
+    (is (= 200 status))
+    (is (.StartsWith ^String content-type "application/json"))
+    (is (= [] body))))
+
+(deftest create-and-read-back
+  (testing "POST /todos creates a todo that conforms to ::model/todo"
+    (let [{:keys [status body]} (POST "/todos" {:title "Write tests"})]
+      (is (= 201 status))
+      (is (valid-todo? body))
+      (is (= "Write tests" (:title body)))
+      (is (false? (:done body)))
+      (is (= "[ ] Write tests" (:display-name body)))
+      (testing "and GET /todos/{id} returns it"
+        (is (= {:status 200 :body body}
+               (select-keys (GET (str "/todos/" (:id body))) [:status :body]))))
+      (testing "and it appears in the list"
+        (is (= [body] (:body (GET "/todos"))))))))
+
+(deftest update-todo
+  (let [{:keys [id]} (:body (POST "/todos" {:title "Ship it"}))]
+    (testing "mark done"
+      (let [{:keys [status body]} (PUT (str "/todos/" id) {:done true})]
+        (is (= 200 status))
+        (is (valid-todo? body))
+        (is (true? (:done body)))
+        (is (= "[x] Ship it" (:display-name body)))))
+    (testing "rename"
+      (is (= "Shipped" (get-in (PUT (str "/todos/" id) {:title "Shipped"}) [:body :title]))))
+    (testing "changes are persisted"
+      (is (= {:id id :title "Shipped" :done true :display-name "[x] Shipped"}
+             (:body (GET (str "/todos/" id))))))))
+
+(deftest delete-todo
+  (let [{:keys [id]} (:body (POST "/todos" {:title "Temporary"}))]
+    (is (= 204 (:status (DELETE (str "/todos/" id)))))
+    (is (= 404 (:status (GET (str "/todos/" id)))))
+    (is (= [] (:body (GET "/todos"))))))
+
+(deftest not-found-and-validation
+  (testing "unknown id"
+    (is (= 404 (:status (GET "/todos/999999"))))
+    (is (= 404 (:status (PUT "/todos/999999" {:done true}))))
+    (is (= 404 (:status (DELETE "/todos/999999")))))
+  (testing "non-numeric id"
+    (is (= 400 (:status (GET "/todos/abc")))))
+  (testing "bodies that do not conform to the specs are rejected with the spec explanation"
+    (is (= 400 (:status (POST "/todos" "not json"))))
+    (is (= 400 (:status (POST "/todos" {}))))
+    (is (= 400 (:status (POST "/todos" {:title ""}))))
+    (is (= 400 (:status (POST "/todos" {:title (apply str (repeat (inc model/max-title-length) "x"))}))))
+    (is (= 400 (:status (PUT "/todos/1" {}))))
+    (let [{:keys [status body]} (PUT "/todos/1" {:done "yes"})]
+      (is (= 400 status))
+      (is (.Contains ^String (:error body) "boolean?"))))
+  (testing "unknown route"
+    (is (= 404 (:status (GET "/nope"))))))
+
+;; ── Property-based tests generated from the specs ────────────────
+
+(defspec new-todos-from-spec-round-trip 50
+  (prop/for-all [new-todo (s/gen ::model/new-todo)]
+    (let [{:keys [status body]} (POST "/todos" new-todo)
+          fetched (:body (GET (str "/todos/" (:id body))))]
+      (and (= 201 status)
+           (s/valid? ::model/todo body)
+           (= (:title new-todo) (:title body))
+           (= (model/display-name body) (:display-name body))
+           (= body fetched)))))
+
+(defspec updates-from-spec-are-applied 50
+  (prop/for-all [new-todo (s/gen ::model/new-todo)
+                 update (s/gen ::model/todo-update)]
+    (let [created (:body (POST "/todos" new-todo))
+          {:keys [status body]} (PUT (str "/todos/" (:id created)) update)
+          expected (merge (select-keys created [:id :title :done]) update)]
+      (and (= 200 status)
+           (s/valid? ::model/todo body)
+           (= expected (select-keys body [:id :title :done]))
+           (= (model/display-name expected) (:display-name body))))))
+
+(defspec invalid-titles-are-rejected 30
+  (prop/for-all [title (gen/one-of [(gen/return "")
+                                    (gen/return "   ")
+                                    gen/small-integer
+                                    gen/boolean
+                                    (gen/fmap #(apply str (repeat (+ model/max-title-length 1 %) "x"))
+                                              gen/nat)])]
+    (= 400 (:status (POST "/todos" {:title title})))))

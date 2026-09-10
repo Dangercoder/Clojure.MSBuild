@@ -1,0 +1,5 @@
+bin/
+obj/
+.cpcache/
+*.db
+*.db-*
