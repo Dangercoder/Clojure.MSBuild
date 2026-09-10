@@ -187,13 +187,17 @@
         (println (str "Resolving " (count deps) " git deps from deps.edn..."))
         (resolve-deps-map deps-map)))))
 
+(defn resolve-deps-from-map!
+  "Resolves git deps from a deps map ({:deps {lib coord}}), e.g. the
+   ClojureGitDep items from the .csproj. Returns a vector of source paths."
+  [deps-map]
+  (let [deps (:deps deps-map)]
+    (when (seq deps)
+      (println (str "Resolving " (count deps) " git deps from .csproj..."))
+      (resolve-deps-map deps-map))))
+
 (defn resolve-deps-from-edn!
-  "Resolves git deps from an EDN string (e.g. embedded from .csproj).
-   Returns a vector of source paths."
+  "Resolves git deps from an EDN string. Returns a vector of source paths."
   [edn-str]
   (when-not (str/blank? edn-str)
-    (let [deps-map (edn/read-string edn-str)
-          deps (:deps deps-map)]
-      (when (seq deps)
-        (println (str "Resolving " (count deps) " git deps from .csproj..."))
-        (resolve-deps-map deps-map)))))
+    (resolve-deps-from-map! (edn/read-string edn-str))))

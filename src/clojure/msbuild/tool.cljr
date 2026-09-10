@@ -97,37 +97,49 @@
     (require ns-sym)
     ((resolve 'clojure.test/run-tests) (find-ns ns-sym))))
 
+(defn- root-cause [^Exception e]
+  (loop [e e]
+    (if-let [inner (.InnerException e)] (recur inner) e)))
+
 (defn compile-namespaces
   "AOT compile semicolon-separated namespaces to compile-path.
-   Works around a ClojureCLR bug where PersistedAssemblyBuilder.Save()
-   writes to CWD instead of *compile-path* — we compile to CWD then
-   move the resulting DLLs to the target directory."
+   Each namespace is compiled explicitly (compile only emits assemblies
+   for namespaces loaded from source during the call, so namespaces that
+   are already loaded in this process must be listed to be emitted).
+   Returns the number of namespaces that failed to compile."
   [namespaces compile-path]
-  (let [compile-path (if (Path/IsPathRooted compile-path)
-                       compile-path
-                       (Path/GetFullPath compile-path))
-        cwd (Environment/CurrentDirectory)]
-    (println (str "Compiling namespaces to: " compile-path))
+  (let [compile-path (Path/GetFullPath compile-path)
+        ns-strs (->> (.Split namespaces (char-array ";") StringSplitOptions/RemoveEmptyEntries)
+                     (map #(.Trim ^String %))
+                     (remove empty?)
+                     distinct)]
+    (println (str "Compiling Clojure namespaces to: " compile-path))
     (Directory/CreateDirectory compile-path)
-    (doseq [ns-str (.Split namespaces (char-array ";") StringSplitOptions/RemoveEmptyEntries)]
-      (let [ns-str (.Trim ns-str)]
-        (when (seq ns-str)
-          (println (str "  Compiling " ns-str "..."))
-          (try
-            (binding [*compile-path* compile-path
-                      *compile-files* true]
-              (compile (symbol ns-str)))
-            ;; Workaround: PersistedAssemblyBuilder.Save() writes to CWD.
-            ;; Move any new DLLs from CWD to compile-path.
-            (doseq [dll (Directory/GetFiles cwd "*.dll")
-                    :let [fname (Path/GetFileName dll)
-                          dest (Path/Combine compile-path fname)]
-                    :when (not= cwd compile-path)]
-              (when (File/Exists dest) (File/Delete dest))
-              (File/Move dll dest))
-            (println (str "  Compiled " ns-str))
-            (catch Exception e
-              (println (str "  Error: " (.Message e))))))))))
+    (reduce
+      (fn [failures ns-str]
+        (println (str "  Compiling " ns-str "..."))
+        (try
+          (binding [*compile-path* compile-path
+                    *compile-files* true]
+            (compile (symbol ns-str)))
+          failures
+          (catch Exception e
+            (let [cause (root-cause e)]
+              (binding [*out* *err*]
+                (println (str "  Error compiling " ns-str ": " (.Message cause)))))
+            (inc failures))))
+      0
+      ns-strs)))
+
+(defn build
+  "Build mode used by the ClojureBuild MSBuild target: compile all listed
+   namespaces and exit non-zero if any of them failed."
+  [namespaces compile-path]
+  (let [failures (compile-namespaces namespaces compile-path)]
+    (when (pos? failures)
+      (binding [*out* *err*]
+        (println (str failures " Clojure namespace(s) failed to compile")))
+      (Environment/Exit 1))))
 
 ;; ── Entry point (--clj-mode dispatch) ────────────────────────────
 
@@ -144,7 +156,8 @@
       "script"         (run-script (first rest-args))
       "test"           (run-tests)
       "test-namespace" (run-namespace-tests (first rest-args))
+      "build"          (build (first rest-args) (second rest-args))
       "compile"        (compile-namespaces (first rest-args) (second rest-args))
       (do (println (str "Unknown mode: " mode))
-          (println "Valid modes: repl, nrepl, script, test, test-namespace, compile")
+          (println "Valid modes: repl, nrepl, script, test, test-namespace, build, compile")
           (Environment/Exit 1)))))

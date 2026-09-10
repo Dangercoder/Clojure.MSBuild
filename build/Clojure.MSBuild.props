@@ -4,8 +4,16 @@
     <ClojureReplEnabled Condition="'$(ClojureReplEnabled)' == ''">true</ClojureReplEnabled>
     <ClojureAutoLoadAssemblies Condition="'$(ClojureAutoLoadAssemblies)' == ''">true</ClojureAutoLoadAssemblies>
 
-    <!-- Main namespace — set this in your csproj to auto-generate an entry point -->
+    <!-- Main namespace — set this in your csproj. Its -main becomes the application entry point. -->
     <ClojureMainNamespace Condition="'$(ClojureMainNamespace)' == ''"></ClojureMainNamespace>
+
+    <!-- Entry point style:
+           gen-class  (default) dotnet build AOT-compiles the project and replaces the
+                      project assembly with one whose entry point is a gen-class Main.
+                      The project cannot contain C# sources in this mode.
+           csharp     keep a generated C# Main as the entry point (needed when the
+                      project also compiles C# files). Clojure is still AOT-compiled. -->
+    <ClojureEntryPoint Condition="'$(ClojureEntryPoint)' == ''">gen-class</ClojureEntryPoint>
 
     <!-- Source directory for Clojure files (added to CLOJURE_LOAD_PATH) -->
     <ClojureSourceDir Condition="'$(ClojureSourceDir)' == ''">src</ClojureSourceDir>
@@ -16,9 +24,8 @@
     <!-- Path to Clojure.MSBuild package source (auto-set, don't override) -->
     <ClojureMSBuildSourceDir>$(MSBuildThisFileDirectory)</ClojureMSBuildSourceDir>
 
-    <!-- Clojure AOT Compilation Settings -->
-    <ClojureCompileOnBuild Condition="'$(ClojureCompileOnBuild)' == ''">false</ClojureCompileOnBuild>
-    <ClojureCompilePath Condition="'$(ClojureCompilePath)' == ''"></ClojureCompilePath>
+    <!-- Additional namespaces to AOT compile besides the main namespace and its
+         dependencies (semicolon-separated), e.g. namespaces with gen-class. -->
     <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''"></ClojureNamespacesToCompile>
   </PropertyGroup>
 </Project>

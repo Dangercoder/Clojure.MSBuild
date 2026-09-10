@@ -52,9 +52,18 @@
               (set! (.-ErrorMessage result) "Test failed - see output for details"))
             (.RecordResult framework-handle result)))))))
 
+(defn- dotnet-host
+  "Path of the dotnet host to run the test assembly with. Prefer the host that
+   is running this process so the same SDK/runtime is used as for the build."
+  []
+  (or (not-empty (System.Environment/GetEnvironmentVariable "DOTNET_HOST_PATH"))
+      (let [p (System.Environment/ProcessPath)]
+        (when (and p (.StartsWith (Path/GetFileNameWithoutExtension p) "dotnet")) p))
+      "dotnet"))
+
 (defn- run-namespace-tests! [assembly ns-name tests project-dir framework-handle]
   (let [start-info (doto (ProcessStartInfo.)
-                     (-> .-FileName (set! "dotnet"))
+                     (-> .-FileName (set! (dotnet-host)))
                      (-> .-Arguments (set! (str "\"" assembly "\" --clj-mode test-namespace " ns-name)))
                      (-> .-WorkingDirectory (set! project-dir))
                      (-> .-RedirectStandardOutput (set! true))
@@ -80,7 +89,7 @@
 
 (defn- run-all-tests! [assembly project-dir framework-handle]
   (let [start-info (doto (ProcessStartInfo.)
-                     (-> .-FileName (set! "dotnet"))
+                     (-> .-FileName (set! (dotnet-host)))
                      (-> .-Arguments (set! (str "\"" assembly "\" --clj-mode test")))
                      (-> .-WorkingDirectory (set! project-dir))
                      (-> .-RedirectStandardOutput (set! true))
