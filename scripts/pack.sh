@@ -4,6 +4,10 @@ set -e
 rm -rf packages
 mkdir -p packages
 
+# Long-lived MSBuild/compiler server processes cache imported .targets files,
+# which makes builds pick up a stale copy of the package after re-packing.
+~/.dotnet/dotnet build-server shutdown > /dev/null 2>&1 || true
+
 echo "=== Packing Clojure.MSBuild ==="
 ~/.dotnet/dotnet pack Clojure.MSBuild.csproj -c Release -o packages/
 

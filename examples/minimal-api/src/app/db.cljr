@@ -49,6 +49,7 @@
     cmd))
 
 (defn ^:async execute!
+  "Runs sqlvec ([sql & params]) asynchronously, returning Task<object>."
   [^DbConnection conn sqlvec]
   (let [sqlvec (if (string? sqlvec) [sqlvec] sqlvec)
         ^DbCommand cmd (prepare-command conn sqlvec)
@@ -59,6 +60,10 @@
     (if (seq results)
       results
       [{"affected" affected}])))
+
+;; (t/await (execute! ...)) needs the static Task<object> type of the call, and a
+;; return tag on a ^:async defn is not kept on the var, so attach it explicitly.
+(alter-meta! #'execute! assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
 
 (defmacro with-transaction
   [[conn-sym conn-expr] & body]
