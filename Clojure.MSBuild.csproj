@@ -5,7 +5,7 @@
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>Clojure.MSBuild</PackageId>
     <Version>0.0.7</Version>
-    <Authors>Clojure CLR Contributors</Authors>
+    <Authors>Dangercoder</Authors>
     <Description>MSBuild integration for ClojureCLR. Build, test, and run Clojure on .NET with standard dotnet commands. Written entirely in ClojureCLR.</Description>
     <PackageTags>clojure;clr;msbuild;repl;dotnet</PackageTags>
     <IncludeBuildOutput>false</IncludeBuildOutput>
