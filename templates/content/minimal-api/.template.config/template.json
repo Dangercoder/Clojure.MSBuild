@@ -13,13 +13,14 @@
     "underscore": { "identifier": "replace", "pattern": "-", "replacement": "_" },
     "slash": { "identifier": "replace", "pattern": "\\.", "replacement": "/" },
     "dirForm": { "identifier": "chain", "steps": ["underscore", "slash"] },
-    "nsForm": { "identifier": "chain", "steps": ["lowerCase", "safe_namespace"] }
+    "kebab": { "identifier": "replace", "pattern": "[^a-z0-9.\\-]+", "replacement": "-" },
+    "nsForm": { "identifier": "chain", "steps": ["lowerCase", "kebab"] }
   },
   "symbols": {
     "RootNamespace": {
       "type": "parameter",
       "datatype": "string",
-      "description": "Root of the generated Clojure namespaces, e.g. constructly.se (default: the project name, lower-cased)."
+      "description": "Root of the generated Clojure namespaces, e.g. constructly.se (default: the project name in lower case, e.g. my-api)."
     },
     "nameNs": { "type": "derived", "valueSource": "name", "valueTransform": "nsForm" },
     "rootNs": {

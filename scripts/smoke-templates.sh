@@ -48,6 +48,13 @@ echo "=== clojure-clr-console"
   echo "$out"
   [[ "$out" == *"Hello from ClojureCLR!"*"one"* ]] )
 
+echo "=== clojure-clr-console with the default root namespace"
+"$DOTNET" new clojure-clr-console -n My-App > /dev/null
+test -f My-App/src/my_app/core.cljr
+grep -q "^(ns my-app.core" My-App/src/my_app/core.cljr
+grep -q "<AssemblyName>My_App</AssemblyName>" My-App/My-App.csproj
+( cd My-App && "$DOTNET" build -nologo -v q && "$DOTNET" run --no-build | grep -q "Hello from ClojureCLR" )
+
 echo "=== clojure-clr-minimal-api"
 "$DOTNET" new clojure-clr-minimal-api -n orders --root-namespace constructly.se > /dev/null
 ( cd orders

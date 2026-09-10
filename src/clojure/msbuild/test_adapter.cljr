@@ -67,7 +67,7 @@
         (for [test-file (Directory/GetFiles test-dir "*_test.cljr" SearchOption/AllDirectories)
               :let [ns-name (file->ns-name test-dir test-file)
                     content (File/ReadAllText test-file)]
-              m (Regex/Matches content "\\((?:deftest|defspec)\\s+(\\S+)")
+              m (Regex/Matches content "\\((?:deftest|defspec)\\s+(?:\\^(?:\\{[^}]*\\}|\\S+)\\s+)*(\\S+)")
               :let [test-name (str (.Value (.get_Item (.Groups m) 1)))
                     line-num (-> (.Substring content 0 (.Index m))
                                  (.Split (char-array "\n"))

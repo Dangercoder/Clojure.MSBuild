@@ -21,6 +21,7 @@ dotnet run
 ```
 
 `--root-namespace` sets the root of the generated Clojure namespaces (`constructly.se.server`,
-`constructly.se.routes`, ...). It defaults to the project name in lower case.
+`constructly.se.routes`, ...). It defaults to the project name in lower case (`-n my-api` gives
+`my-api.server` in `src/my_api/`).
 
 Requires the .NET 11 SDK.
