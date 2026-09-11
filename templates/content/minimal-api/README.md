@@ -28,15 +28,16 @@ curl localhost:5080/todos
 ## Layout
 
 - `src/.../server.cljr` builds the application (configuration, telemetry, schema, routes) and holds `-main`.
-- `src/.../todo/model.cljr` the domain as clojure.spec specs (`::title`, `::done`, derived `::display-name`,
-  `::todo`, `::new-todo`, `::todo-update`). Request bodies are validated against them and the
-  property-based tests generate their input with `s/gen` from them.
+- `src/.../todo/model.cljr` the domain as clojure.spec specs, nothing else (`::title`, `::done`, derived
+  `::display-name`, `::todo`, `::new-todo`, `::todo-update`). Request bodies are validated against them and
+  the property-based tests generate their input with `s/gen` from them.
+- `src/.../todo.cljr` the todo module: the logic (`display-name`, `present`, with `s/fdef` contracts) and the
+  storage (schema, HoneySQL queries).
 - `src/.../routes.cljr` HTTP handlers: plain functions of the `HttpContext` returning response maps.
-- `src/.../todos.cljr` HoneySQL queries.
 - `src/.../db.cljr` async ADO.NET helper: `(t/await (db/execute! db {:select ...}))` returns rows as maps.
 - `src/.../web.cljr` the thin wrapper over minimal APIs (routing, JSON, async handlers).
 - `src/.../telemetry.cljr` OpenTelemetry setup.
-- `test/.../todos_test.cljr` end-to-end tests through HTTP, plus property-based tests driven by the specs.
+- `test/.../todo_test.cljr` end-to-end tests through HTTP, plus property-based tests driven by the specs.
 
 The database connection string is `ConnectionStrings:Default` in `appsettings.json`
 (environment: `ConnectionStrings__Default`).

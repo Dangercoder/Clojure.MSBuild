@@ -1,12 +1,13 @@
 (ns cljapi.routes
   "HTTP endpoints. Handlers take the HttpContext and return a response map
    (see cljapi.web). Request bodies are validated with the specs in
-   cljapi.todo.model; async handlers await database calls."
+   cljapi.todo.model; the work is done by cljapi.todo."
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.spec.alpha :as s]
+            [clojure.string :as str]
             [cljapi.web :as web]
-            [cljapi.todo.model :as model]
-            [cljapi.todos :as todos]))
+            [cljapi.todo :as todo]
+            [cljapi.todo.model :as model]))
 
 (defn- parse-id [ctx]
   (let [s (web/route-param ctx "id")]
@@ -18,38 +19,38 @@
   [spec body]
   (cond
     (nil? body) (web/bad-request "body must be a JSON object")
-    (not (s/valid? spec body)) (web/bad-request (model/explain spec body))))
+    (not (s/valid? spec body)) (web/bad-request (str/trim (s/explain-str spec body)))))
 
 (defn health [_ctx]
   (web/ok {:status "ok"}))
 
 (defn ^:async list-todos [db _ctx]
-  (web/ok (mapv model/present (t/await (todos/list-todos db)))))
+  (web/ok (mapv todo/present (t/await (todo/list-todos db)))))
 
 (defn ^:async get-todo [db ctx]
   (if-let [id (parse-id ctx)]
-    (if-let [found (t/await (todos/get-todo db id))]
-      (web/ok (model/present found))
+    (if-let [found (t/await (todo/get-todo db id))]
+      (web/ok (todo/present found))
       (web/not-found "todo not found"))
     (web/bad-request "id must be a number")))
 
 (defn ^:async create-todo [db ctx]
   (let [body (web/parse-json (t/await (web/read-body ctx)))]
     (or (invalid ::model/new-todo body)
-        (web/created (model/present (t/await (todos/create-todo! db (:title body))))))))
+        (web/created (todo/present (t/await (todo/create-todo! db (:title body))))))))
 
 (defn ^:async update-todo [db ctx]
   (let [id (parse-id ctx)
         body (web/parse-json (t/await (web/read-body ctx)))]
     (or (when (nil? id) (web/bad-request "id must be a number"))
         (invalid ::model/todo-update body)
-        (if-let [updated (t/await (todos/update-todo! db id (select-keys body [:title :done])))]
-          (web/ok (model/present updated))
+        (if-let [updated (t/await (todo/update-todo! db id (select-keys body [:title :done])))]
+          (web/ok (todo/present updated))
           (web/not-found "todo not found")))))
 
 (defn ^:async delete-todo [db ctx]
   (if-let [id (parse-id ctx)]
-    (if (t/await (todos/delete-todo! db id))
+    (if (t/await (todo/delete-todo! db id))
       (web/no-content)
       (web/not-found "todo not found"))
     (web/bad-request "id must be a number")))

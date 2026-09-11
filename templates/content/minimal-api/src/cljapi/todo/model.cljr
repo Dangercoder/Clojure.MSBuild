@@ -1,7 +1,7 @@
 (ns cljapi.todo.model
-  "The todo domain as clojure.spec specs. The API validates request bodies
-   against them, responses conform to them, and the tests generate their
-   data from them with s/gen."
+  "The todo domain as clojure.spec specs, nothing else. The API validates
+   request bodies against them, responses conform to them, and the tests
+   generate their data from them with s/gen. The logic lives in cljapi.todo."
   (:require [clojure.spec.alpha :as s]
             [clojure.spec.gen.alpha :as gen]
             [clojure.string :as str]))
@@ -28,6 +28,10 @@
 
 ;; ── Entities and payloads ────────────────────────────────────────
 
+;; A todo as stored
+(s/def ::stored-todo (s/keys :req-un [::id ::title ::done]))
+
+;; A todo as returned by the API
 (s/def ::todo (s/keys :req-un [::id ::title ::done ::display-name]))
 
 (s/def ::new-todo (s/keys :req-un [::title]))
@@ -35,26 +39,3 @@
 (s/def ::todo-update
   (s/and (s/keys :opt-un [::title ::done])
          #(or (contains? % :title) (contains? % :done))))
-
-;; ── Functions ────────────────────────────────────────────────────
-
-(defn display-name [{:keys [title done]}]
-  (str (if done "[x] " "[ ] ") title))
-
-(s/fdef display-name
-  :args (s/cat :todo (s/keys :req-un [::title ::done]))
-  :ret ::display-name)
-
-(defn present
-  "Adds the derived fields to a stored todo."
-  [todo]
-  (assoc todo :display-name (display-name todo)))
-
-(s/fdef present
-  :args (s/cat :todo (s/keys :req-un [::id ::title ::done]))
-  :ret ::todo)
-
-(defn explain
-  "Human readable reason why value does not conform to spec."
-  [spec value]
-  (str/trim (s/explain-str spec value)))

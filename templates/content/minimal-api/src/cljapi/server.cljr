@@ -3,7 +3,7 @@
    application through build-app with a test server and a temporary database."
   (:require [cljapi.web :as web]
             [cljapi.db :as db]
-            [cljapi.todos :as todos]
+            [cljapi.todo :as todo]
             [cljapi.routes :as routes]
             [cljapi.telemetry :as telemetry])
   (:import [Microsoft.AspNetCore.Builder WebApplication]
@@ -26,7 +26,7 @@
                                              (telemetry/configure! builder)
                                              (when configure-fn (configure-fn builder))))
          db (db/db (connection-string app))]
-     (todos/init-schema! db)
+     (todo/init-schema! db)
      (routes/configure app db))))
 
 (defn -main [& args]

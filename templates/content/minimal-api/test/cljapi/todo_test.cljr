@@ -1,4 +1,4 @@
-(ns cljapi.todos-test
+(ns cljapi.todo-test
   "End-to-end tests: the real application runs in-process on the ASP.NET Core
    test server with its own temporary SQLite database, and every test goes
    through HTTP. Responses are checked against the specs in cljapi.todo.model,
@@ -11,8 +11,8 @@
             [clojure.data.json :as json]
             [cljapi.server :as server]
             [cljapi.db :as db]
-            [cljapi.todo.model :as model]
-            [cljapi.todos :as todos])
+            [cljapi.todo :as todo]
+            [cljapi.todo.model :as model])
   (:import [System.IO Path File]
            [System.Net.Http HttpClient StringContent]
            [Microsoft.AspNetCore.TestHost HostBuilderTestServerExtensions WebHostBuilderExtensions]
@@ -51,7 +51,7 @@
         (when (File/Exists db-file) (File/Delete db-file))))))
 
 (defn with-empty-table [f]
-  (await! (todos/clear! (:db @state)))
+  (await! (todo/clear! (:db @state)))
   (f))
 
 (use-fixtures :once with-server)
@@ -84,7 +84,7 @@
 
 (defn- valid-todo? [body]
   (or (s/valid? ::model/todo body)
-      (println (model/explain ::model/todo body))))
+      (println (s/explain-str ::model/todo body))))
 
 ;; ── Tests ────────────────────────────────────────────────────────
 
@@ -161,7 +161,7 @@
       (and (= 201 status)
            (s/valid? ::model/todo body)
            (= (:title new-todo) (:title body))
-           (= (model/display-name body) (:display-name body))
+           (= (todo/display-name body) (:display-name body))
            (= body fetched)))))
 
 (defspec updates-from-spec-are-applied 50
@@ -173,7 +173,7 @@
       (and (= 200 status)
            (s/valid? ::model/todo body)
            (= expected (select-keys body [:id :title :done]))
-           (= (model/display-name expected) (:display-name body))))))
+           (= (todo/display-name expected) (:display-name body))))))
 
 (defspec invalid-titles-are-rejected 30
   (prop/for-all [title (gen/one-of [(gen/return "")

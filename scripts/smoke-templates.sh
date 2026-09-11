@@ -60,7 +60,7 @@ echo "=== clojure-clr-minimal-api"
 ( cd orders
   test -f src/constructly/se/server.cljr
   test -f src/constructly/se/todo/model.cljr
-  test -f test/constructly/se/todos_test.cljr
+  test -f test/constructly/se/todo_test.cljr
   grep -q "constructly.se.server" orders.csproj
   "$DOTNET" build -nologo -v q
   "$DOTNET" test -nologo -v q

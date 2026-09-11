@@ -1,8 +1,31 @@
-(ns cljapi.todos
-  "Todo storage: schema and HoneySQL queries. All functions are async and
-   return Task<object> (rows or the created/updated todo)."
+(ns cljapi.todo
+  "The todo module: domain logic and storage (schema and HoneySQL queries).
+   The specs it works with are in cljapi.todo.model. The database functions
+   are async and return Task<object>."
   (:require [clojure.clr.async.task.alpha :as t]
-            [cljapi.db :as db]))
+            [clojure.spec.alpha :as s]
+            [cljapi.db :as db]
+            [cljapi.todo.model :as model]))
+
+;; ── Logic ────────────────────────────────────────────────────────
+
+(defn display-name [{:keys [title done]}]
+  (str (if done "[x] " "[ ] ") title))
+
+(s/fdef display-name
+  :args (s/cat :todo (s/keys :req-un [::model/title ::model/done]))
+  :ret ::model/display-name)
+
+(defn present
+  "The API representation of a stored todo: adds the derived fields."
+  [todo]
+  (assoc todo :display-name (display-name todo)))
+
+(s/fdef present
+  :args (s/cat :todo ::model/stored-todo)
+  :ret ::model/todo)
+
+;; ── Storage ──────────────────────────────────────────────────────
 
 ;; Tag for the async vars so callers can (t/await (list-todos db)) without a hint.
 (def ^:private task-object-tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
