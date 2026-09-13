@@ -31,8 +31,8 @@ dotnet run
 | Console application | `clojure-clr-console` | `-main`, ready for `dotnet run` |
 | Minimal API | `clojure-clr-minimal-api` | ASP.NET Core minimal API, SQLite, HoneySQL, clojure.spec domain model with spec-driven property tests, OpenTelemetry, Dockerfile and docker-compose with the Aspire dashboard, end-to-end tests |
 
-`--root-namespace` sets the root of the generated Clojure namespaces (`constructly.se.server`,
-`constructly.se.routes`, ...). It defaults to the project name in lower case (`-n my-api` gives
+`--root-namespace` sets the root of the generated Clojure namespaces (`danger.se.server`,
+`danger.se.routes`, ...). It defaults to the project name in lower case (`-n my-api` gives
 `my-api.server` in `src/my_api/`). The templates live in
 [`templates/`](templates/) and `scripts/smoke-templates.sh` generates, builds, tests and runs both.
 
