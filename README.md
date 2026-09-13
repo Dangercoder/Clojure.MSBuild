@@ -19,7 +19,7 @@ No non-dotnet tools needed.
 
 ```bash
 dotnet new install Clojure.MSBuild.Templates
-dotnet new clojure-clr-minimal-api -n orders --root-namespace constructly.se
+dotnet new clojure-clr-minimal-api -n orders --root-namespace danger.se
 cd orders
 dotnet build
 dotnet test
