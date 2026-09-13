@@ -11,13 +11,13 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
     <ClojureMainNamespace>clojure.msbuild.tool</ClojureMainNamespace>
-    <ClojureSourceDir>../clojure</ClojureSourceDir>
+    <ClojureSourceDir>..</ClojureSourceDir>
     <ClojureNamespacesToCompile>clojure.msbuild.test-adapter</ClojureNamespacesToCompile>
     <IsTestProject>false</IsTestProject>
 
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <PackageId>Clojure.MSBuild.TestAdapter</PackageId>
-    <Version>0.0.8</Version>
+    <Version>0.0.9</Version>
     <Authors>Dangercoder</Authors>
     <Description>VSTest adapter for running ClojureCLR tests with dotnet test.</Description>
     <PackageTags>clojure;clr;test;vstest;adapter</PackageTags>

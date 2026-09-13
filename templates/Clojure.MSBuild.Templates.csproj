@@ -3,7 +3,7 @@
   <PropertyGroup>
     <PackageType>Template</PackageType>
     <PackageId>Clojure.MSBuild.Templates</PackageId>
-    <Version>0.0.8</Version>
+    <Version>0.0.9</Version>
     <Title>ClojureCLR project templates</Title>
     <Authors>Dangercoder</Authors>
     <Description>dotnet new templates for ClojureCLR: a console application and a minimal API with SQLite, HoneySQL, clojure.spec, OpenTelemetry, Docker and end-to-end tests. Projects build, test and run with the dotnet CLI through Clojure.MSBuild.</Description>

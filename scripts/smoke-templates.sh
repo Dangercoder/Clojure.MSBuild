@@ -54,6 +54,8 @@ test -f My-App/src/my_app/core.cljr
 grep -q "^(ns my-app.core" My-App/src/my_app/core.cljr
 grep -q "<AssemblyName>My_App</AssemblyName>" My-App/My-App.csproj
 ( cd My-App && "$DOTNET" build -nologo -v q && "$DOTNET" run --no-build | grep -q "Hello from ClojureCLR" )
+echo "--- rebuild time (console, no changes)"
+( cd My-App && time "$DOTNET" build -nologo -v q )
 
 echo "=== clojure-clr-minimal-api"
 "$DOTNET" new clojure-clr-minimal-api -n orders --root-namespace constructly.se > /dev/null

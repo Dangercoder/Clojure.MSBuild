@@ -24,6 +24,11 @@
     <!-- Path to Clojure.MSBuild package source (auto-set, don't override) -->
     <ClojureMSBuildSourceDir>$(MSBuildThisFileDirectory)</ClojureMSBuildSourceDir>
 
+    <!-- The precompiled Clojure runtime (clojure.core, standard library, Clojure.MSBuild
+         tooling) is shared between projects through this directory, keyed by the Clojure
+         and Clojure.MSBuild versions. Set ClojureLibCache=false to keep everything per project. -->
+    <ClojureLibCacheDir Condition="'$(ClojureLibCacheDir)' == ''">$([System.Environment]::GetFolderPath(SpecialFolder.UserProfile))/.clojure-msbuild/lib-cache/</ClojureLibCacheDir>
+
     <!-- Additional namespaces to AOT compile besides the main namespace and its
          dependencies (semicolon-separated), e.g. namespaces with gen-class. -->
     <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''"></ClojureNamespacesToCompile>
