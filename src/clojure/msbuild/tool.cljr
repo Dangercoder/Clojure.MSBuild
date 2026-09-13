@@ -2,8 +2,49 @@
   "ClojureCLR MSBuild tool — REPL, test runner, script runner, AOT compiler.
    Runs in-process: the host project's entry point already loaded all assemblies
    and set up CLOJURE_LOAD_PATH, so no bootstrap is needed here."
-  (:import [System Environment Console]
+  (:require [clojure.string :as str]
+            [clojure.test])
+  (:import [System Environment Console DateTime]
            [System.IO Directory Path File SearchOption]))
+
+;; ── Machine-readable test results ────────────────────────────────
+
+(def result-prefix
+  "Prefix of the one-line-per-test result written to stdout while tests run:
+   CLJTEST<tab>ns/name<tab>pass|fail<tab>milliseconds<tab>first failure message
+   The VSTest adapter (Clojure.MSBuild.TestAdapter) parses these lines."
+  "CLJTEST")
+
+(defn- format-failure [{:keys [type message expected actual]}]
+  (str (name type)
+       (when message (str ": " message))
+       " expected: " (pr-str expected)
+       " actual: " (pr-str actual)))
+
+(defn- single-line [s]
+  (str/replace (or s "") #"[\r\n\t]+" " "))
+
+(defn run-with-reporter
+  "Calls f with clojure.test/report wrapped so that, in addition to the normal
+   output, one result line per test var is printed (see result-prefix)."
+  [f]
+  (let [original clojure.test/report
+        current (atom nil)]
+    (binding [clojure.test/report
+              (fn [m]
+                (case (:type m)
+                  :begin-test-var (reset! current {:var (:var m) :start (DateTime/UtcNow) :failures []})
+                  (:fail :error) (swap! current update :failures conj (format-failure m))
+                  nil)
+                (original m)
+                (when (= :end-test-var (:type m))
+                  (let [{:keys [var start failures]} @current
+                        {:keys [ns name]} (meta var)
+                        ms (long (.TotalMilliseconds (.Subtract (DateTime/UtcNow) ^DateTime start)))]
+                    (println (str result-prefix "\t" (ns-name ns) "/" name "\t"
+                                  (if (empty? failures) "pass" "fail") "\t" ms "\t"
+                                  (single-line (first failures)))))))]
+      (f))))
 
 ;; ── Test directory helpers ───────────────────────────────────────
 
@@ -82,10 +123,12 @@
                                    (println (str "Error loading namespace " ns-sym ": " (.Message e)))
                                    nil)))
                              test-nses))]
-    (if (seq loaded)
-      (apply run-tests-fn (map find-ns loaded))
-      (do (println "No test namespaces found, running all tests...")
-          (run-all-fn)))))
+    (run-with-reporter
+      (fn []
+        (if (seq loaded)
+          (apply run-tests-fn (map find-ns loaded))
+          (do (println "No test namespaces found, running all tests...")
+              (run-all-fn)))))))
 
 (defn run-namespace-tests
   "Run tests for a specific namespace."
@@ -95,7 +138,29 @@
   (require 'clojure.test)
   (let [ns-sym (symbol ns-name)]
     (require ns-sym)
-    ((resolve 'clojure.test/run-tests) (find-ns ns-sym))))
+    (run-with-reporter
+      (fn [] ((resolve 'clojure.test/run-tests) (find-ns ns-sym))))))
+
+(defn run-test-vars
+  "Run only the given tests (\"ns/name\" strings), with their namespaces'
+   fixtures. Used by the VSTest adapter for filtered runs."
+  [names]
+  (println (str "Running tests: " (str/join " " names)))
+  (add-test-dir-to-load-path!)
+  (require 'clojure.test)
+  (let [vars (doall
+               (keep (fn [full-name]
+                       (let [sym (symbol full-name)]
+                         (try
+                           (require (symbol (namespace sym)))
+                           (or (resolve sym)
+                               (println (str "Error: test " full-name " not found")))
+                           (catch Exception e
+                             (println (str "Error loading namespace " (namespace sym) ": " (.Message e)))
+                             nil))))
+                     names))]
+    (run-with-reporter
+      (fn [] ((resolve 'clojure.test/test-vars) vars)))))
 
 (defn- root-cause [^Exception e]
   (loop [e e]
@@ -156,8 +221,9 @@
       "script"         (run-script (first rest-args))
       "test"           (run-tests)
       "test-namespace" (run-namespace-tests (first rest-args))
+      "test-vars"      (run-test-vars rest-args)
       "build"          (build (first rest-args) (second rest-args))
       "compile"        (compile-namespaces (first rest-args) (second rest-args))
       (do (println (str "Unknown mode: " mode))
-          (println "Valid modes: repl, nrepl, script, test, test-namespace, build, compile")
+          (println "Valid modes: repl, nrepl, script, test, test-namespace, test-vars, build, compile")
           (Environment/Exit 1)))))

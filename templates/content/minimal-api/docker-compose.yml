@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    image: cljimagename
+    ports:
+      - "8080:8080"
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://dashboard:18889
+      OTEL_SERVICE_NAME: ClojureApi
+    volumes:
+      - todos-data:/data
+    depends_on:
+      - dashboard
+
+  # .NET Aspire dashboard: traces, logs and metrics at http://localhost:18888
+  dashboard:
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:13.2
+    environment:
+      DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS: "true"
+    ports:
+      - "18888:18888"
+
+volumes:
+  todos-data:

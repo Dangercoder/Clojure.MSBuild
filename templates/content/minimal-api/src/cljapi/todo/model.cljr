@@ -1,0 +1,41 @@
+(ns cljapi.todo.model
+  "The todo domain as clojure.spec specs, nothing else. The API validates
+   request bodies against them, responses conform to them, and the tests
+   generate their data from them with s/gen. The logic lives in cljapi.todo."
+  (:require [clojure.spec.alpha :as s]
+            [clojure.spec.gen.alpha :as gen]
+            [clojure.string :as str]))
+
+(def max-title-length 200)
+
+;; ── Fields ───────────────────────────────────────────────────────
+
+(s/def ::id pos-int?)
+
+(s/def ::title
+  (s/with-gen
+    (s/and string? (complement str/blank?) #(<= (count %) max-title-length))
+    ;; printable ASCII, non-blank, within the length limit
+    #(gen/such-that (complement str/blank?)
+                    (gen/fmap (fn [s] (subs s 0 (min (count s) max-title-length)))
+                              (gen/string-ascii))
+                    100)))
+
+(s/def ::done boolean?)
+
+;; Derived, read-only: "[x] title" / "[ ] title"
+(s/def ::display-name (s/and string? #(re-matches #"\[[ x]\] .+" %)))
+
+;; ── Entities and payloads ────────────────────────────────────────
+
+;; A todo as stored
+(s/def ::stored-todo (s/keys :req-un [::id ::title ::done]))
+
+;; A todo as returned by the API
+(s/def ::todo (s/keys :req-un [::id ::title ::done ::display-name]))
+
+(s/def ::new-todo (s/keys :req-un [::title]))
+
+(s/def ::todo-update
+  (s/and (s/keys :opt-un [::title ::done])
+         #(or (contains? % :title) (contains? % :done))))

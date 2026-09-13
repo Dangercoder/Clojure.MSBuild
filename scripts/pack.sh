@@ -23,5 +23,9 @@ echo "=== Packing Clojure.MSBuild.TestAdapter ==="
 ~/.dotnet/dotnet pack src/TestAdapter/Clojure.MSBuild.TestAdapter.csproj -c Release -o packages/
 
 echo ""
+echo "=== Packing Clojure.MSBuild.Templates ==="
+~/.dotnet/dotnet pack templates/Clojure.MSBuild.Templates.csproj -c Release -o packages/
+
+echo ""
 echo "=== Packages ==="
 ls -la packages/*.nupkg

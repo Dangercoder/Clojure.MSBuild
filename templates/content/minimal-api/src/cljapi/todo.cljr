@@ -1,0 +1,78 @@
+(ns cljapi.todo
+  "The todo module: domain logic and storage (schema and HoneySQL queries).
+   The specs it works with are in cljapi.todo.model. The database functions
+   are async and return Task<object>."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [clojure.spec.alpha :as s]
+            [cljapi.db :as db]
+            [cljapi.todo.model :as model]))
+
+;; ── Logic ────────────────────────────────────────────────────────
+
+(defn display-name [{:keys [title done]}]
+  (str (if done "[x] " "[ ] ") title))
+
+(s/fdef display-name
+  :args (s/cat :todo (s/keys :req-un [::model/title ::model/done]))
+  :ret ::model/display-name)
+
+(defn present
+  "The API representation of a stored todo: adds the derived fields."
+  [todo]
+  (assoc todo :display-name (display-name todo)))
+
+(s/fdef present
+  :args (s/cat :todo ::model/stored-todo)
+  :ret ::model/todo)
+
+;; ── Storage ──────────────────────────────────────────────────────
+
+;; Tag for the async vars so callers can (t/await (list-todos db)) without a hint.
+(def ^:private task-object-tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn init-schema! [db]
+  (db/execute-sync! db ["CREATE TABLE IF NOT EXISTS todos (
+                           id INTEGER PRIMARY KEY AUTOINCREMENT,
+                           title TEXT NOT NULL,
+                           done INTEGER NOT NULL DEFAULT 0)"]))
+
+(defn- row->todo [{:keys [id title done]}]
+  {:id id :title title :done (= 1 done)})
+
+(defn ^:async list-todos [db]
+  (mapv row->todo
+        (t/await (db/execute! db {:select [:id :title :done]
+                                  :from [:todos]
+                                  :order-by [[:id :asc]]}))))
+
+(defn ^:async get-todo [db id]
+  (let [rows (t/await (db/execute! db {:select [:id :title :done]
+                                       :from [:todos]
+                                       :where [:= :id id]}))]
+    (some-> (first rows) row->todo)))
+
+(alter-meta! #'get-todo assoc :tag task-object-tag)
+
+(defn ^:async create-todo! [db title]
+  (t/await (db/execute! db {:insert-into :todos :values [{:title title :done 0}]}))
+  (let [rows (t/await (db/execute! db ["SELECT id, title, done FROM todos WHERE id = last_insert_rowid()"]))]
+    (row->todo (first rows))))
+
+(defn ^:async update-todo! [db id {:keys [title done]}]
+  (let [changes (cond-> {}
+                  (some? title) (assoc :title title)
+                  (some? done) (assoc :done (if done 1 0)))]
+    (when (seq changes)
+      (t/await (db/execute! db {:update :todos :set changes :where [:= :id id]})))
+    (t/await (get-todo db id))))
+
+(defn ^:async delete-todo! [db id]
+  (let [[{:keys [affected]}] (t/await (db/execute! db {:delete-from :todos :where [:= :id id]}))]
+    (pos? (or affected 0))))
+
+(defn ^:async clear! [db]
+  (t/await (db/execute! db {:delete-from :todos}))
+  nil)
+
+(doseq [v [#'list-todos #'get-todo #'create-todo! #'update-todo! #'delete-todo! #'clear!]]
+  (alter-meta! v assoc :tag task-object-tag))

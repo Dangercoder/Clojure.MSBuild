@@ -4,7 +4,8 @@
     <TargetFramework>net11.0</TargetFramework>
     <EnablePreviewFeatures>true</EnablePreviewFeatures>
     <Features>$(Features);runtime-async=on</Features>
-    <ClojureMainNamespace>app.server</ClojureMainNamespace>
+    <AssemblyName>CLJASSEMBLYNAME</AssemblyName>
+    <ClojureMainNamespace>cljapi.server</ClojureMainNamespace>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
   </PropertyGroup>
@@ -13,18 +14,23 @@
     <PackageReference Include="Clojure.MSBuild" Version="0.0.8" />
     <PackageReference Include="Clojure.MSBuild.TestAdapter" Version="0.0.8" />
     <PackageReference Include="Clojure" Version="1.12.6" />
-    <PackageReference Include="clojure.tools.nrepl" Version="0.1.0-alpha2" />
-    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="11.0.0-rc.1.26425.128" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0-rc.1.26425.128" />
     <PackageReference Include="clojure.data.json" Version="2.5.1" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0-rc.1.26425.128" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.18.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.18.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.18.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.18.0" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="11.0.0-rc.1.26425.128" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.0" />
 
+    <!-- Clojure libraries from git (cloned to ~/.gitlibs, compiled into the build output) -->
     <ClojureGitDep Include="com.github.seancorfield/honeysql" Tag="v2.7.1368" Sha="b8332fc" />
   </ItemGroup>
 
   <ItemGroup>
     <Content Include="src/**/*.cljr" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="test/**/*.cljr" CopyToOutputDirectory="PreserveNewest" />
+    <Content Remove=".template.config/**" />
   </ItemGroup>
 
 </Project>

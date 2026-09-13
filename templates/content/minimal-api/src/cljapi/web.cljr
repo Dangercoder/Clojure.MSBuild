@@ -1,0 +1,121 @@
+(ns cljapi.web
+  "Small wrapper over ASP.NET Core minimal APIs.
+
+   Handlers are plain functions of the HttpContext that return a response:
+     {:status 200 :json data}   JSON body (Clojure data)
+     {:status 200 :body \"..\"}  text body
+     data                       any Clojure collection => 200 JSON
+     nil                        204 No Content
+   A handler may be ^:async (returning a Task) and use t/await inside."
+  (:refer-clojure :exclude [get])
+  (:require [clojure.clr.async.task.alpha :as t]
+            [clojure.data.json :as json])
+  (:import [Microsoft.AspNetCore.Builder WebApplication WebApplicationBuilder EndpointRouteBuilderExtensions]
+           [Microsoft.AspNetCore.Http HttpContext HttpResponse HttpRequest]
+           [Microsoft.Extensions.Hosting HostingAbstractionsHostExtensions]
+           [Microsoft.Extensions.Primitives StringValues]
+           [System.Threading.Tasks Task]))
+
+(set! *warn-on-reflection* true)
+
+;; ── Application ──────────────────────────────────────────────────
+
+(defn app
+  "Creates the WebApplication. configure-fn, if given, receives the
+   WebApplicationBuilder before Build (services, configuration, test server)."
+  ([] (app []))
+  ([args] (app args nil))
+  ([args configure-fn]
+   (let [^|System.String[]| str-args (into-array String (remove nil? args))
+         ^WebApplicationBuilder builder (WebApplication/CreateBuilder str-args)]
+     (when configure-fn (configure-fn builder))
+     (.Build builder))))
+
+(defn start! [^WebApplication app]
+  (HostingAbstractionsHostExtensions/Run app))
+
+;; ── Requests ─────────────────────────────────────────────────────
+
+(defn route-param
+  "Route value for name (e.g. \"id\" for the pattern \"/todos/{id}\"), as a string."
+  [^HttpContext ctx ^String name]
+  (some-> (.get_Item (.-RouteValues (.-Request ctx)) name) str))
+
+(defn ^|System.Threading.Tasks.Task`1[System.String]| read-body [^HttpContext ctx]
+  (let [^HttpRequest req (.-Request ctx)]
+    (.ReadToEndAsync (System.IO.StreamReader. (.Body req)))))
+
+(defn parse-json
+  "Parses a JSON object body into a map with keyword keys, or nil if invalid."
+  [^String body]
+  (try
+    (let [v (json/read-str body :key-fn keyword)]
+      (when (map? v) v))
+    (catch Exception _ nil)))
+
+;; ── Responses ────────────────────────────────────────────────────
+
+(defn ok [data] {:status 200 :json data})
+(defn created [data] {:status 201 :json data})
+(defn no-content [] nil)
+(defn bad-request [message] {:status 400 :json {:error message}})
+(defn not-found [message] {:status 404 :json {:error message}})
+
+(defn- write-bytes ^Task [^HttpResponse resp ^long status ^String content-type ^bytes bytes]
+  (set! (.-StatusCode resp) (int status))
+  (when content-type
+    (.set_Item (.-Headers resp) "Content-Type" (StringValues. content-type)))
+  (.WriteAsync (.Body resp) bytes 0 (alength bytes)))
+
+(defn- write-response ^Task [^HttpContext ctx response]
+  (let [^HttpResponse resp (.-Response ctx)
+        utf8 System.Text.Encoding/UTF8]
+    (cond
+      (nil? response)
+      (do (set! (.-StatusCode resp) (int 204))
+          Task/CompletedTask)
+
+      (and (map? response) (contains? response :json))
+      (write-bytes resp (or (:status response) 200) "application/json; charset=utf-8"
+                   (.GetBytes utf8 (json/write-str (:json response))))
+
+      (and (map? response) (contains? response :status))
+      (write-bytes resp (:status response) "text/plain; charset=utf-8"
+                   (.GetBytes utf8 (str (:body response ""))))
+
+      (or (map? response) (sequential? response))
+      (write-bytes resp 200 "application/json; charset=utf-8"
+                   (.GetBytes utf8 (json/write-str response)))
+
+      :else
+      (write-bytes resp 200 "text/plain; charset=utf-8" (.GetBytes utf8 (str response))))))
+
+(defn ^:async respond
+  "Awaits the handler result if it is a Task, then writes it as the response."
+  [^HttpContext ctx result]
+  (let [value (if (instance? Task result)
+                (t/await ^|System.Threading.Tasks.Task`1[System.Object]| result)
+                result)]
+    (t/await ^System.Threading.Tasks.Task (write-response ctx value))))
+
+(defn- wrap [handler]
+  (gen-delegate |System.Func`2[Microsoft.AspNetCore.Http.HttpContext,System.Threading.Tasks.Task]| [ctx]
+    (respond ctx (handler ctx))))
+
+;; ── Routing ──────────────────────────────────────────────────────
+
+(defn get [^WebApplication app ^String path handler]
+  (EndpointRouteBuilderExtensions/MapGet app path ^System.Delegate (wrap handler))
+  app)
+
+(defn post [^WebApplication app ^String path handler]
+  (EndpointRouteBuilderExtensions/MapPost app path ^System.Delegate (wrap handler))
+  app)
+
+(defn put [^WebApplication app ^String path handler]
+  (EndpointRouteBuilderExtensions/MapPut app path ^System.Delegate (wrap handler))
+  app)
+
+(defn delete [^WebApplication app ^String path handler]
+  (EndpointRouteBuilderExtensions/MapDelete app path ^System.Delegate (wrap handler))
+  app)

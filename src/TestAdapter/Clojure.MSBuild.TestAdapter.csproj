@@ -17,8 +17,8 @@
 
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <PackageId>Clojure.MSBuild.TestAdapter</PackageId>
-    <Version>0.0.7</Version>
-    <Authors>Clojure CLR Contributors</Authors>
+    <Version>0.0.8</Version>
+    <Authors>Dangercoder</Authors>
     <Description>VSTest adapter for running ClojureCLR tests with dotnet test.</Description>
     <PackageTags>clojure;clr;test;vstest;adapter</PackageTags>
     <DevelopmentDependency>true</DevelopmentDependency>

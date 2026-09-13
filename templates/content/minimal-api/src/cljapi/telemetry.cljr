@@ -1,0 +1,40 @@
+(ns cljapi.telemetry
+  "OpenTelemetry: traces and metrics for ASP.NET Core and HttpClient, logs via
+   the OpenTelemetry logger provider. Everything is exported over OTLP when
+   OTEL_EXPORTER_OTLP_ENDPOINT is set (see docker-compose.yml for a local
+   Aspire dashboard); otherwise telemetry is collected but not exported.
+   The service name comes from OTEL_SERVICE_NAME."
+  (:require [clojure.string :as str])
+  (:import [System Environment]
+           [Microsoft.AspNetCore.Builder WebApplicationBuilder]
+           [Microsoft.Extensions.DependencyInjection OpenTelemetryServicesExtensions]
+           [OpenTelemetry IOpenTelemetryBuilder OpenTelemetryBuilderSdkExtensions OpenTelemetryBuilderOtlpExporterExtensions]
+           [OpenTelemetry.Trace TracerProviderBuilder
+            AspNetCoreInstrumentationTracerProviderBuilderExtensions
+            HttpClientInstrumentationTracerProviderBuilderExtensions]
+           [OpenTelemetry.Metrics MeterProviderBuilder
+            AspNetCoreInstrumentationMeterProviderBuilderExtensions
+            HttpClientInstrumentationMeterProviderBuilderExtensions]))
+
+(set! *warn-on-reflection* true)
+
+(defn otlp-endpoint []
+  (let [endpoint (Environment/GetEnvironmentVariable "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    (when-not (str/blank? endpoint) endpoint)))
+
+(defn configure!
+  "Adds OpenTelemetry to the application's services."
+  [^WebApplicationBuilder builder]
+  (let [^IOpenTelemetryBuilder otel (OpenTelemetryServicesExtensions/AddOpenTelemetry (.-Services builder))]
+    (OpenTelemetryBuilderSdkExtensions/WithTracing otel
+      (sys-action [TracerProviderBuilder] [^TracerProviderBuilder tracing]
+        (AspNetCoreInstrumentationTracerProviderBuilderExtensions/AddAspNetCoreInstrumentation tracing)
+        (HttpClientInstrumentationTracerProviderBuilderExtensions/AddHttpClientInstrumentation tracing)))
+    (OpenTelemetryBuilderSdkExtensions/WithMetrics otel
+      (sys-action [MeterProviderBuilder] [^MeterProviderBuilder metrics]
+        (AspNetCoreInstrumentationMeterProviderBuilderExtensions/AddAspNetCoreInstrumentation metrics)
+        (HttpClientInstrumentationMeterProviderBuilderExtensions/AddHttpClientInstrumentation metrics)))
+    (OpenTelemetryBuilderSdkExtensions/WithLogging otel)
+    (when (otlp-endpoint)
+      (OpenTelemetryBuilderOtlpExporterExtensions/UseOtlpExporter otel))
+    builder))
