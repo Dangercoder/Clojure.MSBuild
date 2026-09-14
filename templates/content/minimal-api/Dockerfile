@@ -4,8 +4,10 @@ WORKDIR /src
 COPY . .
 # Restores NuGet packages, AOT-compiles the Clojure namespaces (HoneySQL is fetched
 # from git into ~/.gitlibs during the build) and publishes the standalone output.
+# The precompiled Clojure runtime is cached between image builds in ~/.clojure-msbuild.
 RUN --mount=type=cache,target=/root/.nuget/packages \
     --mount=type=cache,target=/root/.gitlibs \
+    --mount=type=cache,target=/root/.clojure-msbuild \
     dotnet publish ClojureApi.csproj -c Release -o /app
 
 FROM mcr.microsoft.com/dotnet/aspnet:11.0

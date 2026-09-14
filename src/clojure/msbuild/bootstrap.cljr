@@ -83,6 +83,17 @@
           (binding [*out* *err*]
             (println (str "Warning: git deps resolution failed: " (.Message e)))))))))
 
+;; ── clojure.core ─────────────────────────────────────────────────
+
+(defn- mark-core-loaded!
+  "The runtime loads clojure.core without recording it in *loaded-libs*, so a
+   namespace that requires clojure.core explicitly (clojure.test.check.generators
+   does) makes ClojureCLR load it a second time: 25 s from source, and during
+   the build it would be emitted in the wrong layer. Record it as loaded, which
+   is what the JVM effectively does."
+  []
+  (dosync (alter (deref #'clojure.core/*loaded-libs*) conj 'clojure.core)))
+
 ;; ── Entry ────────────────────────────────────────────────────────
 
 (defn run
@@ -100,6 +111,7 @@
    Task result."
   [config args]
   (let [args (vec args)]
+    (mark-core-loaded!)
     (setup-load-path! config)
     (preload-assemblies!)
     (if (= "--clj-mode" (first args))

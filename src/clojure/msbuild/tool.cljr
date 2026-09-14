@@ -166,6 +166,88 @@
   (loop [e e]
     (if-let [inner (.InnerException e)] (recur inner) e)))
 
+(defn- warn [& parts]
+  (binding [*out* *err*]
+    (println (apply str parts))))
+
+;; ── Project vs library namespaces ────────────────────────────────
+;;
+;; The build compiles Clojure in two layers. Library namespaces (clojure.core
+;; and the standard library, NuGet Clojure libraries, git dependencies and the
+;; Clojure.MSBuild tooling) only change when the project's dependencies change,
+;; so they are compiled once into a cached layer. Project namespaces, whose
+;; source lives in the project directories, are recompiled on every build.
+
+(def ^:private source-extensions [".cljr" ".cljc" ".clj"])
+
+(defn- parse-dirs
+  "Pipe-separated directories, made absolute against the current directory;
+   blanks and missing directories are dropped."
+  [dirs]
+  (->> (.Split (or dirs "") (char-array "|") StringSplitOptions/RemoveEmptyEntries)
+       (map #(.Trim ^String %))
+       (remove empty?)
+       (map #(Path/GetFullPath (Path/Combine (Environment/CurrentDirectory) %)))
+       (filter #(Directory/Exists %))
+       distinct
+       vec))
+
+(defn- source-in-dirs?
+  "Does a source file for the given path stem (a/b_c/d) exist under any of dirs?"
+  [dirs stem]
+  (boolean (some (fn [dir] (some #(File/Exists (Path/Combine dir (str stem %))) source-extensions)) dirs)))
+
+(defn- project-namespace? [project-dirs ns-sym]
+  (source-in-dirs? project-dirs
+                   (-> (str ns-sym) (.Replace \- \_) (.Replace \. Path/DirectorySeparatorChar))))
+
+(defn- compiled-file-stem
+  "clojure.msbuild.test_adapter.cljr.dll -> clojure/msbuild/test_adapter, or nil
+   for files that are not compiled Clojure namespaces (e.g. the entry exe)."
+  [file]
+  (let [name (Path/GetFileName file)]
+    (some (fn [ext]
+            (let [suffix (str ext ".dll")]
+              (when (.EndsWith name suffix)
+                (.Replace (subs name 0 (- (count name) (count suffix))) \. Path/DirectorySeparatorChar))))
+          source-extensions)))
+
+(defn- project-compiled-file? [project-dirs file]
+  (when-let [stem (compiled-file-stem file)]
+    (source-in-dirs? project-dirs stem)))
+
+(defn- delete-with-pdb! [^String dll]
+  (File/Delete dll)
+  (let [pdb (Path/ChangeExtension dll ".pdb")]
+    (when (File/Exists pdb) (File/Delete pdb))))
+
+(defn- move-with-pdb! [^String dll ^String target-dir]
+  (let [target (Path/Combine target-dir (Path/GetFileName dll))
+        pdb (Path/ChangeExtension dll ".pdb")]
+    (File/Move dll target true)
+    (when (File/Exists pdb)
+      (File/Move pdb (Path/Combine target-dir (Path/GetFileName pdb)) true))))
+
+;; ── Compilation ──────────────────────────────────────────────────
+
+(defn- compile-one!
+  "Compiles one namespace into compile-path. Returns true on success; failures
+   are reported on stderr and any partially written assembly is removed."
+  [ns-sym compile-path]
+  (try
+    (binding [*compile-path* compile-path
+              *compile-files* true]
+      (compile ns-sym))
+    true
+    (catch Exception e
+      (warn "  Error compiling " ns-sym ": " (.Message (root-cause e)))
+      (let [stem (-> (str ns-sym) (.Replace \- \_))]
+        (doseq [ext source-extensions
+                :let [dll (Path/Combine compile-path (str stem ext ".dll"))]
+                :when (File/Exists dll)]
+          (delete-with-pdb! dll)))
+      false)))
+
 (defn compile-namespaces
   "AOT compile semicolon-separated namespaces to compile-path.
    Each namespace is compiled explicitly (compile only emits assemblies
@@ -180,31 +262,144 @@
                      distinct)]
     (println (str "Compiling Clojure namespaces to: " compile-path))
     (Directory/CreateDirectory compile-path)
-    (reduce
-      (fn [failures ns-str]
-        (println (str "  Compiling " ns-str "..."))
-        (try
-          (binding [*compile-path* compile-path
-                    *compile-files* true]
-            (compile (symbol ns-str)))
-          failures
-          (catch Exception e
-            (let [cause (root-cause e)]
-              (binding [*out* *err*]
-                (println (str "  Error compiling " ns-str ": " (.Message cause)))))
-            (inc failures))))
-      0
-      ns-strs)))
+    (reduce (fn [failures ns-str]
+              (println (str "  Compiling " ns-str "..."))
+              (if (compile-one! (symbol ns-str) compile-path) failures (inc failures)))
+            0
+            ns-strs)))
 
 (defn build
-  "Build mode used by the ClojureBuild MSBuild target: compile all listed
-   namespaces and exit non-zero if any of them failed."
-  [namespaces compile-path]
+  "Build mode used by the ClojureBuild MSBuild target: compile the project
+   namespaces into compile-path and exit non-zero if any of them failed.
+   Library namespaces that had to be loaded from source along the way (a
+   dependency the library layer did not know about yet) are moved into
+   lib-dir so that later builds load them precompiled."
+  [namespaces compile-path lib-dir project-dirs]
   (let [failures (compile-namespaces namespaces compile-path)]
     (when (pos? failures)
-      (binding [*out* *err*]
-        (println (str failures " Clojure namespace(s) failed to compile")))
-      (Environment/Exit 1))))
+      (warn failures " Clojure namespace(s) failed to compile")
+      (Environment/Exit 1))
+    (when-not (str/blank? lib-dir)
+      (let [lib-dir (Path/GetFullPath lib-dir)
+            project-dirs (parse-dirs project-dirs)]
+        (Directory/CreateDirectory lib-dir)
+        (doseq [dll (Directory/GetFiles (Path/GetFullPath compile-path) "*.dll")
+                :when (and (compiled-file-stem dll) (not (project-compiled-file? project-dirs dll)))]
+          (println (str "  Adding " (Path/GetFileName dll) " to the library layer"))
+          (move-with-pdb! dll lib-dir))))))
+
+;; Loaded by clojure.core itself; compiling clojure.core emits them.
+(def ^:private core-parts '#{clojure.core clojure.core.protocols clojure.instant clojure.uuid})
+
+;; spec is reloaded before anything that registers specs against it.
+(def ^:private spec-first '{clojure.spec.alpha 0 clojure.spec.gen.alpha 1 clojure.core.specs.alpha 2})
+
+(defn- copy-dlls!
+  "Copies the assemblies (and pdbs) in files into target-dir."
+  [files target-dir]
+  (Directory/CreateDirectory target-dir)
+  (doseq [^String f files]
+    (File/Copy f (Path/Combine target-dir (Path/GetFileName f)) true)
+    (let [pdb (Path/ChangeExtension f ".pdb")]
+      (when (File/Exists pdb)
+        (File/Copy pdb (Path/Combine target-dir (Path/GetFileName pdb)) true)))))
+
+(defn- publish-shared-layer!
+  "Stores files in shared-dir for other projects. Written to a temporary
+   directory first and moved into place so concurrent builds never see a
+   partial layer; the first one to finish wins."
+  [shared-dir files]
+  (let [shared-dir (.TrimEnd (Path/GetFullPath shared-dir) (char-array [Path/DirectorySeparatorChar]))
+        tmp (str shared-dir ".tmp-" (.Id (System.Diagnostics.Process/GetCurrentProcess)))]
+    (try
+      (copy-dlls! files tmp)
+      (File/WriteAllText (Path/Combine tmp "complete") (str (DateTime/UtcNow)))
+      (Directory/CreateDirectory (Path/GetDirectoryName shared-dir))
+      (if (Directory/Exists shared-dir)
+        (Directory/Delete tmp true)
+        (Directory/Move tmp shared-dir))
+      (println (str "Shared Clojure runtime layer stored in " shared-dir))
+      (catch Exception e
+        (warn "warning: could not store the shared Clojure runtime layer: " (.Message (root-cause e)))
+        (try (when (Directory/Exists tmp) (Directory/Delete tmp true)) (catch Exception _))))))
+
+(defn build-libs
+  "Compiles the library layer into lib-dir: everything the application and its
+   tests load that is not project code, the namespaces already loaded when the
+   process started (the standard library and the Clojure.MSBuild tooling), and
+   finally clojure.core. ClojureCLR ships these as source and would otherwise
+   compile them again at every process start. Failures are reported and the
+   namespace is left to be loaded from source; the mode always exits 0.
+
+   The second part (startup namespaces and clojure.core) depends only on the
+   Clojure and Clojure.MSBuild versions, so it is shared between projects
+   through shared-dir: when that directory is complete the build has already
+   copied it into lib-dir and this pass skips it, otherwise the freshly
+   compiled assemblies are stored there for the next project.
+
+   Must run with clojure.spec.skip-macros=true: reloading clojure.spec.alpha
+   while macro specs are checked with the previous spec objects fails."
+  [lib-dir main-ns project-dirs shared-dir]
+  (let [lib-dir (Path/GetFullPath lib-dir)
+        project-dirs (parse-dirs project-dirs)
+        shared-ready? (and (not (str/blank? shared-dir))
+                           (File/Exists (Path/Combine shared-dir "complete")))
+        started (DateTime/UtcNow)
+        startup-namespaces (set (map ns-name (all-ns)))
+        failures (atom [])
+        compile! (fn [ns-sym]
+                   (println (str "  Compiling " ns-sym "..."))
+                   (when-not (compile-one! ns-sym lib-dir)
+                     (swap! failures conj ns-sym)))
+        dlls #(set (Directory/GetFiles lib-dir "*.dll"))]
+    (println (str "Compiling the Clojure library layer to: " lib-dir))
+    (Directory/CreateDirectory lib-dir)
+    (add-test-dir-to-load-path!)
+    ;; 1. Load the application and the tests with *compile-files* on: every
+    ;;    namespace loaded from source on the way is emitted into lib-dir.
+    (binding [*compile-path* lib-dir
+              *compile-files* true]
+      (when-not (str/blank? main-ns)
+        (println (str "  Loading " main-ns " and its dependencies..."))
+        (try (require (symbol main-ns))
+             (catch Exception e
+               (warn "  Error loading " main-ns ": " (.Message (root-cause e))))))
+      (doseq [test-ns (discover-test-namespaces)]
+        (println (str "  Loading " test-ns " and its dependencies..."))
+        (try (require test-ns)
+             (catch Exception e
+               (warn "  Error loading " test-ns ": " (.Message (root-cause e)))))))
+    (if shared-ready?
+      (println "  Standard library and clojure.core: shared runtime layer")
+      (let [before (dlls)]
+        ;; 2. The namespaces that were already loaded at startup have to be
+        ;;    compiled explicitly.
+        (doseq [ns-sym (->> startup-namespaces
+                            (remove #{'user})
+                            (remove core-parts)
+                            (remove (partial project-namespace? project-dirs))
+                            (sort-by (fn [ns-sym] [(get spec-first ns-sym 9) (str ns-sym)])))]
+          (compile! ns-sym))
+        ;; Not loaded at startup but part of every project: clojure.core.specs.alpha
+        ;; is loaded by macro spec checking (off in this process), the others by
+        ;; the REPL and by most applications.
+        (doseq [ns-sym '[clojure.core.specs.alpha clojure.repl clojure.pprint clojure.set]]
+          (compile! ns-sym))
+        ;; 3. clojure.core last: after reloading it nothing else can be compiled
+        ;;    in this process.
+        (compile! 'clojure.core)
+        (when (and (not (str/blank? shared-dir)) (empty? @failures))
+          (publish-shared-layer! shared-dir (sort (remove before (dlls)))))))
+    ;; 4. Project namespaces emitted in step 1 belong to the build layer.
+    (doseq [dll (Directory/GetFiles lib-dir "*.dll")
+            :when (project-compiled-file? project-dirs dll)]
+      (delete-with-pdb! dll))
+    (let [n (count (Directory/GetFiles lib-dir "*.dll"))
+          secs (long (.TotalSeconds (.Subtract DateTime/UtcNow started)))]
+      (println (str "Library layer: " n " assemblies in " secs " s"))
+      (when (seq @failures)
+        (warn "warning: " (count @failures) " library namespace(s) could not be precompiled and will be loaded from source: "
+              (str/join " " @failures))))))
 
 ;; ── Entry point (--clj-mode dispatch) ────────────────────────────
 
@@ -222,8 +417,11 @@
       "test"           (run-tests)
       "test-namespace" (run-namespace-tests (first rest-args))
       "test-vars"      (run-test-vars rest-args)
-      "build"          (build (first rest-args) (second rest-args))
+      "build"          (let [[namespaces compile-path lib-dir project-dirs] rest-args]
+                         (build namespaces compile-path lib-dir project-dirs))
+      "build-libs"     (let [[lib-dir main-ns project-dirs shared-dir] rest-args]
+                         (build-libs lib-dir main-ns project-dirs shared-dir))
       "compile"        (compile-namespaces (first rest-args) (second rest-args))
       (do (println (str "Unknown mode: " mode))
-          (println "Valid modes: repl, nrepl, script, test, test-namespace, test-vars, build, compile")
+          (println "Valid modes: repl, nrepl, script, test, test-namespace, test-vars, build, build-libs, compile")
           (Environment/Exit 1)))))
