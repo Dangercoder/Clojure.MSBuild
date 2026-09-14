@@ -15,7 +15,7 @@
 
 (defn frame
   "The snapshot as text."
-  [{:keys [size cells collected]} tick]
+  [{:snapshot/keys [size cells collected]} tick]
   (let [grid (into {} (map (fn [[x y :as c]] [[x y] (glyph c)])) cells)
         rows (for [y (range size)]
                (apply str (for [x (range size)] (get grid [x y] " "))))]
