@@ -1,11 +1,22 @@
 (ns ants.colony-test
   "Runs the actors for real: an Orleans silo in the test process. The tests
    share the silo and the world, so each one uses its own ants."
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.clr.async.task.alpha :as t]
-            [orleans.actors :as actors]
+            [clojure.spec.alpha :as s]
+            [orleans.actors :as actors :refer [defactor reply]]
             [ants.world :refer [world]]
             [ants.ant :refer [ant]]))
+
+;; A throwaway actor for the state checks: its state must stay a natural number.
+(s/def ::count nat-int?)
+(s/def ::amount int?)
+
+(defactor counter
+  {:state ::count}
+  (init [self id] 0)
+  (call :get [self n] (reply n n))
+  (call :add ::amount [self n amount] (reply (+ n amount) (+ n amount))))
 
 (def ^:private silo (atom nil))
 
@@ -13,21 +24,21 @@
   (fn [f]
     (reset! silo (actors/start! {:silo-port 11211 :gateway-port 30100}))
     (try
-      (actors/call! (world "main") :configure {:size 20 :seed 3 :food-places 10 :home-size 8})
+      (actors/call! (world "main") :configure #:world{:size 20 :seed 3 :food-places 10 :home-size 8})
       (f)
       (finally (actors/stop! @silo)))))
 
 (defn- step! [ids]
   (t/wait-all (mapv #(actors/call (ant %) :step) ids)))
 
-(defn- at-home? [{:keys [x y]}]
-  (:home? (:here (actors/call! (world "main") :look {:x x :y y :dir 0}))))
+(defn- at-home? [state]
+  (:cell/home? (:view/here (actors/call! (world "main") :look (select-keys state [:ant/x :ant/y :ant/dir])))))
 
-(defn- occupied? [snapshot {:keys [x y]}]
-  (some (fn [[cx cy _ _ _ ant?]] (and ant? (= cx x) (= cy y))) (:cells snapshot)))
+(defn- occupied? [snapshot {:ant/keys [x y]}]
+  (some (fn [[cx cy _ _ _ ant?]] (and ant? (= cx x) (= cy y))) (:snapshot/cells snapshot)))
 
 (deftest an-ant-is-created-on-first-contact
-  (let [{:keys [x y food? steps] :as state} (actors/call! (ant 200) :state)]
+  (let [{:ant/keys [x y food? steps] :as state} (actors/call! (ant 200) :state)]
     (is (integer? x))
     (is (integer? y))
     (is (false? food?))
@@ -39,7 +50,7 @@
     (dotimes [_ 30] (step! ids))
     (let [states (mapv #(actors/call! (ant %) :state) ids)
           snapshot (actors/call! (world "main") :snapshot)]
-      (is (every? #(= 30 (:steps %)) states) "every ant handled every step")
+      (is (every? #(= 30 (:ant/steps %)) states) "every ant handled every step")
       (is (every? #(occupied? snapshot %) states) "the world knows where each ant is")
       (is (some (complement at-home?) states) "at least one ant left the nest"))))
 
@@ -47,7 +58,7 @@
   (let [ids (range 300 305)]
     (dotimes [_ 20] (step! ids))
     (actors/cast (world "main") :clear-trails)
-    (let [trails (fn [] (count (filter #(pos? (nth % 3)) (:cells (actors/call! (world "main") :snapshot)))))]
+    (let [trails (fn [] (count (filter #(pos? (nth % 3)) (:snapshot/cells (actors/call! (world "main") :snapshot)))))]
       (is (loop [n 0]
             (cond (zero? (trails)) true
                   (= n 50) false
@@ -56,3 +67,29 @@
 
 (deftest unknown-messages-are-errors
   (is (thrown? Exception (actors/call! (ant 400) :fly))))
+
+(deftest states-and-messages-are-described
+  (let [{:keys [state call]} (actors/describe :world)]
+    (is (= '(keys :req [:world/size :world/home :world/cells :world/collected]) state))
+    (is (= '(keys :req [:ant/id :move/from :move/to]) (:move call)))
+    (is (nil? (:snapshot call)) "no payload spec")))
+
+(deftest bad-messages-are-rejected-without-touching-the-actor
+  (let [ids (range 500 503)]
+    (dotimes [_ 5] (step! ids))
+    (let [before (actors/call! (world "main") :snapshot)]
+      (testing "the caller gets the explanation"
+        (is (thrown-with-msg? Exception #"rejected :move" (actors/call! (world "main") :move {:bogus 1})))
+        (is (thrown-with-msg? Exception #"rejected :look" (actors/call! (world "main") :look #:ant{:x -1 :y 2 :dir 9}))))
+      (testing "the world is untouched: no restart, same ants in place"
+        (is (= (:snapshot/cells before) (:snapshot/cells (actors/call! (world "main") :snapshot))))))))
+
+(deftest a-state-violation-restarts-the-actor
+  (is (= 2 (actors/call! (counter 1) :add 2)))
+  (is (= 5 (actors/call! (counter 1) :add 3)))
+  (is (thrown-with-msg? Exception #"does not conform" (actors/call! (counter 1) :add -9))
+      "the handler produced a negative count")
+  (is (= 0 (actors/call! (counter 1) :get)) "back to a fresh state")
+  (is (thrown-with-msg? Exception #"rejected :add" (actors/call! (counter 1) :add "two"))
+      "a bad payload is rejected instead")
+  (is (= 0 (actors/call! (counter 1) :get)) "and did not restart anything"))

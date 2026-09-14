@@ -1,39 +1,43 @@
 (ns ants.ant
   "The ant actor. Each ant is its own actor, created on first use: init asks
    the world for a place in the nest. On every :step the ant looks around,
-   decides (ants.logic/decide) and acts through the world actor."
+   decides (ants.logic/decide) and acts through the world actor. Its state
+   is described by ants.model/ant-state."
   (:require [clojure.clr.async.task.alpha :as t]
             [orleans.actors :as actors :refer [defactor reply]]
             [ants.world :refer [world]]
-            [ants.logic :as logic]))
+            [ants.logic :as logic]
+            [ants.model]))                             ; loads the specs
 
 (defactor ant
   "An ant, addressed as (ant id)."
+  {:state :ants.model/ant-state}
+
   (init [self id]
-    (let [{:keys [x y dir]} (t/await (actors/call (world "main") :spawn id))]
-      {:id id :x x :y y :dir dir :food? false :steps 0}))
+    (let [{:ant/keys [x y dir]} (t/await (actors/call (world "main") :spawn id))]
+      #:ant{:id id :x x :y y :dir dir :food? false :steps 0}))
 
   (call :state [self state]
     (reply state state))
 
-  (call :step [self {:keys [id x y dir food?] :as state}]
+  (call :step [self {:ant/keys [id x y dir] :as state}]
     (let [w (world "main")
-          look (t/await (actors/call w :look {:x x :y y :dir dir}))
+          look (t/await (actors/call w :look (select-keys state [:ant/x :ant/y :ant/dir])))
           [action amount] (logic/decide state look (rand))
-          state (update state :steps inc)]
+          state (update state :ant/steps inc)]
       (case action
         :take-food
         (let [taken? (t/await (actors/call w :take-food [x y]))]
-          (reply action (cond-> (update state :dir logic/turn 4) taken? (assoc :food? true))))
+          (reply action (cond-> (update state :ant/dir logic/turn 4) taken? (assoc :ant/food? true))))
 
         :drop-food
         (do (t/await (actors/call w :drop-food [x y]))
-            (reply action (-> state (assoc :food? false) (update :dir logic/turn 4))))
+            (reply action (-> state (assoc :ant/food? false) (update :ant/dir logic/turn 4))))
 
         :move
-        (let [[nx ny] (logic/delta-loc (:size look) [x y] dir)
-              moved? (t/await (actors/call w :move {:id id :from [x y] :to [nx ny]}))]
-          (reply action (if moved? (assoc state :x nx :y ny) state)))
+        (let [[nx ny] (logic/delta-loc (:world/size look) [x y] dir)
+              moved? (t/await (actors/call w :move {:ant/id id :move/from [x y] :move/to [nx ny]}))]
+          (reply action (if moved? (assoc state :ant/x nx :ant/y ny) state)))
 
         :turn
-        (reply action (update state :dir logic/turn amount))))))
+        (reply action (update state :ant/dir logic/turn amount))))))

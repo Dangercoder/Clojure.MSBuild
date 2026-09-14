@@ -1,0 +1,59 @@
+(ns ants.model
+  "The colony as clojure.spec specs: the state of the two actors and the
+   messages they accept. Keys are namespaced by what they describe (an ant,
+   a cell, the world, a move), so a map says what it is wherever it turns up.
+   The actors check their state against these specs after every message and
+   reject payloads that do not conform; the tests generate data from them."
+  (:require [clojure.spec.alpha :as s]))
+
+;; ── An ant ───────────────────────────────────────────────────────
+
+(s/def :ant/id string?)                               ; actor ids are strings
+(s/def :ant/x nat-int?)
+(s/def :ant/y nat-int?)
+(s/def :ant/dir (s/int-in 0 8))                       ; 0 north, clockwise
+(s/def :ant/food? boolean?)
+(s/def :ant/steps nat-int?)
+(s/def ::ant-state (s/keys :req [:ant/id :ant/x :ant/y :ant/dir :ant/food? :ant/steps]))
+
+;; ── A cell of the grid ───────────────────────────────────────────
+
+(s/def ::loc (s/tuple nat-int? nat-int?))
+(s/def :cell/food nat-int?)
+(s/def :cell/pher (s/double-in :min 0.0 :max 1e6 :infinite? false :NaN? false))
+(s/def :cell/home? boolean?)
+(s/def :cell/ant :ant/id)                             ; who stands here
+(s/def ::cell (s/keys :opt [:cell/food :cell/pher :cell/home? :cell/ant]))
+
+;; ── The world ────────────────────────────────────────────────────
+
+(s/def :world/size (s/int-in 4 1000))
+(s/def :world/home (s/tuple nat-int? nat-int?))       ; [min max) of the nest square
+;; every-kv samples large maps; s/map-of would check all cells on every message
+(s/def :world/cells (s/every-kv ::loc ::cell :gen-max 20))
+(s/def :world/collected nat-int?)
+(s/def ::world-state (s/keys :req [:world/size :world/home :world/cells :world/collected]))
+
+;; :configure
+(s/def :world/seed (s/int-in -2147483648 2147483648)) ; System.Random takes an Int32
+(s/def :world/home-size (s/int-in 1 100))
+(s/def :world/food-places (s/int-in 0 10000))
+(s/def :world/food-range (s/int-in 1 10000))          ; bounded: System.Random.Next takes an Int32
+(s/def ::configure
+  (s/and (s/keys :opt [:world/size :world/seed :world/home-size :world/food-places :world/food-range])
+         (fn [{:world/keys [size home-size] :or {size 40 home-size 5}}] (< home-size size))))
+
+;; :look asks with the ant's position; the reply is what it sees
+(s/def ::look (s/keys :req [:ant/x :ant/y :ant/dir]))
+(s/def :cell/ant? boolean?)
+(s/def ::view (s/keys :req [:cell/food :cell/pher :cell/home? :cell/ant?]))
+(s/def :view/here ::view)
+(s/def :view/ahead ::view)
+(s/def :view/left ::view)
+(s/def :view/right ::view)
+(s/def ::look-view (s/keys :req [:world/size :view/here :view/ahead :view/left :view/right]))
+
+;; :move
+(s/def :move/from ::loc)
+(s/def :move/to ::loc)
+(s/def ::move (s/keys :req [:ant/id :move/from :move/to]))

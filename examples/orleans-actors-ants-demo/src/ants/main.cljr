@@ -34,8 +34,8 @@
   "Runs the simulation and returns the final snapshot."
   [{:keys [ants ticks size render? seed]}]
   (let [w (world "main")]
-    (actors/call! w :configure {:size size :seed seed :food-places (quot (* size size) 50)
-                                :home-size (logic/nest-size ants)})
+    (actors/call! w :configure #:world{:size size :seed seed :food-places (quot (* size size) 50)
+                                       :home-size (logic/nest-size ants)})
     (when render? (render/clear!))
     (dotimes [tick ticks]
       (step-all! ants)
@@ -49,6 +49,6 @@
         silo (actors/start! {})]
     (try
       (let [snapshot (simulate! options)]
-        (println (str "\n" (:ants options) " ants, " (:ticks options) " ticks, food collected: " (:collected snapshot))))
+        (println (str "\n" (:ants options) " ants, " (:ticks options) " ticks, food collected: " (:snapshot/collected snapshot))))
       (finally
         (actors/stop! silo)))))
