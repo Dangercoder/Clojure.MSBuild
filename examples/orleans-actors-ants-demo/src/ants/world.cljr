@@ -1,0 +1,44 @@
+(ns ants.world
+  "The world actor: one actor owns the grid (food, pheromone, who is where).
+   Ants ask it what they see and tell it what they do. Pheromone evaporates
+   on a timer the actor sets for itself."
+  (:require [orleans.actors :as actors :refer [defactor reply]]
+            [ants.logic :as logic]))
+
+(defn- rand-double [] (rand))
+
+(defactor world
+  "The grid. One instance, addressed as (world \"main\")."
+  (init [self id]
+    (actors/send-every self 250 :evaporate)
+    (logic/new-world {}))
+
+  (call :configure [self state options]
+    (reply :ok (logic/new-world options)))
+
+  (call :spawn [self state id]
+    (let [[state ant] (logic/spawn state id (rand-double))]
+      (reply ant state)))
+
+  (call :look [self state {:keys [x y dir]}]
+    (reply (logic/look state [x y] dir) state))
+
+  (call :move [self state {:keys [id from to]}]
+    (let [[state moved?] (logic/move state id from to)]
+      (reply moved? state)))
+
+  (call :take-food [self state loc]
+    (let [[state taken?] (logic/take-food state loc)]
+      (reply taken? state)))
+
+  (call :drop-food [self state loc]
+    (reply :ok (logic/drop-food state loc)))
+
+  (call :snapshot [self state]
+    (reply (logic/snapshot state) state))
+
+  (cast :clear-trails [self state]
+    (update state :cells (fn [cells] (into {} (map (fn [[loc c]] [loc (dissoc c :pher)])) cells))))
+
+  (info :evaporate [self state]
+    (logic/evaporate state)))

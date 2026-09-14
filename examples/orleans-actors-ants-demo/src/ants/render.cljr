@@ -1,0 +1,32 @@
+(ns ants.render
+  "Draws a world snapshot in the terminal."
+  (:import [System Console]))
+
+(def ^:private esc (str (char 27)))
+
+(defn- glyph [[_ _ food pher home? ant?]]
+  (cond
+    ant? (str esc "[1;31m" "@" esc "[0m")
+    home? (str esc "[33m" "#" esc "[0m")
+    (pos? food) (str esc "[32m" (cond (> food 40) "O" (> food 15) "o" :else ".") esc "[0m")
+    (> pher 2.0) (str esc "[35m" ":" esc "[0m")
+    (> pher 0.3) (str esc "[35m" "." esc "[0m")
+    :else " "))
+
+(defn frame
+  "The snapshot as text."
+  [{:keys [size cells collected]} tick]
+  (let [grid (into {} (map (fn [[x y :as c]] [[x y] (glyph c)])) cells)
+        rows (for [y (range size)]
+               (apply str (for [x (range size)] (get grid [x y] " "))))]
+    (str "tick " tick "  food collected: " collected "\n"
+         (apply str (interpose "\n" rows))
+         "\n")))
+
+(defn draw!
+  "Redraws the terminal with the snapshot."
+  [snapshot tick]
+  (Console/Write (str esc "[H" (frame snapshot tick))))
+
+(defn clear! []
+  (Console/Write (str esc "[2J" esc "[H")))
