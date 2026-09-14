@@ -19,6 +19,7 @@
    Messages are Clojure data, sent as EDN, so anything printable with pr-str
    and readable with clojure.edn travels: maps, vectors, keywords, numbers,
    strings, sets."
+  (:refer-clojure :exclude [cast])
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.edn :as edn]
             [clojure.string :as str])
@@ -30,11 +31,11 @@
 
 (set! *warn-on-reflection* true)
 
-(def ^:private task-of-object (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+(def ^:private task-of-object "System.Threading.Tasks.Task`1[System.Object]")
 
 (defn- as-task
   "Gives the compiler the static Task<object> type that t/await needs."
-  ^|System.Threading.Tasks.Task`1[System.Object]| [x] x)
+  ^"System.Threading.Tasks.Task`1[System.Object]" [x] x)
 
 ;; ── Registry ─────────────────────────────────────────────────────
 

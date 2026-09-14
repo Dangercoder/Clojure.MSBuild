@@ -1,6 +1,6 @@
 obj
 bin
-.clj-kondo/
+.clj-kondo/.cache/
 .lsp/
 clojure-clr/
 potion/

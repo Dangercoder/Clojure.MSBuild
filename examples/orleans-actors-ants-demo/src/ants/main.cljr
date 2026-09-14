@@ -9,7 +9,8 @@
             [ants.ant :refer [ant]]
             [ants.render :as render]
             [ants.logic :as logic])
-  (:import [System Console Threading.Thread]))
+  (:import [System Int32]
+           [System.Threading Thread]))
 
 (defn- parse-args [args]
   (loop [args args opts {:ants 40 :ticks 400 :size 40 :render? true :seed 42}]
@@ -29,7 +30,7 @@
   [ant-count]
   (t/wait-all (mapv #(actors/call (ant %) :step) (range ant-count))))
 
-(defn run!
+(defn simulate!
   "Runs the simulation and returns the final snapshot."
   [{:keys [ants ticks size render? seed]}]
   (let [w (world "main")]
@@ -47,7 +48,7 @@
   (let [options (parse-args args)
         silo (actors/start! {})]
     (try
-      (let [snapshot (run! options)]
+      (let [snapshot (simulate! options)]
         (println (str "\n" (:ants options) " ants, " (:ticks options) " ticks, food collected: " (:collected snapshot))))
       (finally
         (actors/stop! silo)))))
