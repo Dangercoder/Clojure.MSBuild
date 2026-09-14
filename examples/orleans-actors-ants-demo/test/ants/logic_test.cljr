@@ -1,0 +1,48 @@
+(ns ants.logic-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [ants.logic :as logic]))
+
+(deftest directions-wrap
+  (is (= 0 (logic/turn 7 1)))
+  (is (= 7 (logic/turn 0 -1)))
+  (is (= [0 39] (logic/delta-loc 40 [0 0] 0)) "north of the top row is the bottom row")
+  (is (= [1 0] (logic/delta-loc 40 [0 0] 2))))
+
+(deftest weighted-choice
+  (is (= 0 (logic/wrand [1 1 1] 0.0)))
+  (is (= 1 (logic/wrand [1 1 1] 0.4)))
+  (is (= 2 (logic/wrand [1 1 1] 0.9)))
+  (is (= 1 (logic/wrand [0 5 0] 0.5)) "zero weights are never chosen"))
+
+(def empty-cell {:food 0 :pher 0.0 :home? false :ant? false})
+
+(deftest foraging-ant
+  (let [look {:here empty-cell :ahead empty-cell :left empty-cell :right empty-cell}]
+    (testing "takes food when standing on it"
+      (is (= [:take-food] (logic/decide {:food? false} (assoc-in look [:here :food] 3) 0.5))))
+    (testing "moves onto food ahead"
+      (is (= [:move] (logic/decide {:food? false} (assoc-in look [:ahead :food] 3) 0.5))))
+    (testing "does not walk into another ant"
+      (is (not= [:move] (logic/decide {:food? false} (assoc-in look [:ahead :ant?] true) 0.0))))
+    (testing "prefers the strongest pheromone"
+      (is (= [:turn 1] (logic/decide {:food? false} (assoc-in look [:right :pher] 5.0) 0.99))))))
+
+(deftest ant-carrying-food
+  (let [look {:here empty-cell :ahead empty-cell :left empty-cell :right empty-cell}]
+    (is (= [:drop-food] (logic/decide {:food? true} (assoc-in look [:here :home?] true) 0.5)))
+    (is (= [:move] (logic/decide {:food? true} (assoc-in look [:ahead :home?] true) 0.5)))))
+
+(deftest world-rules
+  (let [world (logic/new-world {:size 10 :home-size 2 :food-places 3 :seed 1})
+        [world {:keys [x y]}] (logic/spawn world 1 0.0)]
+    (is (:home? (logic/cell world [x y])))
+    (is (= 1 (:ant (logic/cell world [x y]))))
+    (testing "moving leaves the old cell and blocks the new one"
+      (let [[world moved?] (logic/move world 1 [x y] [0 0])]
+        (is moved?)
+        (is (= 1 (:ant (logic/cell world [0 0]))))
+        (is (nil? (:ant (logic/cell world [x y]))))
+        (is (= [world false] (logic/move world 2 [5 5] [0 0])) "occupied")))
+    (testing "pheromone evaporates"
+      (let [world (logic/update-cell world [3 3] assoc :pher 1.0)]
+        (is (< (:pher (logic/cell (logic/evaporate world) [3 3])) 1.0))))))

@@ -1,0 +1,165 @@
+(ns ants.logic
+  "The ant colony rules, as pure functions. This is the classic Clojure ants
+   simulation: ants leave the nest, forage for food following pheromone
+   trails, carry food home and leave pheromone on the way back. Nothing here
+   knows about actors; the world and ant actors call these functions.")
+
+;; ── Directions ───────────────────────────────────────────────────
+;; 0 north, then clockwise in 45 degree steps.
+
+(def dir-delta {0 [0 -1] 1 [1 -1] 2 [1 0] 3 [1 1] 4 [0 1] 5 [-1 1] 6 [-1 0] 7 [-1 -1]})
+
+(defn bound
+  "Wraps n into [0, size)."
+  [size n]
+  (let [n (rem n size)] (if (neg? n) (+ n size) n)))
+
+(defn turn [dir amount] (bound 8 (+ dir amount)))
+
+(defn delta-loc
+  "The location one step from [x y] in direction dir, on a torus of the given size."
+  [size [x y] dir]
+  (let [[dx dy] (dir-delta dir)]
+    [(bound size (+ x dx)) (bound size (+ y dy))]))
+
+;; ── Choosing where to go ─────────────────────────────────────────
+
+(defn wrand
+  "Weighted random index: slices are weights, r is a random number in [0, 1)."
+  [slices r]
+  (let [total (reduce + slices)
+        target (* r total)]
+    (loop [i 0 sum 0]
+      (if (< target (+ (nth slices i) sum))
+        i
+        (recur (inc i) (+ (nth slices i) sum))))))
+
+(defn rank-by
+  "Ranks xs by keyfn from 1 (lowest) to (count xs) (highest): {x rank}."
+  [keyfn xs]
+  (let [sorted (sort-by keyfn xs)]
+    (into {} (map-indexed (fn [i x] [x (inc i)]) sorted))))
+
+(defn decide
+  "What an ant does next. ant is {:food? bool}, look is the ant's view:
+   {:here cell :ahead cell :left cell :right cell} with cells
+   {:food n :pher f :home? bool :ant? bool}; r is a random number in [0, 1).
+   Returns one of [:take-food] [:drop-food] [:move] [:turn n]."
+  [{:keys [food?]} {:keys [here ahead left right]} r]
+  (let [places [ahead left right]
+        choose (fn [ranks]
+                 (let [weights [(if (:ant? ahead) 0 (ranks ahead)) (ranks left) (ranks right)]]
+                   ([[:move] [:turn -1] [:turn 1]] (wrand weights r))))]
+    (if food?
+      (cond
+        (:home? here) [:drop-food]
+        (and (:home? ahead) (not (:ant? ahead))) [:move]
+        :else (choose (merge-with + (rank-by #(if (:home? %) 1 0) places)
+                                    (rank-by :pher places))))
+      (cond
+        (and (pos? (:food here 0)) (not (:home? here))) [:take-food]
+        (and (pos? (:food ahead 0)) (not (:home? ahead)) (not (:ant? ahead))) [:move]
+        :else (choose (merge-with + (rank-by :food places)
+                                    (rank-by :pher places)))))))
+
+;; ── The world ────────────────────────────────────────────────────
+
+(def ^:private evaporation-rate 0.99)
+
+(defn new-world
+  "A size x size world with a home in the middle and food scattered around.
+   Cells are {:food n :pher f :home? bool :ant id}; only non-empty cells are stored."
+  [{:keys [size home-size food-places food-range seed]
+    :or {size 40 home-size 5 food-places 30 food-range 60 seed 42}}]
+  (let [rng (System.Random. (int seed))
+        home-min (quot (- size home-size) 2)
+        home-max (+ home-min home-size)
+        home (for [x (range home-min home-max) y (range home-min home-max)] [[x y] {:home? true}])
+        food (for [_ (range food-places)]
+               [[(.Next rng size) (.Next rng size)] {:food (inc (.Next rng food-range))}])]
+    {:size size
+     :home [home-min home-max]
+     :cells (merge-with merge (into {} home) (into {} food))
+     :collected 0}))
+
+(defn cell [world loc] (get-in world [:cells loc] {}))
+
+(defn cell-view
+  "What an ant sees in a cell."
+  [world loc]
+  (let [{:keys [food pher home? ant]} (cell world loc)]
+    {:food (or food 0) :pher (or pher 0.0) :home? (boolean home?) :ant? (some? ant)}))
+
+(defn look
+  "The view for an ant at [x y] facing dir."
+  [world loc dir]
+  (let [size (:size world)]
+    {:size size
+     :here (cell-view world loc)
+     :ahead (cell-view world (delta-loc size loc dir))
+     :left (cell-view world (delta-loc size loc (turn dir -1)))
+     :right (cell-view world (delta-loc size loc (turn dir 1)))}))
+
+(defn update-cell [world loc f & args]
+  (apply update-in world [:cells loc] f args))
+
+(defn nest-size
+  "A nest with room for the given number of ants."
+  [ants]
+  (max 5 (int (Math/Ceiling (Math/Sqrt (* 2.0 ants))))))
+
+(defn spawn
+  "Places ant id on a free home cell. Returns [world {:x :y :dir}]."
+  [world id r]
+  (let [[home-min home-max] (:home world)
+        free (vec (for [x (range home-min home-max) y (range home-min home-max)
+                        :when (nil? (:ant (cell world [x y])))]
+                    [x y]))
+        _ (when (empty? free)
+            (throw (ex-info "The nest is full" {:nest (:home world)})))
+        [x y] (nth free (int (* r (count free))))]
+    [(update-cell world [x y] assoc :ant id)
+     {:x x :y y :dir (int (* r 8))}]))
+
+(defn move
+  "Moves ant id from one location to a neighbouring one if it is free,
+   leaving pheromone behind (except at home). Returns [world moved?]."
+  [world id from to]
+  (if (some? (:ant (cell world to)))
+    [world false]
+    [(-> world
+         (update-cell from (fn [c] (let [c (dissoc c :ant)]
+                                     (if (:home? c) c (update c :pher (fnil + 0.0) 1.0)))))
+         (update-cell to assoc :ant id))
+     true]))
+
+(defn take-food
+  "Returns [world taken?]."
+  [world loc]
+  (if (pos? (:food (cell world loc) 0))
+    [(update-cell world loc update :food dec) true]
+    [world false]))
+
+(defn drop-food [world loc]
+  (-> world
+      (update :collected inc)
+      (update-cell loc update :food (fnil inc 0))))
+
+(defn evaporate [world]
+  (update world :cells
+          (fn [cells]
+            (reduce-kv (fn [m loc c]
+                         (if-let [p (:pher c)]
+                           (let [p (* p evaporation-rate)]
+                             (assoc m loc (if (< p 0.05) (dissoc c :pher) (assoc c :pher p))))
+                           (assoc m loc c)))
+                       {} cells))))
+
+(defn snapshot
+  "A compact picture of the world for rendering: non-empty cells only."
+  [world]
+  {:size (:size world)
+   :collected (:collected world)
+   :cells (into [] (for [[[x y] {:keys [food pher home? ant]}] (:cells world)
+                         :when (or food pher home? ant)]
+                     [x y (or food 0) (or pher 0.0) (boolean home?) (some? ant)]))})

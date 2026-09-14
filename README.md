@@ -283,6 +283,7 @@ Note: `(t/await (f ...))` on a call to a Clojure `^:async` function needs the ca
 - [`templates/content/console`](templates/content/console) — the console template
 - [`examples/minimal-api`](examples/minimal-api) — smaller ASP.NET web API with HoneySQL, async ADO.NET, integration tests
 - [`examples/csharp-interop`](examples/csharp-interop) — Bidirectional C#/Clojure interop in one project (`ClojureEntryPoint=csharp`)
+- [`examples/orleans-actors-ants-demo`](examples/orleans-actors-ants-demo) — Microsoft Orleans actors from Clojure with a GenServer-style `defactor` DSL: the ant colony simulation
 
 ## Releasing
 

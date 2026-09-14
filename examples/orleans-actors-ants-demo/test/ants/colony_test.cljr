@@ -1,0 +1,58 @@
+(ns ants.colony-test
+  "Runs the actors for real: an Orleans silo in the test process. The tests
+   share the silo and the world, so each one uses its own ants."
+  (:require [clojure.test :refer [deftest is use-fixtures]]
+            [clojure.clr.async.task.alpha :as t]
+            [orleans.actors :as actors]
+            [ants.world :refer [world]]
+            [ants.ant :refer [ant]]))
+
+(def ^:private silo (atom nil))
+
+(use-fixtures :once
+  (fn [f]
+    (reset! silo (actors/start! {:silo-port 11211 :gateway-port 30100}))
+    (try
+      (actors/call! (world "main") :configure {:size 20 :seed 3 :food-places 10 :home-size 8})
+      (f)
+      (finally (actors/stop! @silo)))))
+
+(defn- step! [ids]
+  (t/wait-all (mapv #(actors/call (ant %) :step) ids)))
+
+(defn- at-home? [{:keys [x y]}]
+  (:home? (:here (actors/call! (world "main") :look {:x x :y y :dir 0}))))
+
+(defn- occupied? [snapshot {:keys [x y]}]
+  (some (fn [[cx cy _ _ _ ant?]] (and ant? (= cx x) (= cy y))) (:cells snapshot)))
+
+(deftest an-ant-is-created-on-first-contact
+  (let [{:keys [x y food? steps] :as state} (actors/call! (ant 200) :state)]
+    (is (integer? x))
+    (is (integer? y))
+    (is (false? food?))
+    (is (zero? steps))
+    (is (at-home? state) "starts in the nest")))
+
+(deftest ants-live-in-the-world
+  (let [ids (range 100 105)]
+    (dotimes [_ 30] (step! ids))
+    (let [states (mapv #(actors/call! (ant %) :state) ids)
+          snapshot (actors/call! (world "main") :snapshot)]
+      (is (every? #(= 30 (:steps %)) states) "every ant handled every step")
+      (is (every? #(occupied? snapshot %) states) "the world knows where each ant is")
+      (is (some (complement at-home?) states) "at least one ant left the nest"))))
+
+(deftest casts-are-handled-eventually
+  (let [ids (range 300 305)]
+    (dotimes [_ 20] (step! ids))
+    (actors/cast (world "main") :clear-trails)
+    (let [trails (fn [] (count (filter #(pos? (nth % 3)) (:cells (actors/call! (world "main") :snapshot)))))]
+      (is (loop [n 0]
+            (cond (zero? (trails)) true
+                  (= n 50) false
+                  :else (do (System.Threading.Thread/Sleep 20) (recur (inc n)))))
+          "the trails are gone once the cast is handled"))))
+
+(deftest unknown-messages-are-errors
+  (is (thrown? Exception (actors/call! (ant 400) :fly))))
