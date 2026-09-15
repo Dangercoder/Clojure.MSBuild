@@ -1,10 +1,11 @@
 (ns ants.main
-  "Runs the colony: starts the actor system, configures the world and drives
-   the ants tick by tick, drawing the grid between ticks.
+  "Runs the colony: starts a silo, configures the world and drives the ants
+   tick by tick, drawing the grid between ticks.
 
      dotnet run -- --ants 40 --ticks 400 --size 40 [--no-render] [--seed 7]"
   (:require [clojure.clr.async.task.alpha :as t]
             [orleans.actors :as actors]
+            [orleans.actors.silo :as silo]
             [ants.world :refer [world]]
             [ants.ant :refer [ant]]
             [ants.render :as render]
@@ -27,28 +28,29 @@
 (defn step-all!
   "One tick: every ant steps concurrently (each ant actor still handles its
    own message alone; the world serialises what they do to the grid)."
-  [ant-count]
-  (t/wait-all (mapv #(actors/call (ant %) :step) (range ant-count))))
+  [system ant-count]
+  (t/wait-all (mapv #(actors/call system (ant %) :step) (range ant-count))))
 
 (defn simulate!
-  "Runs the simulation and returns the final snapshot."
-  [{:keys [ants ticks size render? seed]}]
+  "Runs the simulation on the given actor system and returns the final
+   snapshot."
+  [system {:keys [ants ticks size render? seed]}]
   (let [w (world "main")]
-    (actors/call! w :configure #:world{:size size :seed seed :food-places (quot (* size size) 50)
-                                       :home-size (logic/nest-size ants)})
+    (actors/call! system w :configure #:world{:size size :seed seed :food-places (quot (* size size) 50)
+                                              :home-size (logic/nest-size ants)})
     (when render? (render/clear!))
     (dotimes [tick ticks]
-      (step-all! ants)
+      (step-all! system ants)
       (when render?
-        (render/draw! (actors/call! w :snapshot) tick)
+        (render/draw! (actors/call! system w :snapshot) tick)
         (Thread/Sleep 30)))
-    (actors/call! w :snapshot)))
+    (actors/call! system w :snapshot)))
 
 (defn -main [& args]
   (let [options (parse-args args)
-        silo (actors/start! {})]
+        system (silo/start! {})]
     (try
-      (let [snapshot (simulate! options)]
+      (let [snapshot (simulate! system options)]
         (println (str "\n" (:ants options) " ants, " (:ticks options) " ticks, food collected: " (:snapshot/collected snapshot))))
       (finally
-        (actors/shutdown! silo)))))
+        (silo/shutdown! system)))))

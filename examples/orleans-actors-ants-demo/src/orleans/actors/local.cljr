@@ -1,0 +1,125 @@
+(ns orleans.actors.local
+  "An actor system in this process, without Orleans: for tests and the
+   REPL. Actors live in a map and messages are handled one after the
+   other, casts included; the Task that `call` or `cast` returns completes
+   once the message has been handled, and as long as the handlers wait on
+   nothing outside the process that happens before the Task is returned,
+   so a test can send a message and look at the state (`state`) right
+   after. Timers are recorded and fired by `run-timers!`.
+
+   The runtime is the one the Orleans host uses (orleans.actors/activate,
+   handle and recover), so specs, persistence and the :on-error policy
+   behave the same; only the hosting differs. Two differences matter: an
+   actor calling itself, directly or in a cycle, works here and deadlocks
+   on Orleans, and there is no cluster, so nothing crosses the wire.
+
+     (let [system (local/system)]
+       (actors/call! system (counter 1) :add 2)
+       (local/state system (counter 1)))       ; => 2"
+  (:require [clojure.clr.async.task.alpha :as t]
+            [orleans.actors :as actors]
+            [orleans.actors.storage.memory :as memory])
+  (:import [System IDisposable]))
+
+(set! *warn-on-reflection* true)
+
+(declare dispatch)
+
+(defn- without-timer [timers id]
+  (vec (remove #(= id (:id %)) timers)))
+
+(defrecord LocalHost [system ref]
+  actors/Host
+  (-timer [_ type payload due period]
+    (let [timer {:id (gensym "timer") :type type :payload payload :due due :period period}]
+      (swap! (:activations system) update-in [ref :timers] (fnil conj []) timer)
+      (reify IDisposable
+        (Dispose [_]
+          (swap! (:activations system) update-in [ref :timers] without-timer (:id timer))))))
+  (-clear-timers [_] (swap! (:activations system) assoc-in [ref :timers] []))
+  (-stop [_] (swap! (:activations system) assoc-in [ref :stopping?] true)))
+
+(defn- context [system ref]
+  (actors/context ref system (:storage system) (->LocalHost system ref)))
+
+(defrecord LocalSystem [activations storage settings]
+  actors/Messaging
+  (-call [this ref type payload] (dispatch this :call ref type payload))
+  (-cast [this ref type payload] (dispatch this :cast ref type payload)))
+
+(def ^:private task-of-object "System.Threading.Tasks.Task`1[System.Object]")
+
+(defn- activation
+  "A Task of the live actor for a ref, activated first when needed. Init may
+   set timers through the context before the state exists, so an entry with
+   timers but no state is not active yet."
+  [system ref]
+  (t/async
+    (let [live (get @(:activations system) ref)]
+      (if (contains? live :state)
+        live
+        (let [state (t/await (actors/activate (context system ref) (:settings system)))]
+          (swap! (:activations system) assoc-in [ref :state] state)
+          (get @(:activations system) ref))))))
+
+(alter-meta! #'activation assoc :tag task-of-object)
+
+(defn- finish! [system ref]
+  (when (:stopping? (get @(:activations system) ref))
+    (swap! (:activations system) dissoc ref)))
+
+(defn- dispatch
+  "Handles one message and returns a Task of the reply, faulted with the
+   handler's exception after the :on-error policy was applied."
+  [system kind ref type payload]
+  (t/async
+    (let [ctx (context system ref)
+          {:keys [state]} (t/await (activation system ref))
+          [result error] (t/await (actors/outcome (actors/handle ctx (:settings system) kind state type payload)))]
+      (if error
+        (let [recovered (t/await (actors/recover ctx (:settings system) state error))]
+          (swap! (:activations system) assoc-in [ref :state] recovered)
+          (finish! system ref)
+          (throw error))
+        (let [[reply new-state] result]
+          (swap! (:activations system) assoc-in [ref :state] new-state)
+          (finish! system ref)
+          reply)))))
+
+(alter-meta! #'dispatch assoc :tag task-of-object)
+
+(defn system
+  "A local actor system. Options: :storage, an orleans.actors.storage/Storage
+   (in memory by default), and :state-check as for orleans.actors.silo/start."
+  ([] (system {}))
+  ([{:keys [storage] :as options}]
+   (->LocalSystem (atom {}) (or storage (memory/storage)) (actors/settings options))))
+
+(defn state
+  "The current state of an actor, nil when it is not active."
+  [system ref]
+  (:state (get @(:activations system) ref)))
+
+(defn active
+  "The refs of the actors that are active."
+  [system]
+  (set (for [[ref live] @(:activations system) :when (contains? live :state)] ref)))
+
+(defn timers
+  "The pending timers of an actor: {:type :payload :due :period}, period
+   nil for a send-after."
+  [system ref]
+  (mapv #(dissoc % :id) (:timers (get @(:activations system) ref))))
+
+(defn run-timers!
+  "Fires every pending timer once, as the host would when its time came:
+   each delivers its message to the actor's info handler and is waited
+   for. Timers set with send-after are removed, those set with send-every
+   stay. Returns the number of messages delivered."
+  [system]
+  (let [pending (vec (for [[ref live] @(:activations system) timer (:timers live)] [ref timer]))]
+    (doseq [[ref {:keys [id type payload period]}] pending]
+      (when-not period
+        (swap! (:activations system) update-in [ref :timers] without-timer id))
+      (t/result (dispatch system :info ref type payload)))
+    (count pending)))

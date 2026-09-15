@@ -1,0 +1,26 @@
+(ns orleans.actors.storage
+  "Where persisting actors keep their state, behind a protocol. The runtime
+   reads through it when a persisting actor is activated and writes through
+   it after every message that changed the state; an actor can reach its
+   system's storage through its context (:actor/storage) for
+   anything else. Implementations: orleans.actors.storage.edn-files (files
+   shared by the silos of a cluster), orleans.actors.storage.sqlite (a
+   database file) and orleans.actors.storage.memory (for tests). Postgres
+   or FoundationDB are another implementation of these three functions.")
+
+(defprotocol Storage
+  (read-state [storage type id]
+    "The stored state of the actor of the given type (a keyword) and id (a
+     string), or `none` when nothing is stored for it. May return a
+     Task<object> of that instead.")
+  (write-state [storage type id state]
+    "Stores the state, which is data (see orleans.actors.wire). May return
+     a Task.")
+  (clear-state [storage type id]
+    "Forgets the stored state. May return a Task."))
+
+(def none
+  "What read-state returns when nothing is stored: nil is a state too."
+  ::none)
+
+(defn none? [x] (= none x))

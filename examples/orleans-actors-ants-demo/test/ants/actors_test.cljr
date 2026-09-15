@@ -1,0 +1,176 @@
+(ns ants.actors-test
+  "The actors on the local system: no Orleans, every message handled on the
+   caller's thread, the state in reach. The runtime is the one the silo
+   uses, so what passes here passes there; ants.colony-test runs the same
+   actors on a real silo."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.spec.alpha :as s]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [ants.model :as model]
+            [ants.test-actors :refer [counter ledger diary]]
+            [ants.world :refer [world]]
+            [ants.ant :refer [ant]]
+            [orleans.actors :as actors]
+            [orleans.actors.local :as local]
+            [orleans.actors.storage :as storage]
+            [orleans.actors.storage.edn-files :as edn-files]
+            [orleans.actors.storage.memory :as memory]
+            [orleans.actors.storage.sqlite :as sqlite]))
+
+(defn- colony
+  "A local system with a small configured world."
+  []
+  (let [system (local/system)]
+    (actors/call! system (world "main") :configure #:world{:size 20 :seed 3 :food-places 10 :home-size 8})
+    system))
+
+(deftest a-counter-counts
+  (let [system (local/system)]
+    (is (= 2 (actors/call! system (counter 1) :add 2)))
+    (is (= 5 (actors/call! system (counter 1) :add 3)))
+    (is (= 0 (actors/call! system (counter 2) :get)) "actors of a type are independent")
+    (is (= 5 (local/state system (counter 1))) "the state is in reach")
+    (is (= #{(counter 1) (counter 2)} (local/active system)))))
+
+(deftest an-ant-lives-in-the-world
+  (let [system (colony)
+        {:ant/keys [x y] :as state} (actors/call! system (ant 1) :state)]
+    (is (:cell/home? (:view/here (actors/call! system (world "main") :look (select-keys state [:ant/x :ant/y :ant/dir]))))
+        "init asked the world for a place in the nest")
+    (is (= "1" (:cell/ant (get-in (local/state system (world "main")) [:world/cells [x y]]))))
+    (dotimes [_ 30] (actors/call! system (ant 1) :step))
+    (is (= 30 (:ant/steps (actors/call! system (ant 1) :state))))
+    (is (s/valid? ::model/world-state (local/state system (world "main"))))))
+
+(defn- forage!
+  "Steps a few ants until at least one of them has left the nest and
+   dropped pheromone on the way."
+  [system]
+  (dotimes [_ 40] (doseq [id (range 5)] (actors/call! system (ant id) :step))))
+
+(deftest timers-are-fired-on-demand
+  (let [system (colony)]
+    (is (= [{:type :evaporate :payload nil :due 250 :period 250}] (local/timers system (world "main"))))
+    (forage! system)
+    (let [trail (fn [] (reduce + (keep :cell/pher (vals (:world/cells (local/state system (world "main")))))))
+          before (trail)]
+      (is (pos? before) "the ant left pheromone")
+      (is (= 1 (local/run-timers! system)))
+      (is (< (trail) before) "evaporated by the info handler")
+      (is (= 1 (count (local/timers system (world "main")))) "a periodic timer stays"))))
+
+(deftest casts-are-handled-before-they-return
+  (let [system (colony)]
+    (forage! system)
+    (is (seq (keep :cell/pher (vals (:world/cells (local/state system (world "main")))))))
+    (actors/cast system (world "main") :clear-trails)
+    (is (empty? (keep :cell/pher (vals (:world/cells (local/state system (world "main")))))))))
+
+(deftest messages-are-checked
+  (let [system (colony)]
+    (testing "an unknown message is rejected, the actor untouched"
+      (is (thrown-with-msg? Exception #"rejected :fly" (actors/call! system (ant 4) :fly)))
+      (is (zero? (:ant/steps (actors/call! system (ant 4) :state)))))
+    (testing "a payload that fails its spec is rejected with the explanation"
+      (is (thrown-with-msg? Exception #"rejected :move" (actors/call! system (world "main") :move {:bogus 1})))
+      (is (thrown-with-msg? Exception #"rejected :add" (actors/call! system (counter 1) :add "two"))))
+    (testing "the actor's own mistake restarts it"
+      (is (= 5 (actors/call! system (counter 1) :add 5)))
+      (is (thrown-with-msg? Exception #"does not conform" (actors/call! system (counter 1) :add -9)))
+      (is (= 0 (actors/call! system (counter 1) :get)) "back to a fresh state"))))
+
+(deftest states-and-messages-are-described
+  (let [{:keys [state call]} (actors/describe :world)]
+    (is (= '(keys :req [:world/size :world/home :world/cells :world/collected]) state))
+    (is (= '(keys :req [:ant/id :move/from :move/to]) (:move call)))
+    (is (nil? (:snapshot call)) "no payload spec"))
+  (is (true? (:persist (actors/describe :ledger))))
+  (is (false? (:persist (actors/describe :counter)))))
+
+;; ── Persistence, through the storage protocol ─────────────────────
+
+(deftest persisting-actors-resume-where-they-left
+  (let [store (memory/storage)
+        system (local/system {:storage store})]
+    (is (= 7 (actors/call! system (ledger 1) :add 7)))
+    (is (= 7 (storage/read-state store :ledger "1")) "stored after the message")
+    (is (= :stopping (actors/call! system (ledger 1) :stop)))
+    (is (nil? (local/state system (ledger 1))) "deactivated")
+    (is (= 7 (actors/call! system (ledger 1) :get)) "resumed from the stored state")
+    (testing "a crash restarts from the last stored state, which is the last one that conformed"
+      (is (thrown-with-msg? Exception #"does not conform" (actors/call! system (ledger 1) :add -100)))
+      (is (= 7 (actors/call! system (ledger 1) :get))))
+    (testing "forget starts over"
+      (is (= :forgotten (actors/call! system (ledger 1) :forget)))
+      (is (storage/none? (storage/read-state store :ledger "1")))
+      (is (= 0 (actors/call! system (ledger 1) :get))))
+    (testing "without persistence a stop starts over"
+      (is (= 3 (actors/call! system (counter 9) :add 3)))
+      (actors/call! system (counter 9) :stop)
+      (is (= 0 (actors/call! system (counter 9) :get))))
+    (testing "the same actors on a fresh system with the same storage"
+      (is (= 7 (actors/call! (local/system {:storage store}) (ledger 2) :add 7)))
+      (is (= 8 (actors/call! (local/system {:storage store}) (ledger 2) :add 1))))))
+
+(deftest an-actor-can-use-the-storage-itself
+  (let [store (memory/storage)
+        system (local/system {:storage store})]
+    (is (= 2 (do (actors/call! system (diary "d") :note "one")
+                 (actors/call! system (diary "d") :note "two"))))
+    (is (= ["one" "two"] (storage/read-state store :notes "d")))))
+
+(deftest edn-files-keep-any-id-inside-the-directory
+  (let [dir (System.IO.Path/Combine (System.IO.Path/GetTempPath) (str "ants-storage-" (System.Guid/NewGuid)))
+        store (edn-files/storage dir)]
+    (try
+      (doseq [id ["1" "../../escape" "a b/c" "åäö" "" ".."]]
+        (testing (pr-str id)
+          (storage/write-state store :ledger id {:n 8 :id id})
+          (let [file (edn-files/file-of store :ledger id)]
+            (is (System.IO.File/Exists file))
+            (is (.StartsWith file (str (System.IO.Path/GetFullPath dir) "/")) "inside the directory")
+            (is (= (str "{:n 8, :id " (pr-str id) "}") (System.IO.File/ReadAllText file)) "what would be on the wire"))
+          (is (= {:n 8 :id id} (storage/read-state store :ledger id)))
+          (storage/clear-state store :ledger id)
+          (is (storage/none? (storage/read-state store :ledger id)))))
+      (is (= "%2E%2E%2F%2E%2E%2Fescape" (edn-files/encode "../../escape")))
+      (is (= 8 (actors/call! (local/system {:storage store}) (ledger "x") :add 8)))
+      (is (= 8 (actors/call! (local/system {:storage store}) (ledger "x") :get)) "a fresh system reads the file")
+      (finally
+        (System.IO.Directory/Delete dir true)))))
+
+(deftest sqlite-keeps-state-in-a-database
+  (let [file (System.IO.Path/Combine (System.IO.Path/GetTempPath) (str "ants-" (System.Guid/NewGuid) ".db"))
+        store (sqlite/storage file)]
+    (try
+      (is (= 8 (actors/call! (local/system {:storage store}) (ledger "x") :add 8)))
+      (is (= 9 (actors/call! (local/system {:storage store}) (ledger "x") :add 1)) "a fresh system reads the row")
+      (is (= 9 (storage/read-state store :ledger "x")))
+      (is (= 9 (storage/read-state (sqlite/storage file) :ledger "x")) "and so does a fresh connection")
+      (doseq [id ["../../escape" "åäö" "" "it's"]]
+        (storage/write-state store :ledger id {:id id})
+        (is (= {:id id} (storage/read-state store :ledger id)) (pr-str id)))
+      (storage/clear-state store :ledger "x")
+      (is (storage/none? (storage/read-state store :ledger "x")))
+      (is (= 0 (actors/call! (local/system {:storage store}) (ledger "x") :get)) "forgotten")
+      (finally
+        (System.IO.File/Delete file)))))
+
+;; ── Every valid message, generated from the specs ────────────────
+;; A fresh system per case, with the whole grid checked after every message.
+
+(defspec the-world-handles-every-valid-message 100
+  (prop/for-all [messages (gen/vector (actors/message-generator :world :call) 1 5)]
+    (let [system (local/system {:state-check 5000})]
+      (doseq [[type payload] messages]
+        (actors/call! system (world "main") type payload))
+      (s/valid? ::model/look-view (actors/call! system (world "main") :look #:ant{:x 0 :y 0 :dir 0})))))
+
+(defspec the-ant-handles-every-valid-message 30
+  (prop/for-all [messages (gen/vector (actors/message-generator :ant :call) 1 10)]
+    (let [system (colony)]
+      (doseq [[type payload] messages]
+        (actors/call! system (ant "under-test") type payload))
+      (s/valid? ::model/ant-state (actors/call! system (ant "under-test") :state)))))

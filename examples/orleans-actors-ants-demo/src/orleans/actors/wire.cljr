@@ -1,0 +1,31 @@
+(ns orleans.actors.wire
+  "How values leave the process: as EDN. Messages between silos and the
+   states in a file storage go through here, so both have to be data: maps,
+   vectors, sets, keywords, symbols, numbers, strings. A var travels as its
+   symbol. Anything that cannot be printed and read back (a compiled
+   function, a .NET object) is refused rather than sent as garbage."
+  (:refer-clojure :exclude [read])
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
+            [clojure.walk :as walk]))
+
+(defn- var->symbol [^clojure.lang.Var v]
+  (symbol (str (.Namespace v)) (str (.Symbol v))))
+
+(defn write
+  "The EDN text for a value."
+  ^String [value]
+  (let [text (pr-str (walk/postwalk (fn [x]
+                                      (cond (var? x) (var->symbol x)
+                                            (fn? x) (throw (ex-info (str "A function cannot leave the process; messages and states are data: " x)
+                                                                    {:value x}))
+                                            :else x))
+                                    value))]
+    (when (str/includes? text "#object[")
+      (throw (ex-info (str "This value cannot leave the process, it does not print as data: " text) {:value value})))
+    text))
+
+(defn read
+  "The value for EDN text."
+  [^String text]
+  (edn/read-string text))

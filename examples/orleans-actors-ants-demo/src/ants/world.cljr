@@ -13,36 +13,36 @@
   "The grid. One instance, addressed as (world \"main\")."
   {:state :ants.model/world-state}
 
-  (init [self id]
-    (actors/send-every self 250 :evaporate)
+  (init [ctx id]
+    (actors/send-every ctx 250 :evaporate)
     (logic/new-world {}))
 
-  (call :configure :ants.model/configure [self state options]
+  (call :configure :ants.model/configure [ctx state options]
     (reply :ok (logic/new-world options)))
 
-  (call :spawn :ant/id [self state id]
+  (call :spawn :ant/id [ctx state id]
     (let [[state ant] (logic/spawn state id (rand-double))]
       (reply ant state)))
 
-  (call :look :ants.model/look [self state {:ant/keys [x y dir]}]
+  (call :look :ants.model/look [ctx state {:ant/keys [x y dir]}]
     (reply (logic/look state [x y] dir) state))
 
-  (call :move :ants.model/move [self state {:ant/keys [id] :move/keys [from to]}]
+  (call :move :ants.model/move [ctx state {:ant/keys [id] :move/keys [from to]}]
     (let [[state moved?] (logic/move state id from to)]
       (reply moved? state)))
 
-  (call :take-food :ants.model/loc [self state loc]
+  (call :take-food :ants.model/loc [ctx state loc]
     (let [[state taken?] (logic/take-food state loc)]
       (reply taken? state)))
 
-  (call :drop-food :ants.model/loc [self state loc]
+  (call :drop-food :ants.model/loc [ctx state loc]
     (reply :ok (logic/drop-food state loc)))
 
-  (call :snapshot [self state]
+  (call :snapshot [ctx state]
     (reply (logic/snapshot state) state))
 
-  (cast :clear-trails [self state]
+  (cast :clear-trails [ctx state]
     (update state :world/cells (fn [cells] (into {} (map (fn [[loc c]] [loc (dissoc c :cell/pher)])) cells))))
 
-  (info :evaporate [self state]
+  (info :evaporate [ctx state]
     (logic/evaporate state)))
