@@ -37,6 +37,12 @@
 (defn- occupied? [snapshot {:ant/keys [x y]}]
   (some (fn [[cx cy _ _ _ ant?]] (and ant? (= cx x) (= cy y))) (:snapshot/cells snapshot)))
 
+(defn- ants-in
+  "Where the ants stand; unlike pheromone, which evaporates on a timer, this
+   only changes when an ant steps."
+  [snapshot]
+  (set (for [[x y _ _ _ ant?] (:snapshot/cells snapshot) :when ant?] [x y])))
+
 (deftest an-ant-is-created-on-first-contact
   (let [{:ant/keys [x y food? steps] :as state} (actors/call! (ant 200) :state)]
     (is (integer? x))
@@ -82,7 +88,7 @@
         (is (thrown-with-msg? Exception #"rejected :move" (actors/call! (world "main") :move {:bogus 1})))
         (is (thrown-with-msg? Exception #"rejected :look" (actors/call! (world "main") :look #:ant{:x -1 :y 2 :dir 9}))))
       (testing "the world is untouched: no restart, same ants in place"
-        (is (= (:snapshot/cells before) (:snapshot/cells (actors/call! (world "main") :snapshot))))))))
+        (is (= (ants-in before) (ants-in (actors/call! (world "main") :snapshot))))))))
 
 (deftest a-state-violation-restarts-the-actor
   (is (= 2 (actors/call! (counter 1) :add 2)))

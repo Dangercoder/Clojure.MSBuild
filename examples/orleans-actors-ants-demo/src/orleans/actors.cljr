@@ -171,15 +171,21 @@
 
 (alter-meta! #'run-handler assoc :tag task-of-object)
 
-(defonce ^:private check-state? (atom true))
+(defonce ^:private state-check-sample (atom 10))
 
 (defn check-state!
-  "Whether states are checked against their :state spec after init and after
-   every message (default true). The check costs what s/valid? costs on the
-   state, so keep state specs proportionate (s/every-kv rather than s/map-of
-   for large maps) or turn it off in production."
-  [enabled?]
-  (reset! check-state? (boolean enabled?)))
+  "How states are checked against their :state spec after init and after
+   every message: false turns the checks off, true or a number sets how many
+   elements of a collection described with s/every or s/every-kv are
+   examined per check (the default, 10, keeps a check on a large state map
+   well under a millisecond; s/coll-of and s/map-of always check every
+   element). The check otherwise costs what s/valid? costs on the state."
+  [setting]
+  (reset! state-check-sample
+          (cond (false? setting) nil
+                (nil? setting) nil
+                (number? setting) (long setting)
+                :else 10)))
 
 (defn- conform-state!
   "Throws when the state does not conform to the actor's :state spec. A
@@ -187,10 +193,13 @@
    is not checked again: the state still conforms."
   [definition type msg-type state previous]
   (when-let [spec (:state definition)]
-    (when (and @check-state? (not (identical? state previous)) (not (s/valid? spec state)))
-      (throw (ex-info (str "Actor " type (when msg-type (str " after " msg-type))
-                           ": the state does not conform to " spec ": " (s/explain-str spec state))
-                      {:actor type :message msg-type :spec spec :state state})))))
+    (when-let [sample @state-check-sample]
+      (when-not (identical? state previous)
+        (binding [s/*coll-check-limit* sample]
+          (when-not (s/valid? spec state)
+            (throw (ex-info (str "Actor " type (when msg-type (str " after " msg-type))
+                                 ": the state does not conform to " spec ": " (s/explain-str spec state))
+                            {:actor type :message msg-type :spec spec :state state}))))))))
 
 (defn- payload-problem
   "The rejection data when a payload does not conform to the handler's spec,
