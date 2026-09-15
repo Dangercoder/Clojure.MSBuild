@@ -108,15 +108,21 @@
   [ants]
   (max 5 (int (Math/Ceiling (Math/Sqrt (* 2.0 ants))))))
 
+(defn- free-cells [world locs]
+  (vec (for [loc locs :when (nil? (:cell/ant (cell world loc)))] loc)))
+
 (defn spawn
-  "Places ant id on a free home cell. Returns [world #:ant{:x :y :dir}]."
+  "Places ant id on a free home cell, or on any free cell when the nest is
+   full. Returns [world #:ant{:x :y :dir}]."
   [world id r]
   (let [[home-min home-max] (:world/home world)
-        free (vec (for [x (range home-min home-max) y (range home-min home-max)
-                        :when (nil? (:cell/ant (cell world [x y])))]
-                    [x y]))
+        size (:world/size world)
+        free (let [nest (free-cells world (for [x (range home-min home-max) y (range home-min home-max)] [x y]))]
+               (if (seq nest)
+                 nest
+                 (free-cells world (for [x (range size) y (range size)] [x y]))))
         _ (when (empty? free)
-            (throw (ex-info "The nest is full" {:nest (:world/home world)})))
+            (throw (ex-info "The world is full" {:size size})))
         [x y] (nth free (int (* r (count free))))]
     [(update-cell world [x y] assoc :cell/ant id)
      #:ant{:x x :y y :dir (int (* r 8))}]))

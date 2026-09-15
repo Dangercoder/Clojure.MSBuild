@@ -52,10 +52,12 @@ type is defined with `defactor`; the body reads like a GenServer:
 | a typespec / struct | `{:state ::spec}` on the actor, `(call :move ::move [self state payload] ...)` on a handler | checked after every message, and on every incoming payload |
 
 Handler bodies run in an async context, so they can `t/await` calls to other
-actors. Messages are Clojure data: they travel as EDN, so maps, vectors,
-keywords, numbers, strings and sets all work, across silos too. Actors of the
-same type are independent; an actor handles one message at a time, and a call
-cycle (A calls B calls A) deadlocks, exactly as with a GenServer.
+actors. Messages are Clojure values. Inside a silo they are passed by
+reference (they are immutable, so Orleans has nothing to copy); between silos
+they travel as EDN through a small codec in the glue. Both mean the same thing.
+Actors of the same type are independent; an actor handles one message at a
+time, and a call cycle (A calls B calls A) deadlocks, exactly as with a
+GenServer.
 
 **State and messages as specs.** `src/ants/model.cljr` describes the colony
 with clojure.spec, using namespaced keys (`:ant/x`, `:cell/food`, `:world/size`,
@@ -73,8 +75,24 @@ described with `s/every-kv` (which samples) rather than `s/map-of`, the
 runtime examines 10 sampled elements per check (`(actors/check-state! 50)`
 raises that, `(actors/check-state! false)` turns state checks off), and a
 handler that returns the state it was given is not checked again. With
-these specs a tick of 30 ants costs about 27 ms with the checks and 23 ms
+these specs a tick of 30 ants costs about 14 ms with the checks and 7 ms
 without.
+
+**Every valid message, generated.** `(actors/message-generator :world :call)`
+turns an actor's declared messages and payload specs into a test.check
+generator, so a property can send an actor everything it claims to accept
+and let the state spec judge the result (`test/ants/colony_test.cljr`):
+
+```clojure
+(defspec the-world-handles-every-valid-message 100
+  (prop/for-all [messages (gen/vector (actors/message-generator :world :call) 1 5)]
+    (doseq [[type payload] messages]
+      (actors/call! (world "under-test") type payload))
+    (s/valid? ::model/look-view (actors/call! (world "under-test") :look #:ant{:x 0 :y 0 :dir 0}))))
+```
+
+Its first run found a real bug: configure a one-cell nest, spawn two ants,
+and the world threw "the nest is full".
 
 There is no supervisor tree to define: Orleans is the supervisor. Every actor
 is always "running" as far as its callers are concerned; if it crashes it is
@@ -86,13 +104,19 @@ next message.
 Orleans generates proxies and serializers from C# grain interfaces, so a small C#
 class library (`glue/`) holds:
 
-- `ActorMessage`: a type name and an EDN payload.
+- `ActorMessage` and `ActorReply`: a type name and a payload, any Clojure
+  value, marked immutable so Orleans passes them by reference inside a silo.
+- `ClojureCodec` and `ClojureCopier`: how a Clojure value leaves the process
+  (as EDN, through `IClojureWire`, implemented in Clojure) and how it is
+  copied (it is not: it is immutable).
 - `IActorGrain`: `Call` and `Cast`. Every Clojure actor type is hosted by the
   same grain interface; the grain key is `"type/id"`.
 - `ActorGrain`: the one grain class. It owns the state slot and the timers and
   hands every event (`OnActivate`, `OnCall`, `OnCast`, `OnInfo`, `OnError`) to
   an `IActorHost`, which `orleans.actors` implements with `reify`.
-- `Actors.StartSilo`: an in-process silo with localhost clustering.
+- `Actors.StartSiloAsync` and `StopSiloAsync`: an in-process silo with localhost
+  clustering. `actors/start` and `actors/shutdown` await them; `start!` and
+  `shutdown!` block, for `-main`, tests and the REPL.
 
 Everything else, including the dispatch on actor type, the state handling and
 the error policy, is Clojure.

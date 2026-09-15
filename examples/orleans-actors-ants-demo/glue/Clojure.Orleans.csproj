@@ -9,9 +9,12 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Clojure.Orleans</RootNamespace>
+    <EnablePreviewFeatures>true</EnablePreviewFeatures>
+    <NoWarn>CA2252</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Clojure" Version="1.12.6" />
     <PackageReference Include="Microsoft.Orleans.Sdk" Version="10.3.1" />
     <PackageReference Include="Microsoft.Orleans.Server" Version="10.3.1" />
   </ItemGroup>

@@ -1,5 +1,7 @@
 (ns hooks.orleans.actors
-  "clj-kondo expansion of orleans.actors/defactor:
+  "clj-kondo expansions for orleans.actors.
+
+   defactor:
 
      (defactor ant \"doc\" {:on-error :restart}
        (init [self id] ...)
@@ -17,7 +19,7 @@
                        :let [clause (if (= kind 'init) clause (rest clause))          ; drop the message type
                              [spec clause] (if (vector? (first clause)) [nil clause] [(first clause) (rest clause)])
                              [args & handler-body] clause]]
-                   `(fn ~args ~spec ~@args ~@handler-body))]                          ; the payload spec counts as used
+                   `(clojure.core/fn ~args ~spec ~@args ~@handler-body))]                          ; the payload spec counts as used
     `(do
        (defn ~name ~@(when doc [doc]) [~'id] ~'id)
        ~(:state options)                                                               ; so does the state spec

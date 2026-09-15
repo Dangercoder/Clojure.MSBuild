@@ -16,9 +16,10 @@
    first message and deactivated when idle), each actor handles one message
    at a time, and a crashed actor is simply re-initialised (`:on-error`).
 
-   Messages are Clojure data, sent as EDN, so anything printable with pr-str
-   and readable with clojure.edn travels: maps, vectors, keywords, numbers,
-   strings, sets.
+   Messages are Clojure values. Inside a silo they are passed by reference
+   (they are immutable, so Orleans has nothing to copy); between silos they
+   travel as EDN, so a message has to be data: maps, vectors, sets, keywords,
+   symbols, numbers, strings. Both ways mean the same thing.
 
    State and messages can be described with clojure.spec: a `:state` spec
    is checked after init and after every message (a violation is a bug in
@@ -29,8 +30,10 @@
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.edn :as edn]
             [clojure.spec.alpha :as s]
-            [clojure.string :as str])
-  (:import [Clojure.Orleans Actors ActorGrain ActorMessage IActorGrain IActorHost]
+            [clojure.spec.gen.alpha :as gen]
+            [clojure.string :as str]
+            [clojure.walk :as walk])
+  (:import [Clojure.Orleans Actors ActorGrain ActorMessage ActorReply IActorGrain IActorHost IClojureWire]
            [Microsoft.Extensions.Hosting IHost]
            [Microsoft.Extensions.Logging LogLevel]
            [System TimeSpan]
@@ -81,10 +84,41 @@
 ;; ── Messages ─────────────────────────────────────────────────────
 
 (defn- message ^ActorMessage [type payload]
-  (ActorMessage. (name type) (pr-str payload)))
+  (ActorMessage. (subs (str type) 1) payload))   ; keeps the namespace of a qualified keyword
 
 (defn- payload-of [^ActorMessage message]
-  (edn/read-string (.Payload message)))
+  (.Payload message))
+
+;; ── The wire: how values leave the process ───────────────────────
+;; Orleans only serializes a message that goes to another silo. Values are
+;; written as EDN; a var travels as its symbol. Anything that cannot be
+;; printed and read back (a compiled function, a .NET object) is refused.
+
+(defn- var->symbol [^clojure.lang.Var v]
+  (symbol (str (.Namespace v)) (str (.Symbol v))))
+
+(defn write-wire
+  "The EDN text for a value leaving the process."
+  [value]
+  (let [text (pr-str (walk/postwalk (fn [x]
+                                      (cond (var? x) (var->symbol x)
+                                            (fn? x) (throw (ex-info (str "A function cannot leave the process; messages are data: " x)
+                                                                    {:value x}))
+                                            :else x))
+                                    value))]
+    (when (str/includes? text "#object[")
+      (throw (ex-info (str "This value cannot leave the process, it does not print as data: " text) {:value value})))
+    text))
+
+(defn read-wire
+  "The value for EDN text from another silo."
+  [text]
+  (edn/read-string text))
+
+(defn- wire []
+  (reify IClojureWire
+    (Write [_ value] (write-wire value))
+    (Read [_ text] (read-wire text))))
 
 ;; ── Sending ──────────────────────────────────────────────────────
 
@@ -102,8 +136,9 @@
   ([ref type] (call ref type nil))
   ([^IActorGrain ref type payload]
    (t/async
-     (let [[tag value] (edn/read-string (t/await (.Call ref (message type payload))))]
-       (if (= tag :ok)
+     (let [^ActorReply reply (t/await (.Call ref (message type payload)))
+           value (.Value reply)]
+       (if (.Ok reply)
          value
          (throw (ex-info (str "Actor " (:actor value) " rejected " (:message value) ": " (:explain value))
                          value)))))))
@@ -235,7 +270,7 @@
           problem (payload-problem definition kind type msg-type payload)]
       (cond
         (and problem (= kind :call))
-        (pr-str [:error problem])
+        (ActorReply. false problem)
 
         problem
         (do (warn "actor " type " rejected " msg-type ": " (:explain problem))
@@ -252,7 +287,7 @@
                   [value new-state] result]
               (conform-state! definition type msg-type new-state previous)
               (set! (.State grain) new-state)
-              (pr-str [:ok value]))
+              (ActorReply. true value))
             (do (conform-state! definition type msg-type result previous)
                 (set! (.State grain) result)
                 nil)))))))
@@ -308,23 +343,67 @@
 
 ;; ── The actor system ─────────────────────────────────────────────
 
-(defn start!
-  "Starts an Orleans silo in this process hosting all defined actors and
-   returns it. Options: :silo-port (11111), :gateway-port (30000),
-   :log-level (LogLevel/Warning)."
-  ([] (start! {}))
+(defn start
+  "Starts an Orleans silo in this process hosting all defined actors.
+   Returns a Task of the silo. Options: :silo-port (11111), :gateway-port
+   (30000), :log-level (LogLevel/Warning)."
+  ([] (start {}))
   ([{:keys [silo-port gateway-port log-level]
      :or {silo-port 11111 gateway-port 30000 log-level LogLevel/Warning}}]
    (Actors/SetHost (host))
-   (let [silo (Actors/StartSilo (int silo-port) (int gateway-port) log-level)]
-     (reset! grain-factory (Actors/GrainFactory silo))
-     silo)))
+   (Actors/SetWire (wire))
+   (t/async
+     (let [silo (t/await (Actors/StartSiloAsync (int silo-port) (int gateway-port) log-level))]
+       (reset! grain-factory (Actors/GrainFactory silo))
+       silo))))
 
-(defn stop!
-  "Stops the silo started with start!."
+(alter-meta! #'start assoc :tag task-of-object)
+
+(defn start!
+  "Blocking start, for -main, tests and the REPL."
+  ([] (start! {}))
+  ([options] (t/result (start options))))
+
+(defn round-trip
+  "Serializes a message the way it would travel to another silo and reads it
+   back: what the other side would receive. For tests and curiosity."
+  [silo type payload]
+  (.Payload (Actors/RoundTrip silo (message type payload))))
+
+(defn shutdown
+  "Stops the silo started with start. Returns a Task."
   [^IHost silo]
   (reset! grain-factory nil)
-  (Actors/StopSilo silo))
+  (Actors/StopSiloAsync silo))
+
+(defn shutdown!
+  "Blocking shutdown, for -main, tests and the REPL."
+  [silo]
+  (t/result (shutdown silo)))
+
+;; ── Property-based testing from the specs ────────────────────────
+
+(defn message-generator
+  "A test.check generator of [message-type payload] for the messages of the
+   given kind (:call, :cast or :info) an actor type declares, with payloads
+   generated from their specs (nil for a message without one). With it a
+   property can send an actor every valid message it accepts:
+
+     (prop/for-all [[type payload] (actors/message-generator :world :call)]
+       (actors/call! (world \"under-test\") type payload)
+       true)
+
+   A message the actor cannot handle throws, and after every message the
+   runtime checks the state against the :state spec."
+  [type kind]
+  (let [definition (or (get @definitions type) (throw (ex-info (str "No actor defined for type " type) {})))
+        messages (get definition kind)]
+    (when (empty? messages)
+      (throw (ex-info (str "Actor " type " has no " (name kind) " messages") {:actor type})))
+    (gen/one-of (for [[msg-type _] messages
+                      :let [spec (get-in definition [:specs kind msg-type])]]
+                  (gen/tuple (gen/return msg-type)
+                             (if spec (s/gen spec) (gen/return nil)))))))
 
 ;; ── defactor ─────────────────────────────────────────────────────
 
