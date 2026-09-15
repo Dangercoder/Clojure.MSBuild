@@ -50,7 +50,6 @@ type is defined with `defactor`; the body reads like a GenServer:
 | a supervisor | `{:on-error :restart}` (default), `:resume` or `:stop` on the actor | the runtime re-initialises a crashed actor; the caller still gets the error |
 | `GenServer.stop/1` | `(actors/stop self)` | `DeactivateOnIdle` |
 | a typespec / struct | `{:state ::spec}` on the actor, `(call :move ::move [self state payload] ...)` on a handler | checked after every message, and on every incoming payload |
-| `Agent.update/2`, `Agent.get/2` | `(actors/swap ref (actors/fn [state] ...))`, `(actors/get ref f)`, `(actors/send ref f)` | the function travels as data and runs inside the actor |
 
 Handler bodies run in an async context, so they can `t/await` calls to other
 actors. Messages are Clojure values. Inside a silo they are passed by
@@ -59,26 +58,6 @@ they travel as EDN through a small codec in the glue. Both mean the same thing.
 Actors of the same type are independent; an actor handles one message at a
 time, and a call cycle (A calls B calls A) deadlocks, exactly as with a
 GenServer.
-
-**Functions are messages too, as data.** Every actor understands `swap`,
-`send` and `get`, the way an atom understands `swap!` and an agent `send`:
-
-```clojure
-(actors/swap! (world "main") (actors/fn [world] (assoc world :world/collected ~n)))
-(actors/send  (world "main") 'ants.logic/evaporate)
-(actors/get!  (world "main") :world/collected)
-```
-
-`(actors/fn [state] ...)` is a function as data: its form and the namespace it
-was written in. The receiving actor evaluates it there (once per distinct form,
-then cached), so it means the same thing on every silo, and it is plain data on
-the wire. Values from the surrounding code are spliced in with `~`, as in a
-syntax quote, and must be data. A var or a symbol names a function both sides
-have; a keyword is a function. A compiled function is refused, in this process
-too, so that nothing works locally that would break across silos. The function
-runs inside the actor, one message at a time, and its result is checked
-against the state spec like any handler's. The usual caveat of code as data
-applies: only accept messages from code you trust.
 
 **State and messages as specs.** `src/ants/model.cljr` describes the colony
 with clojure.spec, using namespaced keys (`:ant/x`, `:cell/food`, `:world/size`,

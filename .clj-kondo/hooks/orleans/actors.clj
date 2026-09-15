@@ -10,17 +10,7 @@
    becomes a defn of the reference constructor (ant id) plus one fn per
    handler, so the linter sees the bindings and the bodies. Handler arguments
    are positional in the DSL, so they count as used even when a handler does
-   not need them.
-
-   (actors/fn [state] ... ~value ...) is a function as data; for the linter it
-   is a fn whose unquotes are the values themselves."
-  (:require [clojure.walk :as walk]))
-
-(defmacro fn [& fn-tail]
-  (let [tail (walk/postwalk (clojure.core/fn [x]
-                              (if (and (seq? x) (= 'clojure.core/unquote (first x))) (second x) x))
-                            fn-tail)]
-    `(clojure.core/fn ~@tail)))
+   not need them.")
 
 (defmacro defactor [name & body]
   (let [[doc body] (if (string? (first body)) [(first body) (rest body)] [nil body])
