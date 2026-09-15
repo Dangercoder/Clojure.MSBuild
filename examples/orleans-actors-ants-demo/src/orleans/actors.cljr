@@ -16,21 +16,26 @@
    first message and deactivated when idle), each actor handles one message
    at a time, and a crashed actor is simply re-initialised (`:on-error`).
 
-   Messages are Clojure data, sent as EDN, so anything printable with pr-str
-   and readable with clojure.edn travels: maps, vectors, keywords, numbers,
-   strings, sets.
+   Messages are Clojure values, and code is data: `swap`, `send` and `get`
+   apply a function to an actor's state the way swap!, send and deref do on
+   atoms and agents, and the function is sent as its form, written with
+   `(actors/fn [state] ...)`, and evaluated where it arrives. A var or a
+   symbol names a function that exists on both sides. Inside a silo values
+   are passed by reference (they are immutable, so Orleans has nothing to
+   copy); between silos they travel as EDN. Both ways mean the same thing.
 
    State and messages can be described with clojure.spec: a `:state` spec
    is checked after init and after every message (a violation is a bug in
    the actor and restarts it), a spec on a handler is checked on the
    incoming payload (a violation is a bad message and is rejected without
    touching the actor). `describe` shows what an actor type expects."
-  (:refer-clojure :exclude [cast])
+  (:refer-clojure :exclude [cast fn get send swap!])
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.edn :as edn]
             [clojure.spec.alpha :as s]
-            [clojure.string :as str])
-  (:import [Clojure.Orleans Actors ActorGrain ActorMessage IActorGrain IActorHost]
+            [clojure.string :as str]
+            [clojure.walk :as walk])
+  (:import [Clojure.Orleans Actors ActorGrain ActorMessage ActorReply IActorGrain IActorHost IClojureWire]
            [Microsoft.Extensions.Hosting IHost]
            [Microsoft.Extensions.Logging LogLevel]
            [System TimeSpan]
@@ -55,17 +60,17 @@
 
 (defn register-actor!
   "Registers an actor definition for a type keyword:
-     {:init     (fn [self id] state)
-      :call     {msg-type (fn [self state payload] [reply state])}
-      :cast     {msg-type (fn [self state payload] state)}
-      :info     {msg-type (fn [self state payload] state)}
+     {:init     (clojure.core/fn [self id] state)
+      :call     {msg-type (clojure.core/fn [self state payload] [reply state])}
+      :cast     {msg-type (clojure.core/fn [self state payload] state)}
+      :info     {msg-type (clojure.core/fn [self state payload] state)}
       :state    spec of the state, optional
       :specs    {:call {msg-type payload-spec} :cast {...} :info {...}}, optional
       :on-error :restart | :resume | :stop}
    Handlers may return a Task<object> (t/async) instead of a value.
    `defactor` is the convenient way to build this map."
   [type definition]
-  (swap! definitions assoc type definition)
+  (clojure.core/swap! definitions assoc type definition)
   type)
 
 (defn- key->type+id [^String key]
@@ -74,17 +79,48 @@
 
 (defn- definition-of [^ActorGrain grain]
   (let [[type id] (key->type+id (.Key grain))]
-    [(or (get @definitions type)
+    [(or (clojure.core/get @definitions type)
          (throw (ex-info (str "No actor defined for type " type) {:key (.Key grain)})))
      type id]))
 
 ;; ── Messages ─────────────────────────────────────────────────────
 
 (defn- message ^ActorMessage [type payload]
-  (ActorMessage. (name type) (pr-str payload)))
+  (ActorMessage. (subs (str type) 1) payload))   ; keeps the namespace of a qualified keyword
 
 (defn- payload-of [^ActorMessage message]
-  (edn/read-string (.Payload message)))
+  (.Payload message))
+
+;; ── The wire: how values leave the process ───────────────────────
+;; Orleans only serializes a message that goes to another silo. Values are
+;; written as EDN; a var travels as its symbol. Anything that cannot be
+;; printed and read back (a compiled function, a .NET object) is refused.
+
+(defn- var->symbol [^clojure.lang.Var v]
+  (symbol (str (.Namespace v)) (str (.Symbol v))))
+
+(defn write-wire
+  "The EDN text for a value leaving the process."
+  [value]
+  (let [text (pr-str (walk/postwalk (clojure.core/fn [x]
+                                      (cond (var? x) (var->symbol x)
+                                            (fn? x) (throw (ex-info (str "A compiled function cannot leave the process; send code with (actors/fn ...), a var or a symbol: " x)
+                                                                    {:value x}))
+                                            :else x))
+                                    value))]
+    (when (str/includes? text "#object[")
+      (throw (ex-info (str "This value cannot leave the process, it does not print as data: " text) {:value value})))
+    text))
+
+(defn read-wire
+  "The value for EDN text from another silo."
+  [text]
+  (edn/read-string text))
+
+(defn- wire []
+  (reify IClojureWire
+    (Write [_ value] (write-wire value))
+    (Read [_ text] (read-wire text))))
 
 ;; ── Sending ──────────────────────────────────────────────────────
 
@@ -102,8 +138,9 @@
   ([ref type] (call ref type nil))
   ([^IActorGrain ref type payload]
    (t/async
-     (let [[tag value] (edn/read-string (t/await (.Call ref (message type payload))))]
-       (if (= tag :ok)
+     (let [^ActorReply reply (t/await (.Call ref (message type payload)))
+           value (.Value reply)]
+       (if (.Ok reply)
          value
          (throw (ex-info (str "Actor " (:actor value) " rejected " (:message value) ": " (:explain value))
                          value)))))))
@@ -127,6 +164,114 @@
   "Return value for call handlers: the reply and the new state."
   [value state]
   [value state])
+
+;; ── Functions as data ────────────────────────────────────────────
+;; A function sent to an actor is code: its form plus the namespace it was
+;; written in, evaluated in that namespace where it arrives (once per
+;; distinct form, then cached). It means the same thing on every silo, and
+;; it is plain data on the wire.
+
+(defmacro fn
+  "A function as data, to send to an actor with swap, send or get:
+
+     (actors/swap w (actors/fn [world] (assoc world :world/collected ~n)))
+
+   The form is evaluated by the receiving actor in the namespace this is
+   written in (which has to exist there, i.e. the same code is deployed).
+   Values from the surrounding code are spliced in with ~, as in a syntax
+   quote, and must be data."
+  [& fn-tail]
+  (let [values (atom [])
+        form (walk/postwalk (clojure.core/fn [x]
+                              (if (and (seq? x) (= 'clojure.core/unquote (first x)))
+                                (let [placeholder (keyword "orleans.actors" (str "unquote-" (count @values)))]
+                                  (clojure.core/swap! values conj (second x))
+                                  placeholder)
+                                x))
+                            (cons 'clojure.core/fn fn-tail))]
+    `(code '~(ns-name *ns*) '~form ~@(deref values))))
+
+(defn code
+  "The data form of a function: the namespace to evaluate in, the form, and
+   the values spliced into it. (actors/fn ...) builds this."
+  [ns form & values]
+  (let [placeholders (zipmap (map (clojure.core/fn [i] (keyword "orleans.actors" (str "unquote-" i))) (range))
+                             values)]
+    {::ns ns
+     ::form (walk/postwalk (clojure.core/fn [x] (clojure.core/get placeholders x x)) form)}))
+
+(defonce ^:private compiled (atom {}))
+
+(defn- compile-code [{::keys [ns form] :as code}]
+  (or (clojure.core/get @compiled code)
+      (let [f (binding [*ns* (do (require ns) (the-ns ns))]
+                (eval form))]
+        (when (> (count @compiled) 1000) (reset! compiled {}))
+        (clojure.core/swap! compiled assoc code f)
+        f)))
+
+(defn- resolve-fn
+  "The function for what was sent: code, a var, a symbol naming a var, or
+   a keyword."
+  [f]
+  (cond
+    (and (map? f) (::form f)) (compile-code f)
+    (keyword? f) f
+    (var? f) f
+    (symbol? f) (or (requiring-resolve f) (throw (ex-info (str "No var " f " on this silo") {:symbol f})))
+    :else (throw (ex-info (str "Functions are sent as data: (actors/fn ...), a var, a symbol or a keyword, not " (pr-str f))
+                          {:value f}))))
+
+(defn- check-fn-data!
+  "Refuses a compiled function up front, so the semantics do not depend on
+   whether the actor happens to be in this process."
+  [f]
+  (when (and (fn? f) (not (keyword? f)))
+    (throw (ex-info (str "Functions are sent as data: (actors/fn ...), a var, a symbol or a keyword, not " f) {:value f})))
+  f)
+
+;; Every actor understands these, the way an atom understands swap! and an
+;; agent understands send: the function runs inside the actor, one message
+;; at a time, and the result is checked against the state spec.
+
+(defn swap
+  "Applies f to the actor's state (with args) and stores the result, like
+   clojure.core/swap! on an atom. Returns a Task of the new state.
+   f is code, see `fn`, a var, a symbol or a keyword."
+  [ref f & args]
+  (call ref ::swap [(check-fn-data! f) args]))
+
+(alter-meta! #'swap assoc :tag task-of-object)
+
+(defn swap!
+  "Blocking swap."
+  [ref f & args]
+  (t/result (apply swap ref f args)))
+
+(defn send
+  "Applies f to the actor's state without waiting, like clojure.core/send on
+   an agent."
+  [ref f & args]
+  (cast ref ::swap [(check-fn-data! f) args]))
+
+(defn get
+  "Applies f to the actor's state (with args) and returns a Task of the
+   result; the state is unchanged. A keyword is a function, so
+   (get ref :world/collected) reads one key."
+  [ref f & args]
+  (call ref ::get [(check-fn-data! f) args]))
+
+(alter-meta! #'get assoc :tag task-of-object)
+
+(defn get!
+  "Blocking get."
+  [ref f & args]
+  (t/result (apply get ref f args)))
+
+(def ^:private built-in-handlers
+  {:call {::swap (clojure.core/fn [_ state [f args]] (let [state (apply (resolve-fn f) state args)] (reply state state)))
+          ::get (clojure.core/fn [_ state [f args]] (reply (apply (resolve-fn f) state args) state))}
+   :cast {::swap (clojure.core/fn [_ state [f args]] (apply (resolve-fn f) state args))}})
 
 ;; ── Inside a handler: self ───────────────────────────────────────
 
@@ -229,13 +374,14 @@
     (let [[definition type _] (definition-of grain)
           msg-type (keyword (.Type message))
           handler (or (get-in definition [kind msg-type])
+                      (get-in built-in-handlers [kind msg-type])
                       (throw (ex-info (str "Actor " type " has no " (name kind) " handler for " msg-type)
                                       {:actor type :message msg-type})))
           payload (payload-of message)
           problem (payload-problem definition kind type msg-type payload)]
       (cond
         (and problem (= kind :call))
-        (pr-str [:error problem])
+        (ActorReply. false problem)
 
         problem
         (do (warn "actor " type " rejected " msg-type ": " (:explain problem))
@@ -252,7 +398,7 @@
                   [value new-state] result]
               (conform-state! definition type msg-type new-state previous)
               (set! (.State grain) new-state)
-              (pr-str [:ok value]))
+              (ActorReply. true value))
             (do (conform-state! definition type msg-type result previous)
                 (set! (.State grain) result)
                 nil)))))))
@@ -293,12 +439,12 @@
   "What an actor type expects: its state spec, the messages it handles and
    their payload specs (as s/describe forms), and its error policy."
   [type]
-  (let [definition (or (get @definitions type) (throw (ex-info (str "No actor defined for type " type) {})))
-        messages (fn [kind]
+  (let [definition (or (clojure.core/get @definitions type) (throw (ex-info (str "No actor defined for type " type) {})))
+        messages (clojure.core/fn [kind]
                    (into (sorted-map)
-                         (map (fn [[msg-type _]]
+                         (map (clojure.core/fn [[msg-type _]]
                                 [msg-type (some-> (get-in definition [:specs kind msg-type]) s/describe)]))
-                         (get definition kind)))]
+                         (clojure.core/get definition kind)))]
     {:type type
      :state (some-> (:state definition) s/describe)
      :on-error (:on-error definition :restart)
@@ -316,9 +462,16 @@
   ([{:keys [silo-port gateway-port log-level]
      :or {silo-port 11111 gateway-port 30000 log-level LogLevel/Warning}}]
    (Actors/SetHost (host))
+   (Actors/SetWire (wire))
    (let [silo (Actors/StartSilo (int silo-port) (int gateway-port) log-level)]
      (reset! grain-factory (Actors/GrainFactory silo))
      silo)))
+
+(defn round-trip
+  "Serializes a message the way it would travel to another silo and reads it
+   back: what the other side would receive. For tests and curiosity."
+  [silo type payload]
+  (.Payload (Actors/RoundTrip silo (message type payload))))
 
 (defn stop!
   "Stops the silo started with start!."
@@ -329,14 +482,14 @@
 ;; ── defactor ─────────────────────────────────────────────────────
 
 (defn- handler-fn
-  "Builds (fn [self state payload] (t/async body...)) from a handler clause's
+  "Builds (clojure.core/fn [self state payload] (t/async body...)) from a handler clause's
    argument vector, which may leave out trailing arguments. The runtime calls
    init with [self id] and the other handlers with [self state payload]."
   [args body arity]
   (when (> (count args) arity)
     (throw (ex-info (str "defactor: handler takes at most " arity " arguments, got " args) {})))
   (let [params (vec (take arity (concat args (repeatedly #(gensym "_")))))]
-    `(fn ~params (t/async ~@body))))
+    `(clojure.core/fn ~params (t/async ~@body))))
 
 (defmacro defactor
   "Defines an actor type and a function that returns references to its
@@ -374,9 +527,9 @@
                                            [args & b] more]
                                        [(keyword kind) msg-type spec (handler-fn args b 3)])
                     (throw (ex-info (str "defactor " name ": unknown clause " kind) {}))))
-        init (some (fn [[k _ _ f]] (when (= k :init) f)) clauses)
-        handlers (reduce (fn [m [k msg-type _ f]] (if (= k :init) m (assoc-in m [k msg-type] f))) {} clauses)
-        specs (reduce (fn [m [k msg-type spec _]] (if spec (assoc-in m [k msg-type] spec) m)) {} clauses)]
+        init (some (clojure.core/fn [[k _ _ f]] (when (= k :init) f)) clauses)
+        handlers (reduce (clojure.core/fn [m [k msg-type _ f]] (if (= k :init) m (assoc-in m [k msg-type] f))) {} clauses)
+        specs (reduce (clojure.core/fn [m [k msg-type spec _]] (if spec (assoc-in m [k msg-type] spec) m)) {} clauses)]
     (when-not init
       (throw (ex-info (str "defactor " name ": an init clause is required") {})))
     `(do

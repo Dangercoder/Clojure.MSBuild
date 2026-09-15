@@ -90,6 +90,36 @@
       (testing "the world is untouched: no restart, same ants in place"
         (is (= (ants-in before) (ants-in (actors/call! (world "main") :snapshot))))))))
 
+(deftest functions-are-sent-as-data
+  (testing "code written with actors/fn runs inside the actor, values spliced in with ~"
+    (let [n 40]
+      (is (= 42 (actors/swap! (counter 3) (actors/fn [count] (+ count ~n 2)))))
+      (is (= 42 (actors/get! (counter 3) (actors/fn [count] count))))))
+  (testing "a var, a symbol and a keyword name functions both sides have"
+    (is (= 43 (actors/swap! (counter 3) #'clojure.core/inc)))
+    (is (= 44 (actors/swap! (counter 3) 'clojure.core/inc)))
+    (is (= 0 (actors/get! (world "main") :world/collected))))
+  (testing "send applies later, without a reply"
+    (actors/send (counter 3) 'clojure.core/+ 6)
+    (is (loop [n 0] (cond (= 50 (actors/get! (counter 3) 'clojure.core/identity)) true
+                          (= n 50) false
+                          :else (do (System.Threading.Thread/Sleep 20) (recur (inc n)))))))
+  (testing "the state spec still applies to code"
+    (is (thrown-with-msg? Exception #"does not conform" (actors/swap! (counter 3) (actors/fn [count] (- count 100)))))
+    (is (= 0 (actors/get! (counter 3) 'clojure.core/identity)) "restarted"))
+  (testing "a compiled function is refused, in this process too"
+    (is (thrown-with-msg? Exception #"sent as data" (actors/swap! (counter 3) (clojure.core/fn [count] (inc count)))))))
+
+(deftest values-survive-the-wire
+  (testing "what another silo would receive"
+    (let [payload {:a [1 2.5 "three" :four 'five] :s #{1 2} :nested {:deep [nil true]}}]
+      (is (= payload (actors/round-trip @silo :any payload))))
+    (is (= 'clojure.core/inc (actors/round-trip @silo :any #'clojure.core/inc)) "a var travels as its symbol")
+    (let [code (actors/fn [count] (+ count ~1))]
+      (is (= code (actors/round-trip @silo :any code)) "code is data")))
+  (testing "a compiled function cannot leave the process"
+    (is (thrown-with-msg? Exception #"cannot leave the process" (actors/round-trip @silo :any {:f (clojure.core/fn [] 1)})))))
+
 (deftest a-state-violation-restarts-the-actor
   (is (= 2 (actors/call! (counter 1) :add 2)))
   (is (= 5 (actors/call! (counter 1) :add 3)))

@@ -1,6 +1,7 @@
 {;; orleans.actors/defactor (examples/orleans-actors-ants-demo) is expanded for the
  ;; linter by .clj-kondo/hooks/orleans/actors.clj
- :hooks {:macroexpand {orleans.actors/defactor hooks.orleans.actors/defactor}}
+ :hooks {:macroexpand {orleans.actors/defactor hooks.orleans.actors/defactor
+                       orleans.actors/fn hooks.orleans.actors/fn}}
  :lint-as {clojure.test.check.clojure-test/defspec clj-kondo.lint-as/def-catch-all}
  ;; ClojureCLR additions to clojure.core
  :linters {:unresolved-symbol {:exclude [assembly-load alias-type add-type-alias

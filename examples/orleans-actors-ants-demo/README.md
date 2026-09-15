@@ -50,12 +50,35 @@ type is defined with `defactor`; the body reads like a GenServer:
 | a supervisor | `{:on-error :restart}` (default), `:resume` or `:stop` on the actor | the runtime re-initialises a crashed actor; the caller still gets the error |
 | `GenServer.stop/1` | `(actors/stop self)` | `DeactivateOnIdle` |
 | a typespec / struct | `{:state ::spec}` on the actor, `(call :move ::move [self state payload] ...)` on a handler | checked after every message, and on every incoming payload |
+| `Agent.update/2`, `Agent.get/2` | `(actors/swap ref (actors/fn [state] ...))`, `(actors/get ref f)`, `(actors/send ref f)` | the function travels as data and runs inside the actor |
 
 Handler bodies run in an async context, so they can `t/await` calls to other
-actors. Messages are Clojure data: they travel as EDN, so maps, vectors,
-keywords, numbers, strings and sets all work, across silos too. Actors of the
-same type are independent; an actor handles one message at a time, and a call
-cycle (A calls B calls A) deadlocks, exactly as with a GenServer.
+actors. Messages are Clojure values. Inside a silo they are passed by
+reference (they are immutable, so Orleans has nothing to copy); between silos
+they travel as EDN through a small codec in the glue. Both mean the same thing.
+Actors of the same type are independent; an actor handles one message at a
+time, and a call cycle (A calls B calls A) deadlocks, exactly as with a
+GenServer.
+
+**Functions are messages too, as data.** Every actor understands `swap`,
+`send` and `get`, the way an atom understands `swap!` and an agent `send`:
+
+```clojure
+(actors/swap! (world "main") (actors/fn [world] (assoc world :world/collected ~n)))
+(actors/send  (world "main") 'ants.logic/evaporate)
+(actors/get!  (world "main") :world/collected)
+```
+
+`(actors/fn [state] ...)` is a function as data: its form and the namespace it
+was written in. The receiving actor evaluates it there (once per distinct form,
+then cached), so it means the same thing on every silo, and it is plain data on
+the wire. Values from the surrounding code are spliced in with `~`, as in a
+syntax quote, and must be data. A var or a symbol names a function both sides
+have; a keyword is a function. A compiled function is refused, in this process
+too, so that nothing works locally that would break across silos. The function
+runs inside the actor, one message at a time, and its result is checked
+against the state spec like any handler's. The usual caveat of code as data
+applies: only accept messages from code you trust.
 
 **State and messages as specs.** `src/ants/model.cljr` describes the colony
 with clojure.spec, using namespaced keys (`:ant/x`, `:cell/food`, `:world/size`,
@@ -73,7 +96,7 @@ described with `s/every-kv` (which samples) rather than `s/map-of`, the
 runtime examines 10 sampled elements per check (`(actors/check-state! 50)`
 raises that, `(actors/check-state! false)` turns state checks off), and a
 handler that returns the state it was given is not checked again. With
-these specs a tick of 30 ants costs about 27 ms with the checks and 23 ms
+these specs a tick of 30 ants costs about 14 ms with the checks and 7 ms
 without.
 
 There is no supervisor tree to define: Orleans is the supervisor. Every actor
@@ -86,7 +109,11 @@ next message.
 Orleans generates proxies and serializers from C# grain interfaces, so a small C#
 class library (`glue/`) holds:
 
-- `ActorMessage`: a type name and an EDN payload.
+- `ActorMessage` and `ActorReply`: a type name and a payload, any Clojure
+  value, marked immutable so Orleans passes them by reference inside a silo.
+- `ClojureCodec` and `ClojureCopier`: how a Clojure value leaves the process
+  (as EDN, through `IClojureWire`, implemented in Clojure) and how it is
+  copied (it is not: it is immutable).
 - `IActorGrain`: `Call` and `Cast`. Every Clojure actor type is hosted by the
   same grain interface; the grain key is `"type/id"`.
 - `ActorGrain`: the one grain class. It owns the state slot and the timers and
