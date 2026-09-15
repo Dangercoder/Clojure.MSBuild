@@ -68,10 +68,13 @@ with the explanation and the actor is untouched. `(actors/describe :world)`
 shows the state spec, the messages and their payload specs.
 The same specs generate the data for the property-based tests in
 `test/ants/logic_test.cljr`. The checks cost what `s/valid?` costs on the
-state, so large collections use `s/every-kv` (which samples) rather than
-`s/map-of`, and a handler that returns the state it was given is not checked
-again. With these specs a tick of 30 ants costs about 54 ms with the checks
-and 23 ms without; `(actors/check-state! false)` turns the state checks off.
+state, which on ClojureCLR is about 15 µs per validated map, so the grid is
+described with `s/every-kv` (which samples) rather than `s/map-of`, the
+runtime examines 10 sampled elements per check (`(actors/check-state! 50)`
+raises that, `(actors/check-state! false)` turns state checks off), and a
+handler that returns the state it was given is not checked again. With
+these specs a tick of 30 ants costs about 27 ms with the checks and 23 ms
+without.
 
 There is no supervisor tree to define: Orleans is the supervisor. Every actor
 is always "running" as far as its callers are concerned; if it crashes it is
