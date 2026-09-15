@@ -4,6 +4,10 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.clr.async.task.alpha :as t]
             [clojure.spec.alpha :as s]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [ants.model :as model]
             [orleans.actors :as actors :refer [defactor reply]]
             [ants.world :refer [world]]
             [ants.ant :refer [ant]]))
@@ -26,7 +30,7 @@
     (try
       (actors/call! (world "main") :configure #:world{:size 20 :seed 3 :food-places 10 :home-size 8})
       (f)
-      (finally (actors/stop! @silo)))))
+      (finally (actors/shutdown! @silo)))))
 
 (defn- step! [ids]
   (t/wait-all (mapv #(actors/call (ant %) :step) ids)))
@@ -107,3 +111,20 @@
   (is (thrown-with-msg? Exception #"rejected :add" (actors/call! (counter 1) :add "two"))
       "a bad payload is rejected instead")
   (is (= 0 (actors/call! (counter 1) :get)) "and did not restart anything"))
+
+;; ── Every valid message, generated from the specs ────────────────
+
+(defspec the-world-handles-every-valid-message 100
+  (prop/for-all [messages (gen/vector (actors/message-generator :world :call) 1 5)]
+    (actors/check-state! 5000)                          ; check the whole grid after each message, not a sample
+    (try
+      (doseq [[type payload] messages]
+        (actors/call! (world "under-test") type payload))
+      (s/valid? ::model/look-view (actors/call! (world "under-test") :look #:ant{:x 0 :y 0 :dir 0}))
+      (finally (actors/check-state! true)))))
+
+(defspec the-ant-handles-every-valid-message 30
+  (prop/for-all [messages (gen/vector (actors/message-generator :ant :call) 1 10)]
+    (doseq [[type payload] messages]
+      (actors/call! (ant "under-test") type payload))
+    (s/valid? ::model/ant-state (actors/call! (ant "under-test") :state))))

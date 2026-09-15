@@ -78,6 +78,22 @@ handler that returns the state it was given is not checked again. With
 these specs a tick of 30 ants costs about 14 ms with the checks and 7 ms
 without.
 
+**Every valid message, generated.** `(actors/message-generator :world :call)`
+turns an actor's declared messages and payload specs into a test.check
+generator, so a property can send an actor everything it claims to accept
+and let the state spec judge the result (`test/ants/colony_test.cljr`):
+
+```clojure
+(defspec the-world-handles-every-valid-message 100
+  (prop/for-all [messages (gen/vector (actors/message-generator :world :call) 1 5)]
+    (doseq [[type payload] messages]
+      (actors/call! (world "under-test") type payload))
+    (s/valid? ::model/look-view (actors/call! (world "under-test") :look #:ant{:x 0 :y 0 :dir 0}))))
+```
+
+Its first run found a real bug: configure a one-cell nest, spawn two ants,
+and the world threw "the nest is full".
+
 There is no supervisor tree to define: Orleans is the supervisor. Every actor
 is always "running" as far as its callers are concerned; if it crashes it is
 re-initialised, and if a silo dies its actors come back on another one on the
@@ -98,7 +114,9 @@ class library (`glue/`) holds:
 - `ActorGrain`: the one grain class. It owns the state slot and the timers and
   hands every event (`OnActivate`, `OnCall`, `OnCast`, `OnInfo`, `OnError`) to
   an `IActorHost`, which `orleans.actors` implements with `reify`.
-- `Actors.StartSilo`: an in-process silo with localhost clustering.
+- `Actors.StartSiloAsync` and `StopSiloAsync`: an in-process silo with localhost
+  clustering. `actors/start` and `actors/shutdown` await them; `start!` and
+  `shutdown!` block, for `-main`, tests and the REPL.
 
 Everything else, including the dispatch on actor type, the state handling and
 the error policy, is Clojure.

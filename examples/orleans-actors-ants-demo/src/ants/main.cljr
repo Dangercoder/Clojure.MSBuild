@@ -51,4 +51,4 @@
       (let [snapshot (simulate! options)]
         (println (str "\n" (:ants options) " ants, " (:ticks options) " ticks, food collected: " (:snapshot/collected snapshot))))
       (finally
-        (actors/stop! silo)))))
+        (actors/shutdown! silo)))))

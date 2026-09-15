@@ -212,7 +212,7 @@ public static class Actors
     public static IActorGrain Ref(IGrainFactory factory, string key) => factory.GetGrain<IActorGrain>(key);
 
     /// <summary>Starts an in-process Orleans silo (localhost clustering) and returns the host.</summary>
-    public static IHost StartSilo(int siloPort, int gatewayPort, LogLevel logLevel)
+    public static async Task<IHost> StartSiloAsync(int siloPort, int gatewayPort, LogLevel logLevel)
     {
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
         builder.Logging.SetMinimumLevel(logLevel);
@@ -220,7 +220,7 @@ public static class Actors
         builder.Services.AddSingleton<IGeneralizedCopier, ClojureCopier>();
         builder.UseOrleans(silo => silo.UseLocalhostClustering(siloPort, gatewayPort));
         var host = builder.Build();
-        host.StartAsync().GetAwaiter().GetResult();
+        await host.StartAsync();
         return host;
     }
 
@@ -233,9 +233,9 @@ public static class Actors
         return serializer.Deserialize<ActorMessage>(serializer.SerializeToArray(message));
     }
 
-    public static void StopSilo(IHost host)
+    public static async Task StopSiloAsync(IHost host)
     {
-        host.StopAsync().GetAwaiter().GetResult();
+        await host.StopAsync();
         host.Dispose();
     }
 }

@@ -30,6 +30,7 @@
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.edn :as edn]
             [clojure.spec.alpha :as s]
+            [clojure.spec.gen.alpha :as gen]
             [clojure.string :as str]
             [clojure.walk :as walk])
   (:import [Clojure.Orleans Actors ActorGrain ActorMessage ActorReply IActorGrain IActorHost IClojureWire]
@@ -342,18 +343,26 @@
 
 ;; ── The actor system ─────────────────────────────────────────────
 
-(defn start!
-  "Starts an Orleans silo in this process hosting all defined actors and
-   returns it. Options: :silo-port (11111), :gateway-port (30000),
-   :log-level (LogLevel/Warning)."
-  ([] (start! {}))
+(defn start
+  "Starts an Orleans silo in this process hosting all defined actors.
+   Returns a Task of the silo. Options: :silo-port (11111), :gateway-port
+   (30000), :log-level (LogLevel/Warning)."
+  ([] (start {}))
   ([{:keys [silo-port gateway-port log-level]
      :or {silo-port 11111 gateway-port 30000 log-level LogLevel/Warning}}]
    (Actors/SetHost (host))
    (Actors/SetWire (wire))
-   (let [silo (Actors/StartSilo (int silo-port) (int gateway-port) log-level)]
-     (reset! grain-factory (Actors/GrainFactory silo))
-     silo)))
+   (t/async
+     (let [silo (t/await (Actors/StartSiloAsync (int silo-port) (int gateway-port) log-level))]
+       (reset! grain-factory (Actors/GrainFactory silo))
+       silo))))
+
+(alter-meta! #'start assoc :tag task-of-object)
+
+(defn start!
+  "Blocking start, for -main, tests and the REPL."
+  ([] (start! {}))
+  ([options] (t/result (start options))))
 
 (defn round-trip
   "Serializes a message the way it would travel to another silo and reads it
@@ -361,11 +370,40 @@
   [silo type payload]
   (.Payload (Actors/RoundTrip silo (message type payload))))
 
-(defn stop!
-  "Stops the silo started with start!."
+(defn shutdown
+  "Stops the silo started with start. Returns a Task."
   [^IHost silo]
   (reset! grain-factory nil)
-  (Actors/StopSilo silo))
+  (Actors/StopSiloAsync silo))
+
+(defn shutdown!
+  "Blocking shutdown, for -main, tests and the REPL."
+  [silo]
+  (t/result (shutdown silo)))
+
+;; ── Property-based testing from the specs ────────────────────────
+
+(defn message-generator
+  "A test.check generator of [message-type payload] for the messages of the
+   given kind (:call, :cast or :info) an actor type declares, with payloads
+   generated from their specs (nil for a message without one). With it a
+   property can send an actor every valid message it accepts:
+
+     (prop/for-all [[type payload] (actors/message-generator :world :call)]
+       (actors/call! (world \"under-test\") type payload)
+       true)
+
+   A message the actor cannot handle throws, and after every message the
+   runtime checks the state against the :state spec."
+  [type kind]
+  (let [definition (or (get @definitions type) (throw (ex-info (str "No actor defined for type " type) {})))
+        messages (get definition kind)]
+    (when (empty? messages)
+      (throw (ex-info (str "Actor " type " has no " (name kind) " messages") {:actor type})))
+    (gen/one-of (for [[msg-type _] messages
+                      :let [spec (get-in definition [:specs kind msg-type])]]
+                  (gen/tuple (gen/return msg-type)
+                             (if spec (s/gen spec) (gen/return nil)))))))
 
 ;; ── defactor ─────────────────────────────────────────────────────
 
