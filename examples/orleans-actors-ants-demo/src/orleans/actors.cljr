@@ -18,10 +18,17 @@
 
    Messages are Clojure data, sent as EDN, so anything printable with pr-str
    and readable with clojure.edn travels: maps, vectors, keywords, numbers,
-   strings, sets."
+   strings, sets.
+
+   State and messages can be described with clojure.spec: a `:state` spec
+   is checked after init and after every message (a violation is a bug in
+   the actor and restarts it), a spec on a handler is checked on the
+   incoming payload (a violation is a bad message and is rejected without
+   touching the actor). `describe` shows what an actor type expects."
   (:refer-clojure :exclude [cast])
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.edn :as edn]
+            [clojure.spec.alpha :as s]
             [clojure.string :as str])
   (:import [Clojure.Orleans Actors ActorGrain ActorMessage IActorGrain IActorHost]
            [Microsoft.Extensions.Hosting IHost]
@@ -32,6 +39,10 @@
 (set! *warn-on-reflection* true)
 
 (def ^:private task-of-object "System.Threading.Tasks.Task`1[System.Object]")
+
+(defn- warn [& parts]
+  (binding [*out* *err*]
+    (println (apply str parts))))
 
 (defn- as-task
   "Gives the compiler the static Task<object> type that t/await needs."
@@ -48,6 +59,8 @@
       :call     {msg-type (fn [self state payload] [reply state])}
       :cast     {msg-type (fn [self state payload] state)}
       :info     {msg-type (fn [self state payload] state)}
+      :state    spec of the state, optional
+      :specs    {:call {msg-type payload-spec} :cast {...} :info {...}}, optional
       :on-error :restart | :resume | :stop}
    Handlers may return a Task<object> (t/async) instead of a value.
    `defactor` is the convenient way to build this map."
@@ -84,10 +97,16 @@
 
 (defn call
   "Sends a request and returns a Task<object> of the reply. Await it in an
-   async context with t/await, or use call! to block."
+   async context with t/await, or use call! to block. A payload the actor
+   rejects (see `defactor`) throws ex-info with the actor's explanation."
   ([ref type] (call ref type nil))
   ([^IActorGrain ref type payload]
-   (t/async (edn/read-string (t/await (.Call ref (message type payload)))))))
+   (t/async
+     (let [[tag value] (edn/read-string (t/await (.Call ref (message type payload))))]
+       (if (= tag :ok)
+         value
+         (throw (ex-info (str "Actor " (:actor value) " rejected " (:message value) ": " (:explain value))
+                         value)))))))
 
 (alter-meta! #'call assoc :tag task-of-object)
 
@@ -152,18 +171,59 @@
 
 (alter-meta! #'run-handler assoc :tag task-of-object)
 
+(defonce ^:private state-check-sample (atom 10))
+
+(defn check-state!
+  "How states are checked against their :state spec after init and after
+   every message: false turns the checks off, true or a number sets how many
+   elements of a collection described with s/every or s/every-kv are
+   examined per check (the default, 10, keeps a check on a large state map
+   well under a millisecond; s/coll-of and s/map-of always check every
+   element). The check otherwise costs what s/valid? costs on the state."
+  [setting]
+  (reset! state-check-sample
+          (cond (false? setting) nil
+                (nil? setting) nil
+                (number? setting) (long setting)
+                :else 10)))
+
+(defn- conform-state!
+  "Throws when the state does not conform to the actor's :state spec. A
+   handler that returns the state it was given (identical, not merely equal)
+   is not checked again: the state still conforms."
+  [definition type msg-type state previous]
+  (when-let [spec (:state definition)]
+    (when-let [sample @state-check-sample]
+      (when-not (identical? state previous)
+        (binding [s/*coll-check-limit* sample]
+          (when-not (s/valid? spec state)
+            (throw (ex-info (str "Actor " type (when msg-type (str " after " msg-type))
+                                 ": the state does not conform to " spec ": " (s/explain-str spec state))
+                            {:actor type :message msg-type :spec spec :state state}))))))))
+
+(defn- payload-problem
+  "The rejection data when a payload does not conform to the handler's spec,
+   nil when it does or when the handler has no spec."
+  [definition kind type msg-type payload]
+  (when-let [spec (get-in definition [:specs kind msg-type])]
+    (when-not (s/valid? spec payload)
+      {:actor type :message msg-type :spec spec :explain (s/explain-str spec payload)})))
+
 (defn- init! [^ActorGrain grain]
   (t/async
-    (let [[definition _ id] (definition-of grain)]
-      (set! (.State grain) (t/await (run-handler (:init definition) grain id)))
+    (let [[definition type id] (definition-of grain)
+          state (t/await (run-handler (:init definition) grain id))]
+      (conform-state! definition type nil state ::none)
+      (set! (.State grain) state)
       nil)))
 
 (alter-meta! #'init! assoc :tag task-of-object)
 
 (defn- handle
   "Runs the handler of the given kind (:call, :cast or :info) for a message.
-   Call handlers return [reply state]; the reply is returned as EDN.
-   Cast and info handlers return the new state."
+   Call handlers return [reply state]; the reply travels as EDN [:ok reply],
+   a rejected payload as [:error data]. Cast and info handlers return the
+   new state."
   [kind ^ActorGrain grain ^ActorMessage message]
   (t/async
     (let [[definition type _] (definition-of grain)
@@ -171,17 +231,31 @@
           handler (or (get-in definition [kind msg-type])
                       (throw (ex-info (str "Actor " type " has no " (name kind) " handler for " msg-type)
                                       {:actor type :message msg-type})))
-          result (t/await (run-handler handler grain (.State grain) (payload-of message)))]
-      (if (= kind :call)
-        (let [_ (when-not (and (vector? result) (= 2 (count result)))
-                  (throw (ex-info (str "Actor " type ": the " msg-type " call handler returned " (pr-str result)
-                                       "; call handlers return (reply value state)")
-                                  {:actor type :message msg-type})))
-              [value new-state] result]
-          (set! (.State grain) new-state)
-          (pr-str value))
-        (do (set! (.State grain) result)
-            nil)))))
+          payload (payload-of message)
+          problem (payload-problem definition kind type msg-type payload)]
+      (cond
+        (and problem (= kind :call))
+        (pr-str [:error problem])
+
+        problem
+        (do (warn "actor " type " rejected " msg-type ": " (:explain problem))
+            nil)
+
+        :else
+        (let [previous (.State grain)
+              result (t/await (run-handler handler grain previous payload))]
+          (if (= kind :call)
+            (let [_ (when-not (and (vector? result) (= 2 (count result)))
+                      (throw (ex-info (str "Actor " type ": the " msg-type " call handler returned " (pr-str result)
+                                           "; call handlers return (reply value state)")
+                                      {:actor type :message msg-type})))
+                  [value new-state] result]
+              (conform-state! definition type msg-type new-state previous)
+              (set! (.State grain) new-state)
+              (pr-str [:ok value]))
+            (do (conform-state! definition type msg-type result previous)
+                (set! (.State grain) result)
+                nil)))))))
 
 (alter-meta! #'handle assoc :tag task-of-object)
 
@@ -214,6 +288,23 @@
     (OnCast [_ grain message] (handle :cast grain message))
     (OnInfo [_ grain message] (handle :info grain message))
     (OnError [_ grain error] (on-error grain error))))
+
+(defn describe
+  "What an actor type expects: its state spec, the messages it handles and
+   their payload specs (as s/describe forms), and its error policy."
+  [type]
+  (let [definition (or (get @definitions type) (throw (ex-info (str "No actor defined for type " type) {})))
+        messages (fn [kind]
+                   (into (sorted-map)
+                         (map (fn [[msg-type _]]
+                                [msg-type (some-> (get-in definition [:specs kind msg-type]) s/describe)]))
+                         (get definition kind)))]
+    {:type type
+     :state (some-> (:state definition) s/describe)
+     :on-error (:on-error definition :restart)
+     :call (messages :call)
+     :cast (messages :cast)
+     :info (messages :info)}))
 
 ;; ── The actor system ─────────────────────────────────────────────
 
@@ -253,31 +344,43 @@
 
      (defactor counter
        \"Counts.\"
-       {:on-error :restart}                 ; options, optional
+       {:state ::count                      ; options, optional: spec of the state,
+        :on-error :restart}                 ;   error policy
        (init [self id] 0)                   ; -> state
        (call :get [self state] (reply state state))
-       (call :add [self state n] (reply (+ state n) (+ state n)))
+       (call :add ::amount [self state n]   ; optional spec of the payload
+         (reply (+ state n) (+ state n)))
        (cast :reset [self state] 0)
        (info :tick [self state] (inc state)))
 
    Handler bodies run in an async context, so they can t/await calls to
    other actors. Call handlers return [reply new-state] (see `reply`); cast
-   and info handlers return the new state."
+   and info handlers return the new state.
+
+   With a :state spec the state is checked after init and after every
+   message; a violation is a bug in the actor, so the actor fails and its
+   :on-error policy applies. A payload that fails its spec is rejected
+   before the handler runs: the caller gets an ex-info, the actor is
+   untouched."
   [name & body]
   (let [[doc body] (if (string? (first body)) [(first body) (rest body)] [nil body])
         [options body] (if (map? (first body)) [(first body) (rest body)] [{} body])
         type (keyword name)
         clauses (for [[kind & clause] body]
                   (case kind
-                    init (let [[args & b] clause] [:init (handler-fn args b 2)])
-                    (call cast info) (let [[msg-type args & b] clause] [(keyword kind) msg-type (handler-fn args b 3)])
+                    init (let [[args & b] clause] [:init nil nil (handler-fn args b 2)])
+                    (call cast info) (let [[msg-type & more] clause
+                                           [spec more] (if (vector? (first more)) [nil more] [(first more) (rest more)])
+                                           [args & b] more]
+                                       [(keyword kind) msg-type spec (handler-fn args b 3)])
                     (throw (ex-info (str "defactor " name ": unknown clause " kind) {}))))
-        init (some (fn [[k f]] (when (= k :init) f)) clauses)
-        handlers (reduce (fn [m [k msg-type f]] (if (= k :init) m (assoc-in m [k msg-type] f))) {} clauses)]
+        init (some (fn [[k _ _ f]] (when (= k :init) f)) clauses)
+        handlers (reduce (fn [m [k msg-type _ f]] (if (= k :init) m (assoc-in m [k msg-type] f))) {} clauses)
+        specs (reduce (fn [m [k msg-type spec _]] (if spec (assoc-in m [k msg-type] spec) m)) {} clauses)]
     (when-not init
       (throw (ex-info (str "defactor " name ": an init clause is required") {})))
     `(do
-       (register-actor! ~type (merge {:init ~init} ~handlers ~options))
+       (register-actor! ~type (merge {:init ~init :specs ~specs} ~handlers ~options))
        (defn ~(with-meta name {:doc (or doc (str "Reference to the " name " actor with the given id."))
                                :actor/type type})
          [~'id]
