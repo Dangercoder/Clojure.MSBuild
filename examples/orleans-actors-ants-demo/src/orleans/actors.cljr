@@ -188,9 +188,16 @@
 
 (defn stop
   "Deactivates the actor after the current message. The next message sent to
-   it creates a fresh one (init runs again)."
+   it creates a fresh one: init runs again, or resume when the actor
+   persists."
   [^ActorGrain self]
   (.Stop self))
+
+(defn forget
+  "Discards the stored state of a persisting actor. Returns a Task; the
+   next activation runs init again."
+  [^ActorGrain self]
+  (.ForgetState self))
 
 ;; ── Runtime: the Orleans side calls these ─────────────────────────
 
@@ -244,12 +251,29 @@
     (when-not (s/valid? spec payload)
       {:actor type :message msg-type :spec spec :explain (s/explain-str spec payload)})))
 
-(defn- init! [^ActorGrain grain]
+(defn- persist!
+  "Stores the state when the actor persists and the state changed."
+  [^ActorGrain grain definition state previous]
+  (t/async
+    (when (and (:persist definition) (not (identical? state previous)))
+      (t/await (.PersistState grain state)))
+    nil))
+
+(alter-meta! #'persist! assoc :tag task-of-object)
+
+(defn- init!
+  "Runs init, or resume with the stored state when the actor persists and
+   has one; stores the result when the actor persists."
+  [^ActorGrain grain]
   (t/async
     (let [[definition type id] (definition-of grain)
-          state (t/await (run-handler (:init definition) grain id))]
+          resuming? (and (:persist definition) (.HasStoredState grain))
+          state (if resuming?
+                  (t/await (run-handler (:resume definition (fn [_ stored] stored)) grain (.StoredState grain)))
+                  (t/await (run-handler (:init definition) grain id)))]
       (conform-state! definition type nil state ::none)
       (set! (.State grain) state)
+      (t/await (persist! grain definition state ::none))
       nil)))
 
 (alter-meta! #'init! assoc :tag task-of-object)
@@ -263,11 +287,13 @@
   (t/async
     (let [[definition type _] (definition-of grain)
           msg-type (keyword (.Type message))
-          handler (or (get-in definition [kind msg-type])
-                      (throw (ex-info (str "Actor " type " has no " (name kind) " handler for " msg-type)
-                                      {:actor type :message msg-type})))
+          handler (get-in definition [kind msg-type])
           payload (payload-of message)
-          problem (payload-problem definition kind type msg-type payload)]
+          problem (if handler
+                    (payload-problem definition kind type msg-type payload)
+                    ;; an unknown message is the sender's mistake, not the actor's: rejected, no restart
+                    {:actor type :message msg-type
+                     :explain (str "no " (name kind) " handler for " msg-type)})]
       (cond
         (and problem (= kind :call))
         (ActorReply. false problem)
@@ -287,9 +313,11 @@
                   [value new-state] result]
               (conform-state! definition type msg-type new-state previous)
               (set! (.State grain) new-state)
+              (t/await (persist! grain definition new-state previous))
               (ActorReply. true value))
             (do (conform-state! definition type msg-type result previous)
                 (set! (.State grain) result)
+                (t/await (persist! grain definition result previous))
                 nil)))))))
 
 (alter-meta! #'handle assoc :tag task-of-object)
@@ -297,7 +325,8 @@
 (defn- on-error
   "Applies the actor's :on-error policy after a handler threw:
      :restart (default) the state is rebuilt with init, like a supervised
-              GenServer coming back after a crash
+              GenServer coming back after a crash; a persisting actor
+              resumes from its stored state, the last one that conformed
      :resume  the state is kept
      :stop    the actor is deactivated
    The exception still reaches the caller."
@@ -336,6 +365,7 @@
                          (get definition kind)))]
     {:type type
      :state (some-> (:state definition) s/describe)
+     :persist (boolean (:persist definition))
      :on-error (:on-error definition :restart)
      :call (messages :call)
      :cast (messages :cast)
@@ -346,14 +376,21 @@
 (defn start
   "Starts an Orleans silo in this process hosting all defined actors.
    Returns a Task of the silo. Options: :silo-port (11111), :gateway-port
-   (30000), :log-level (LogLevel/Warning)."
+   (30000), :log-level (LogLevel/Warning), and :primary-port to join the
+   cluster whose primary silo listens on that port on this machine (the
+   silo is a primary itself otherwise). Actors are shared by every silo of
+   the cluster: an actor lives on one of them and is reached from all.
+   :storage-dir is where persisting actors keep their state, as EDN files
+   (\".actors\" in the working directory by default); silos of one cluster
+   share it."
   ([] (start {}))
-  ([{:keys [silo-port gateway-port log-level]
-     :or {silo-port 11111 gateway-port 30000 log-level LogLevel/Warning}}]
+  ([{:keys [silo-port gateway-port primary-port storage-dir log-level]
+     :or {silo-port 11111 gateway-port 30000 primary-port 0 storage-dir ".actors" log-level LogLevel/Warning}}]
    (Actors/SetHost (host))
    (Actors/SetWire (wire))
    (t/async
-     (let [silo (t/await (Actors/StartSiloAsync (int silo-port) (int gateway-port) log-level))]
+     (let [silo (t/await (Actors/StartSiloAsync (int silo-port) (int gateway-port) (int primary-port)
+                                                (System.IO.Path/GetFullPath storage-dir) log-level))]
        (reset! grain-factory (Actors/GrainFactory silo))
        silo))))
 
@@ -369,6 +406,12 @@
    back: what the other side would receive. For tests and curiosity."
   [silo type payload]
   (.Payload (Actors/RoundTrip silo (message type payload))))
+
+(defn active-silos
+  "A Task of the number of silos the cluster considers active, as seen from
+   this silo."
+  [^IHost silo]
+  (Actors/ActiveSiloCount silo))
 
 (defn shutdown
   "Stops the silo started with start. Returns a Task."
@@ -440,26 +483,33 @@
    message; a violation is a bug in the actor, so the actor fails and its
    :on-error policy applies. A payload that fails its spec is rejected
    before the handler runs: the caller gets an ex-info, the actor is
-   untouched."
+   untouched.
+
+   With {:persist true} the state is stored after init and after every
+   message that changed it, and an actor that is activated again (after
+   stop, an idle deactivation, a crash or a silo restart) gets it back:
+   (resume [self stored] state) runs instead of init, by default keeping
+   the stored state as it is. The state has to be data (see the wire)."
   [name & body]
   (let [[doc body] (if (string? (first body)) [(first body) (rest body)] [nil body])
         [options body] (if (map? (first body)) [(first body) (rest body)] [{} body])
         type (keyword name)
         clauses (for [[kind & clause] body]
                   (case kind
-                    init (let [[args & b] clause] [:init nil nil (handler-fn args b 2)])
+                    (init resume) (let [[args & b] clause] [(keyword kind) nil nil (handler-fn args b 2)])
                     (call cast info) (let [[msg-type & more] clause
                                            [spec more] (if (vector? (first more)) [nil more] [(first more) (rest more)])
                                            [args & b] more]
                                        [(keyword kind) msg-type spec (handler-fn args b 3)])
                     (throw (ex-info (str "defactor " name ": unknown clause " kind) {}))))
         init (some (fn [[k _ _ f]] (when (= k :init) f)) clauses)
-        handlers (reduce (fn [m [k msg-type _ f]] (if (= k :init) m (assoc-in m [k msg-type] f))) {} clauses)
+        resume (some (fn [[k _ _ f]] (when (= k :resume) f)) clauses)
+        handlers (reduce (fn [m [k msg-type _ f]] (if (#{:init :resume} k) m (assoc-in m [k msg-type] f))) {} clauses)
         specs (reduce (fn [m [k msg-type spec _]] (if spec (assoc-in m [k msg-type] spec) m)) {} clauses)]
     (when-not init
       (throw (ex-info (str "defactor " name ": an init clause is required") {})))
     `(do
-       (register-actor! ~type (merge {:init ~init :specs ~specs} ~handlers ~options))
+       (register-actor! ~type (merge {:init ~init :specs ~specs} (when ~resume {:resume ~resume}) ~handlers ~options))
        (defn ~(with-meta name {:doc (or doc (str "Reference to the " name " actor with the given id."))
                                :actor/type type})
          [~'id]

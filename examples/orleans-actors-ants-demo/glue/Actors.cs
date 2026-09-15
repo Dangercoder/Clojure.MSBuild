@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Net;
 using System.Text;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -11,6 +12,8 @@ using Orleans.Serialization.Cloning;
 using Orleans.Serialization.Codecs;
 using Orleans.Serialization.Serializers;
 using Orleans.Serialization.WireProtocol;
+using Orleans.Runtime.Hosting;
+using Orleans.Storage;
 
 namespace Clojure.Orleans;
 
@@ -60,11 +63,43 @@ public interface IClojureWire
     object Read(string text);
 }
 
+/// <summary>The stored form of an actor's state, for actors that persist.</summary>
+[GenerateSerializer]
+public sealed class ActorState
+{
+    [Id(0)] public object? Value { get; set; }
+}
+
 /// <summary>The generic grain. State and behaviour belong to the Clojure runtime.</summary>
 public sealed class ActorGrain : Grain, IActorGrain
 {
+    private readonly IPersistentState<ActorState> store;
+
+    public ActorGrain([PersistentState("actor", Actors.StorageName)] IPersistentState<ActorState> store)
+    {
+        this.store = store;
+    }
+
     /// <summary>The actor's state, owned by the Clojure runtime.</summary>
     public object? State { get; set; }
+
+    /// <summary>Whether a state was stored for this actor (loaded before activation).</summary>
+    public bool HasStoredState => store.RecordExists;
+
+    public object? StoredState => store.State.Value;
+
+    public async Task<bool> PersistState(object? value)
+    {
+        store.State.Value = value;
+        await store.WriteStateAsync();
+        return true;
+    }
+
+    public async Task<bool> ForgetState()
+    {
+        await store.ClearStateAsync();
+        return true;
+    }
 
     public string Key => this.GetPrimaryKeyString();
 
@@ -191,6 +226,71 @@ public sealed class ClojureCodec : IGeneralizedCodec
     }
 }
 
+/// <summary>
+/// Grain storage as EDN files, one per actor: durable across process and silo restarts,
+/// shared by every silo with access to the directory. It stores the state through
+/// <see cref="IClojureWire"/>, so what is on disk is what would be on the wire.
+/// </summary>
+public sealed class EdnFileStorage : IGrainStorage
+{
+    private readonly string directory;
+
+    public EdnFileStorage(string directory) => this.directory = directory;
+
+    /// <summary>The file for an actor: "type/id" becomes type/id.state.edn under the directory.
+    /// Ids come from callers, so the path is checked to stay inside the directory.</summary>
+    private string PathFor(string stateName, GrainId grainId)
+    {
+        var key = grainId.Key.ToString()!;
+        if (key.Split('/').Any(segment => segment is "" or "." or ".."))
+            throw new ArgumentException($"Actor key '{key}' cannot be stored as a file", nameof(grainId));
+        var root = Path.GetFullPath(directory) + Path.DirectorySeparatorChar;
+        var path = Path.GetFullPath(Path.Combine(root, key.Replace('/', Path.DirectorySeparatorChar) + "." + stateName + ".edn"));
+        if (!path.StartsWith(root, StringComparison.Ordinal))
+            throw new ArgumentException($"Actor key '{key}' escapes the storage directory", nameof(grainId));
+        return path;
+    }
+
+    private static IClojureWire Wire =>
+        Actors.Wire ?? throw new InvalidOperationException("The Clojure actor runtime is not started: call orleans.actors/start! first.");
+
+    public async Task ReadStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+    {
+        var path = PathFor(stateName, grainId);
+        if (!File.Exists(path))
+        {
+            grainState.RecordExists = false;
+            return;
+        }
+        var text = await File.ReadAllTextAsync(path);
+        var state = (ActorState)(object)grainState.State!;
+        state.Value = Wire.Read(text);
+        grainState.RecordExists = true;
+        grainState.ETag = File.GetLastWriteTimeUtc(path).Ticks.ToString();
+    }
+
+    public async Task WriteStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+    {
+        var path = PathFor(stateName, grainId);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var value = ((ActorState)(object)grainState.State!).Value;
+        var temporary = path + ".tmp";
+        await File.WriteAllTextAsync(temporary, value is null ? "nil" : Wire.Write(value));
+        File.Move(temporary, path, overwrite: true);
+        grainState.RecordExists = true;
+        grainState.ETag = File.GetLastWriteTimeUtc(path).Ticks.ToString();
+    }
+
+    public Task ClearStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+    {
+        var path = PathFor(stateName, grainId);
+        if (File.Exists(path)) File.Delete(path);
+        grainState.RecordExists = false;
+        grainState.ETag = null;
+        return Task.CompletedTask;
+    }
+}
+
 /// <summary>Clojure values are immutable: a deep copy is the value itself.</summary>
 public sealed class ClojureCopier : IGeneralizedCopier
 {
@@ -211,20 +311,43 @@ public static class Actors
 
     public static IActorGrain Ref(IGrainFactory factory, string key) => factory.GetGrain<IActorGrain>(key);
 
-    /// <summary>Starts an in-process Orleans silo (localhost clustering) and returns the host.</summary>
-    public static async Task<IHost> StartSiloAsync(int siloPort, int gatewayPort, LogLevel logLevel)
+    /// <summary>The grain storage actors persist to: EDN files in a directory (see
+    /// <see cref="EdnFileStorage"/>). A database is one AddXxxGrainStorage call instead.</summary>
+    public const string StorageName = "actors";
+
+    /// <summary>
+    /// Starts an Orleans silo in this process and returns the host. Localhost clustering: the
+    /// silo is the primary of its cluster unless <paramref name="primarySiloPort"/> names the
+    /// silo to join. Clustering across machines is a membership provider here instead.
+    /// </summary>
+    public static async Task<IHost> StartSiloAsync(int siloPort, int gatewayPort, int primarySiloPort, string storageDirectory, LogLevel logLevel)
     {
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
         builder.Logging.SetMinimumLevel(logLevel);
         builder.Services.AddSingleton<IGeneralizedCodec, ClojureCodec>();
         builder.Services.AddSingleton<IGeneralizedCopier, ClojureCopier>();
-        builder.UseOrleans(silo => silo.UseLocalhostClustering(siloPort, gatewayPort));
+        builder.UseOrleans(silo =>
+        {
+            if (primarySiloPort > 0)
+                silo.UseLocalhostClustering(siloPort, gatewayPort, new IPEndPoint(IPAddress.Loopback, primarySiloPort));
+            else
+                silo.UseLocalhostClustering(siloPort, gatewayPort);
+            silo.Services.AddGrainStorage<EdnFileStorage>(StorageName, (_, _) => new EdnFileStorage(storageDirectory));
+        });
         var host = builder.Build();
         await host.StartAsync();
         return host;
     }
 
     public static IGrainFactory GrainFactory(IHost host) => (IGrainFactory)host.Services.GetService(typeof(IGrainFactory))!;
+
+    /// <summary>The number of silos the cluster currently considers active.</summary>
+    public static async Task<int> ActiveSiloCount(IHost host)
+    {
+        var management = GrainFactory(host).GetGrain<IManagementGrain>(0);
+        var hosts = await management.GetHosts(onlyActive: true);
+        return hosts.Count;
+    }
 
     /// <summary>Serializes a message the way it would travel to another silo and reads it back.</summary>
     public static ActorMessage RoundTrip(IHost host, ActorMessage message)

@@ -49,6 +49,7 @@ type is defined with `defactor`; the body reads like a GenServer:
 | a pid | `(ant 7)`, `(world "main")`: refs are just `type/id` keys | virtual actors: exist when addressed, activated on first message, deactivated when idle |
 | a supervisor | `{:on-error :restart}` (default), `:resume` or `:stop` on the actor | the runtime re-initialises a crashed actor; the caller still gets the error |
 | `GenServer.stop/1` | `(actors/stop self)` | `DeactivateOnIdle` |
+| persistent state (Mnesia, ETS...) | `{:persist true}`, `(resume [self stored] ...)`, `(actors/forget self)` | grain storage |
 | a typespec / struct | `{:state ::spec}` on the actor, `(call :move ::move [self state payload] ...)` on a handler | checked after every message, and on every incoming payload |
 
 Handler bodies run in an async context, so they can `t/await` calls to other
@@ -93,6 +94,33 @@ and let the state spec judge the result (`test/ants/colony_test.cljr`):
 
 Its first run found a real bug: configure a one-cell nest, spawn two ants,
 and the world threw "the nest is full".
+
+**Persistence.** `{:persist true}` on an actor stores its state after `init`
+and after every message that changed it, and an actor that is activated
+again, after `stop`, an idle deactivation, a crash or a silo restart, gets it
+back: `(resume [self stored] state)` runs instead of `init` (by default the
+stored state is kept as it is). A crash restarts a persisting actor from its
+stored state, which is the last one that conformed to the spec. The store is
+Orleans grain storage; this example's glue provides one that writes each
+actor's state as an EDN file (`.actors/` in the working directory, or
+`:storage-dir`), so state survives a process restart and is what would be on
+the wire. A database is one `AddXxxGrainStorage` call instead. The state has
+to be data.
+
+**More than one silo.** `(actors/start {:primary-port 11111 :silo-port 11112
+:gateway-port 30001})` joins the cluster whose primary silo listens on that
+port on this machine; actors are shared by every silo of the cluster, each
+living on one silo and reached from all. The test suite starts a second silo
+in another process (`test/ants/second_silo.cljr`) and has it talk to the
+world actor of the first: every message crosses the wire through the codec,
+including a rejection and an unknown message. Across machines the localhost
+clustering is replaced by a membership provider, again one line in the glue.
+After a silo leaves, the others need a few seconds to see it gone and to take
+over its share of the grain directory; messages routed through it fail until
+then, which is what `actors/active-silos` is for. An actor whose directory
+registration was on the silo that left is activated afresh on its next
+message, so an actor that does not persist can lose its state on a cluster
+change. That is Orleans, not the DSL: persist what matters.
 
 There is no supervisor tree to define: Orleans is the supervisor. Every actor
 is always "running" as far as its callers are concerned; if it crashes it is

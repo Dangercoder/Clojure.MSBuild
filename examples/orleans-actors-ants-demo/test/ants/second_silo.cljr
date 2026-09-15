@@ -1,0 +1,30 @@
+;; Started by ants.colony-test in a second process: joins the test's silo as a
+;; second silo of the same cluster and talks to the world actor, which lives
+;; on the first silo, so every message crosses the wire.
+(require '[orleans.actors :as actors]
+         '[ants.world :refer [world]]
+         '[ants.colony-test :refer [ledger]]      ; the persisting actor type the test defines
+         '[clojure.string :as str])
+(import '[System Int32])
+
+(defn- port [name] (Int32/Parse (System.Environment/GetEnvironmentVariable name)))
+
+(defn- message-of [thunk]
+  (try (thunk) nil (catch Exception e (.Message e))))
+
+(let [silo (actors/start! {:silo-port (port "SILO_PORT")
+                           :gateway-port (port "GATEWAY_PORT")
+                           :primary-port (port "PRIMARY_PORT")
+                           :storage-dir (System.Environment/GetEnvironmentVariable "ACTORS_DIR")})]
+  (try
+    (let [view (actors/call! (world "main") :look #:ant{:x 1 :y 1 :dir 0})]
+      (assert (= 20 (:world/size view)) (str "the world configured by the first silo has size 20, saw " (:world/size view)))
+      (assert (= :ok (actors/call! (world "main") :drop-food [1 1])))
+      (let [rejected (message-of #(actors/call! (world "main") :move {:bogus 1}))]
+        (assert (and rejected (str/includes? rejected "rejected")) (str "a rejection travels back as data, saw " rejected)))
+      (let [unknown (message-of #(actors/call! (world "main") :fly))]
+        (assert (and unknown (str/includes? unknown "rejected")) "an unknown message is rejected on the other silo too"))
+      (assert (= 5 (actors/call! (ledger "shared") :add 5)) "a persisting actor, written from this silo")
+      (println "second silo: ok"))
+    (finally
+      (actors/shutdown! silo))))

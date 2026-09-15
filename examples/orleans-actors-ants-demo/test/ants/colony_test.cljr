@@ -4,6 +4,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.clr.async.task.alpha :as t]
             [clojure.spec.alpha :as s]
+            [clojure.string :as str]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -20,17 +21,32 @@
   {:state ::count}
   (init [self id] 0)
   (call :get [self n] (reply n n))
-  (call :add ::amount [self n amount] (reply (+ n amount) (+ n amount))))
+  (call :add ::amount [self n amount] (reply (+ n amount) (+ n amount)))
+  (call :stop [self n] (actors/stop self) (reply :stopping n)))
+
+;; The same, persisting: it comes back where it left.
+(defactor ledger
+  {:state ::count :persist true}
+  (init [self id] 0)
+  (resume [self stored] stored)
+  (call :get [self n] (reply n n))
+  (call :add ::amount [self n amount] (reply (+ n amount) (+ n amount)))
+  (call :stop [self n] (actors/stop self) (reply :stopping n)))
 
 (def ^:private silo (atom nil))
+(def ^:private storage-dir
+  (System.IO.Path/Combine (System.IO.Path/GetTempPath) (str "ants-actors-" (System.Guid/NewGuid))))
 
 (use-fixtures :once
   (fn [f]
-    (reset! silo (actors/start! {:silo-port 11211 :gateway-port 30100}))
+    (reset! silo (actors/start! {:silo-port 11211 :gateway-port 30100 :storage-dir storage-dir}))
     (try
       (actors/call! (world "main") :configure #:world{:size 20 :seed 3 :food-places 10 :home-size 8})
       (f)
-      (finally (actors/shutdown! @silo)))))
+      (finally
+        (actors/shutdown! @silo)
+        (when (System.IO.Directory/Exists storage-dir)
+          (System.IO.Directory/Delete storage-dir true))))))
 
 (defn- step! [ids]
   (t/wait-all (mapv #(actors/call (ant %) :step) ids)))
@@ -75,8 +91,9 @@
                   :else (do (System.Threading.Thread/Sleep 20) (recur (inc n)))))
           "the trails are gone once the cast is handled"))))
 
-(deftest unknown-messages-are-errors
-  (is (thrown? Exception (actors/call! (ant 400) :fly))))
+(deftest unknown-messages-are-rejected
+  (is (thrown-with-msg? Exception #"rejected :fly" (actors/call! (ant 400) :fly)))
+  (is (zero? (:ant/steps (actors/call! (ant 400) :state))) "the sender's mistake did not restart the ant"))
 
 (deftest states-and-messages-are-described
   (let [{:keys [state call]} (actors/describe :world)]
@@ -128,3 +145,82 @@
     (doseq [[type payload] messages]
       (actors/call! (ant "under-test") type payload))
     (s/valid? ::model/ant-state (actors/call! (ant "under-test") :state))))
+
+;; ── Persistence ──────────────────────────────────────────────────
+
+(deftest persisting-actors-resume-where-they-left
+  (is (= 7 (actors/call! (ledger 1) :add 7)))
+  (is (= :stopping (actors/call! (ledger 1) :stop)) "deactivates after this message")
+  (is (= 7 (actors/call! (ledger 1) :get)) "a fresh activation resumed from the stored state")
+  (is (= 8 (actors/call! (ledger 1) :add 1)))
+  (testing "a crash restarts from the last stored state, which is the last one that conformed"
+    (is (thrown-with-msg? Exception #"does not conform" (actors/call! (ledger 1) :add -100)))
+    (is (= 8 (actors/call! (ledger 1) :get))))
+  (testing "without persistence a stop starts over"
+    (is (= 3 (actors/call! (counter 9) :add 3)))
+    (actors/call! (counter 9) :stop)
+    (is (= 0 (actors/call! (counter 9) :get))))
+  (testing "describe says so"
+    (is (true? (:persist (actors/describe :ledger))))
+    (is (false? (:persist (actors/describe :counter)))))
+  (testing "the state is an EDN file, what would be on the wire"
+    (is (= 8 (read-string (slurp (System.IO.Path/Combine storage-dir "ledger" "1.actor.edn"))))))
+  (testing "an id cannot escape the storage directory"
+    (is (thrown? Exception (actors/call! (ledger "../../escape") :get)))
+    (is (not (System.IO.File/Exists (System.IO.Path/Combine storage-dir ".." ".." "escape.actor.edn"))))))
+
+;; ── A second silo ────────────────────────────────────────────────
+
+(defn- run-second-silo
+  "Runs test/ants/second_silo.cljr in a second process that joins this test's
+   silo. Returns {:exit code :output text}."
+  []
+  (let [dotnet (or (System.Environment/GetEnvironmentVariable "DOTNET_HOST_PATH") System.Environment/ProcessPath)
+        app (.Location (System.Reflection.Assembly/GetEntryAssembly))
+        info (doto (System.Diagnostics.ProcessStartInfo. dotnet)
+               (.set_UseShellExecute false)
+               (.set_RedirectStandardOutput true)
+               (.set_RedirectStandardError true))]
+    (doseq [a [app "--clj-mode" "script" "test/ants/second_silo.cljr"]] (.Add (.ArgumentList info) a))
+    (doseq [[k v] {"SILO_PORT" "11212" "GATEWAY_PORT" "30101" "PRIMARY_PORT" "11211"
+                   "ACTORS_DIR" storage-dir "CLOJURE_LOAD_PATH" "test"}]
+      (.set_Item (.Environment info) k v))
+    (let [process (System.Diagnostics.Process/Start info)
+          output (.ReadToEndAsync (.StandardOutput process))
+          errors (.ReadToEndAsync (.StandardError process))]
+      (when-not (.WaitForExit process 180000)
+        (.Kill process true)
+        (throw (ex-info "the second silo did not finish in time" {})))
+      {:exit (.ExitCode process)
+       :output (str (t/result output) "\n" (t/result errors))})))
+
+(defn- cluster-recovered?
+  "After a silo leaves, the others need a moment to see it gone and to take
+   over its share of the grain directory; until then messages routed through
+   it fail. True once this silo counts one active silo and both an existing
+   and a fresh actor answer again."
+  []
+  (loop [tries 0]
+    (let [ok? (try (and (= 1 (t/result (actors/active-silos @silo)))
+                        (actors/call! (world "main") :snapshot)
+                        (zero? (actors/call! (counter (str "probe-" tries)) :get)))
+                   (catch Exception _ false))]
+      (cond ok? true
+            (= tries 300) false
+            :else (do (System.Threading.Thread/Sleep 200) (recur (inc tries)))))))
+
+(deftest a-second-silo-reaches-the-same-actors
+  ;; The world is activated on this silo before the second one joins; the
+  ;; script asserts that what it sees is this world (size 20). Its effects are
+  ;; checked through a persisting actor: when a silo leaves, the others take
+  ;; over its share of the grain directory, and an actor whose registration
+  ;; was there is activated afresh, so an actor that does not persist can
+  ;; lose its state on a cluster change. The world does not persist; the
+  ;; ledger does.
+  (actors/call! (world "main") :look #:ant{:x 0 :y 0 :dir 0})
+  (let [{:keys [exit output]} (run-second-silo)]
+    (is (zero? exit) output)
+    (is (str/includes? output "second silo: ok") output)
+    (is (cluster-recovered?) "the cluster noticed the second silo leaving")
+    (is (= 5 (actors/call! (ledger "shared") :get))
+        "what the other silo wrote to a persisting actor is there after it left")))
