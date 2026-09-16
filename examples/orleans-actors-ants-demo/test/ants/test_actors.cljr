@@ -7,29 +7,40 @@
 
 ;; A counter: its state must stay a natural number.
 (s/def ::count nat-int?)
-(s/def ::amount int?)
+(s/def :counter/add int?)
 
 (defactor counter
   {:state ::count}
   (init [ctx id] 0)
-  (call :get [ctx n] (reply n n))
-  (call :add ::amount [ctx n amount] (reply (+ n amount) (+ n amount)))
-  (call :stop [ctx n] (actors/stop ctx) (reply :stopping n)))
+  (call :counter/get ::count [ctx n] (reply n n))
+  (call :counter/add ::count [ctx n amount] (reply (+ n amount) (+ n amount)))
+  (call :counter/stop [ctx n] (actors/stop ctx) (reply :stopping n)))
 
 ;; The same, persisting: it comes back where it left.
+(s/def :ledger/add int?)
+
 (defactor ledger
   {:state ::count :persist true}
   (init [ctx id] 0)
   (resume [ctx stored] stored)
-  (call :get [ctx n] (reply n n))
-  (call :add ::amount [ctx n amount] (reply (+ n amount) (+ n amount)))
-  (call :forget [ctx n] (t/await (actors/forget ctx)) (actors/stop ctx) (reply :forgotten n))
-  (call :stop [ctx n] (actors/stop ctx) (reply :stopping n)))
+  (call :ledger/get ::count [ctx n] (reply n n))
+  (call :ledger/add ::count [ctx n amount] (reply (+ n amount) (+ n amount)))
+  (call :ledger/forget [ctx n] (t/await (actors/forget ctx)) (actors/stop ctx) (reply :forgotten n))
+  (call :ledger/stop [ctx n] (actors/stop ctx) (reply :stopping n)))
 
 ;; Keeps a note of every message in its own storage, outside its state.
+(s/def :diary/note string?)
+
 (defactor diary
   (init [ctx id] [])
-  (call :note [ctx entries text]
+  (call :diary/note [ctx entries text]
     (let [entries (conj entries text)]
       (t/await (actors/as-async (storage/write-state (:actor/storage ctx) :notes (:actor/id (:actor/self ctx)) entries)))
       (reply (count entries) entries))))
+
+;; Promises a natural number and answers with something else.
+(defactor liar
+  {:state ::count}
+  (init [ctx id] 0)
+  (call :liar/count ::count [ctx n] (reply -1 (inc n)))
+  (call :liar/asked [ctx n] (reply n n)))

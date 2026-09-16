@@ -26,31 +26,31 @@ the trails.
   {:state :ants.model/ant-state}                        ; spec of the state, optional
 
   (init [ctx id]                                        ; state on activation
-    (let [{:ant/keys [x y dir]} (t/await (actors/call ctx (world "main") :spawn id))]
+    (let [{:ant/keys [x y dir]} (t/await (actors/call ctx (world "main") :world/spawn id))]
       #:ant{:id id :x x :y y :dir dir :food? false :steps 0}))
 
-  (call :state [ctx state]                              ; request/response
+  (call :ant/state :ants.model/ant-state [ctx state]    ; request/response, with the reply's spec
     (reply state state))
 
-  (call :step [ctx {:ant/keys [x y dir] :as state}]
-    (let [look (t/await (actors/call ctx (world "main") :look (select-keys state [:ant/x :ant/y :ant/dir])))]
+  (call :ant/step :ants.model/action [ctx {:ant/keys [x y dir] :as state}]
+    (let [look (t/await (actors/call ctx (world "main") :world/look (select-keys state [:ant/x :ant/y :ant/dir])))]
       ...
-      (reply :moved (assoc state :ant/x nx :ant/y ny)))))
+      (reply :move (assoc state :ant/x nx :ant/y ny)))))
 ```
 
 | OTP | here | Orleans underneath |
 |---|---|---|
 | `GenServer.init/1` | `(init [ctx id] ...)` returns the state | `OnActivateAsync` |
-| `handle_call/3` | `(call :msg [ctx state payload] (reply value state))` | grain method `Call`, one message at a time |
-| `handle_cast/2` | `(cast :msg [ctx state payload] state)` | `[OneWay]` grain method `Cast` |
-| `handle_info/2` | `(info :msg [ctx state payload] state)` with `send-after` / `send-every` | grain timers, never concurrent with handlers |
-| `GenServer.call/2` | `(actors/call ctx ref :msg payload)` returns a Task; `call!` blocks | grain reference proxy |
-| `GenServer.cast/2` | `(actors/cast ctx ref :msg payload)` | |
+| `handle_call/3` | `(call :ant/step [ctx state payload] (reply value state))` | grain method `Call`, one message at a time |
+| `handle_cast/2` | `(cast :world/clear-trails [ctx state payload] state)` | `[OneWay]` grain method `Cast` |
+| `handle_info/2` | `(info :world/evaporate [ctx state payload] state)` with `send-after` / `send-every` | grain timers, never concurrent with handlers |
+| `GenServer.call/2` | `(actors/call ctx ref :world/look payload)` returns a Task; `call!` blocks | grain reference proxy |
+| `GenServer.cast/2` | `(actors/cast ctx ref :world/clear-trails payload)` | |
 | a pid | `(ant 7)`, `(world "main")`: refs are data, `{:actor/type :ant :actor/id "7"}` | virtual actors: exist when addressed, activated on first message, deactivated when idle |
 | a supervisor | `{:on-error :restart}` (default), `:resume` or `:stop` on the actor | the runtime re-initialises a crashed actor; the caller still gets the error |
 | `GenServer.stop/1` | `(actors/stop ctx)` | `DeactivateOnIdle` |
 | persistent state (Mnesia, ETS...) | `{:persist true}`, `(resume [ctx stored] ...)`, `(actors/forget ctx)` | the storage protocol, called by the runtime |
-| a typespec / struct | `{:state ::spec}` on the actor, `(call :move ::move [ctx state payload] ...)` on a handler | checked after every message, and on every incoming payload |
+| a typespec / struct | `{:state ::spec}` on the actor; `(s/def :world/move ...)` for a message's payload; `(call :world/move ::moved? ...)` for its reply | state and reply checked after every message, payload on every incoming one |
 
 **The context.** The first argument of every handler is the actor's context,
 a map with namespaced keys, and everything an actor does besides computing
@@ -84,8 +84,8 @@ looks at the state right after:
 
 ```clojure
 (let [system (local/system)]
-  (actors/call! system (world "main") :configure #:world{:size 20 :home-size 8})
-  (actors/call! system (ant 1) :step)
+  (actors/call! system (world "main") :world/configure #:world{:size 20 :home-size 8})
+  (actors/call! system (ant 1) :ant/step)
   (local/state system (world "main")))          ; the grid, with the ant on it
 ```
 
@@ -99,15 +99,22 @@ generated cases included, in about a second; `test/ants/colony_test.cljr`
 runs them on a real silo. A local tick of 30 ants takes about 3 ms against
 12 ms on a silo: the difference is Orleans doing its job.
 
-**State and messages as specs.** `src/ants/model.cljr` describes the colony
-with clojure.spec, using namespaced keys (`:ant/x`, `:cell/food`, `:world/size`,
-`:move/from`) so a map says what it is wherever it turns up. An actor with a
-`:state` spec has its state checked after `init` and after every message; a
-violation is a bug in the actor, so it fails and its `:on-error` policy
-applies (a restart, by default). A handler with a payload spec rejects
-payloads that do not conform before it runs: the caller gets an `ex-info`
-with the explanation and the actor is untouched. `(actors/describe :world)`
-shows the state spec, the messages and their payload specs.
+**State, messages and replies as specs.** `src/ants/model.cljr` describes the
+colony with clojure.spec, using namespaced keys (`:ant/x`, `:cell/food`,
+`:world/size`, `:move/from`) so a map says what it is wherever it turns up.
+A message type is a namespaced keyword too, and the spec registered under it
+is its payload: `(s/def :world/look (s/keys :req [:ant/x :ant/y :ant/dir]))`
+says both that `:world/look` is a message the world handles and what it
+carries, the way a key is declared. A call clause can name a spec for its
+reply, `(call :world/look ::look-view [ctx state pos] ...)`; a cast or an
+info message has no reply, its effect is the next state, which the `:state`
+spec covers. An actor with a `:state` spec has its state checked after `init`
+and after every message, and a reply is checked against its spec; a
+violation of either is a bug in the actor, so it fails and its `:on-error`
+policy applies (a restart, by default). A payload that does not conform is
+rejected before the handler runs: the caller gets an `ex-info` with the
+explanation and the actor is untouched. `(actors/describe :world)` shows the
+state spec and, per message, the payload and reply specs.
 The same specs generate the data for the property-based tests in
 `test/ants/logic_test.cljr`. The checks cost what `s/valid?` costs on the
 state, which on ClojureCLR is about 15 µs per validated map, so the grid is
@@ -130,7 +137,7 @@ fresh world and the whole grid is checked after every message:
     (let [system (local/system {:state-check 5000})]
       (doseq [[type payload] messages]
         (actors/call! system (world "main") type payload))
-      (s/valid? ::model/look-view (actors/call! system (world "main") :look #:ant{:x 0 :y 0 :dir 0})))))
+      (s/valid? ::model/look-view (actors/call! system (world "main") :world/look #:ant{:x 0 :y 0 :dir 0})))))
 ```
 
 Its first run found a real bug: configure a one-cell nest, spawn two ants,
@@ -212,8 +219,8 @@ persistence and the error policy, is Clojure.
   host for tests; `wire.cljr` values as EDN.
 - `src/orleans/actors/storage.cljr` the storage protocol; `storage/edn_files.cljr`,
   `storage/sqlite.cljr`, `storage/memory.cljr` its implementations.
-- `src/ants/model.cljr` the colony as specs: actor states, messages, what an
-  ant sees.
+- `src/ants/model.cljr` the colony as specs: actor states, messages and
+  replies, what an ant sees.
 - `src/ants/logic.cljr` the colony rules as pure functions (ranking, weighted
   random choice, evaporation), no actors involved.
 - `src/ants/world.cljr` the world actor: owns the grid, evaporates pheromone on

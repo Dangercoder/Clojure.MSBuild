@@ -1,9 +1,12 @@
 (ns ants.model
-  "The colony as clojure.spec specs: the state of the two actors and the
-   messages they accept. Keys are namespaced by what they describe (an ant,
-   a cell, the world, a move), so a map says what it is wherever it turns up.
-   The actors check their state against these specs after every message and
-   reject payloads that do not conform; the tests generate data from them."
+  "The colony as clojure.spec specs: the state of the two actors, the
+   messages they accept and what they answer. Keys are namespaced by what
+   they describe (an ant, a cell, the world, a move), so a map says what it
+   is wherever it turns up; a message is a namespaced keyword whose spec is
+   its payload (:world/look is a message the world handles, carrying an
+   ant's position). The actors check their state and their replies against
+   these specs after every message and reject payloads that do not conform;
+   the tests generate data from them."
   (:require [clojure.spec.alpha :as s]))
 
 ;; ── An ant ───────────────────────────────────────────────────────
@@ -34,17 +37,21 @@
 (s/def :world/collected nat-int?)
 (s/def ::world-state (s/keys :req [:world/size :world/home :world/cells :world/collected]))
 
-;; :configure
+;; ── Messages the world handles, and their replies ────────────────
+
 (s/def :world/seed (s/int-in -2147483648 2147483648)) ; System.Random takes an Int32
 (s/def :world/home-size (s/int-in 1 100))
 (s/def :world/food-places (s/int-in 0 10000))
 (s/def :world/food-range (s/int-in 1 10000))          ; bounded: System.Random.Next takes an Int32
-(s/def ::configure
+(s/def :world/configure
   (s/and (s/keys :opt [:world/size :world/seed :world/home-size :world/food-places :world/food-range])
          (fn [{:world/keys [size home-size] :or {size 40 home-size 5}}] (< home-size size))))
+(s/def ::ok #{:ok})
 
-;; :look asks with the ant's position; the reply is what it sees
-(s/def ::look (s/keys :req [:ant/x :ant/y :ant/dir]))
+(s/def :world/spawn :ant/id)                          ; an ant asks for a place in the nest
+(s/def ::placed (s/keys :req [:ant/x :ant/y :ant/dir]))
+
+(s/def :world/look (s/keys :req [:ant/x :ant/y :ant/dir]))   ; an ant's position; the reply is what it sees
 (s/def :cell/ant? boolean?)
 (s/def ::view (s/keys :req [:cell/food :cell/pher :cell/home? :cell/ant?]))
 (s/def :view/here ::view)
@@ -53,7 +60,23 @@
 (s/def :view/right ::view)
 (s/def ::look-view (s/keys :req [:world/size :view/here :view/ahead :view/left :view/right]))
 
-;; :move
 (s/def :move/from ::loc)
 (s/def :move/to ::loc)
-(s/def ::move (s/keys :req [:ant/id :move/from :move/to]))
+(s/def :world/move (s/keys :req [:ant/id :move/from :move/to]))   ; the reply says whether the ant moved
+(s/def ::moved? boolean?)
+
+(s/def :world/take-food ::loc)                        ; the reply says whether there was food
+(s/def ::taken? boolean?)
+(s/def :world/drop-food ::loc)
+
+;; :world/snapshot carries nothing; the reply is a compact picture for rendering
+(s/def :snapshot/size :world/size)
+(s/def :snapshot/collected nat-int?)
+(s/def :snapshot/cells (s/coll-of (s/tuple nat-int? nat-int? nat-int? :cell/pher boolean? boolean?) :kind vector?))
+(s/def ::snapshot (s/keys :req [:snapshot/size :snapshot/collected :snapshot/cells]))
+
+;; ── Messages an ant handles ──────────────────────────────────────
+;; :ant/state and :ant/step carry nothing. :ant/state answers with the
+;; ant's state, :ant/step with what the ant did.
+
+(s/def ::action #{:take-food :drop-food :move :turn})

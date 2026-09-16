@@ -62,11 +62,11 @@
            (or (not= action :turn) (#{-1 1} amount))))))
 
 (defspec new-worlds-conform-to-their-spec 30
-  (prop/for-all [options (s/gen ::model/configure)]
+  (prop/for-all [options (s/gen :world/configure)]
     (s/valid? ::model/world-state (logic/new-world options))))
 
 (defspec looking-around-conforms-to-the-view-spec 50
-  (prop/for-all [options (s/gen ::model/configure)
+  (prop/for-all [options (s/gen :world/configure)
                  dir (s/gen :ant/dir)]
     (let [world (logic/new-world options)
           size (:world/size world)]

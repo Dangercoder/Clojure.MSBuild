@@ -1,8 +1,8 @@
 (ns ants.world
   "The world actor: one actor owns the grid (food, pheromone, who is where).
    Ants ask it what they see and tell it what they do. Pheromone evaporates
-   on a timer the actor sets for itself. Its state and messages are
-   described in ants.model."
+   on a timer the actor sets for itself. Its state, its messages and its
+   replies are described in ants.model."
   (:require [orleans.actors :as actors :refer [defactor reply]]
             [ants.logic :as logic]
             [ants.model]))                             ; loads the specs
@@ -14,35 +14,35 @@
   {:state :ants.model/world-state}
 
   (init [ctx id]
-    (actors/send-every ctx 250 :evaporate)
+    (actors/send-every ctx 250 :world/evaporate)
     (logic/new-world {}))
 
-  (call :configure :ants.model/configure [ctx state options]
+  (call :world/configure :ants.model/ok [ctx state options]
     (reply :ok (logic/new-world options)))
 
-  (call :spawn :ant/id [ctx state id]
+  (call :world/spawn :ants.model/placed [ctx state id]
     (let [[state ant] (logic/spawn state id (rand-double))]
       (reply ant state)))
 
-  (call :look :ants.model/look [ctx state {:ant/keys [x y dir]}]
+  (call :world/look :ants.model/look-view [ctx state {:ant/keys [x y dir]}]
     (reply (logic/look state [x y] dir) state))
 
-  (call :move :ants.model/move [ctx state {:ant/keys [id] :move/keys [from to]}]
+  (call :world/move :ants.model/moved? [ctx state {:ant/keys [id] :move/keys [from to]}]
     (let [[state moved?] (logic/move state id from to)]
       (reply moved? state)))
 
-  (call :take-food :ants.model/loc [ctx state loc]
+  (call :world/take-food :ants.model/taken? [ctx state loc]
     (let [[state taken?] (logic/take-food state loc)]
       (reply taken? state)))
 
-  (call :drop-food :ants.model/loc [ctx state loc]
+  (call :world/drop-food :ants.model/ok [ctx state loc]
     (reply :ok (logic/drop-food state loc)))
 
-  (call :snapshot [ctx state]
+  (call :world/snapshot :ants.model/snapshot [ctx state]
     (reply (logic/snapshot state) state))
 
-  (cast :clear-trails [ctx state]
+  (cast :world/clear-trails [ctx state]
     (update state :world/cells (fn [cells] (into {} (map (fn [[loc c]] [loc (dissoc c :cell/pher)])) cells))))
 
-  (info :evaporate [ctx state]
+  (info :world/evaporate [ctx state]
     (logic/evaporate state)))

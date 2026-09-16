@@ -27,12 +27,16 @@
 
    Messages and states are Clojure values. Inside a silo they are passed by
    reference (they are immutable); between silos, and in a file storage,
-   they are EDN (orleans.actors.wire), so they have to be data. State and
-   messages can be described with clojure.spec: a `:state` spec is checked
-   after init and after every message (a violation is a bug in the actor
-   and restarts it), a spec on a handler is checked on the incoming payload
-   (a violation is a bad message and is rejected without touching the
-   actor). `describe` shows what an actor type expects."
+   they are EDN (orleans.actors.wire), so they have to be data.
+
+   A message type is a namespaced keyword, :world/look, and when a spec is
+   registered under it that spec describes the payload: the keyword says
+   both that this is a message the world handles and what it carries. A
+   `:state` spec is checked after init and after every message, and a call
+   clause can name a spec for its reply; a violation of either is a bug in
+   the actor and restarts it. A payload that does not conform is a bad
+   message and is rejected without touching the actor. `describe` shows
+   what an actor type expects."
   (:refer-clojure :exclude [cast])
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.spec.alpha :as s]
@@ -148,7 +152,9 @@
       :cast     {msg-type (fn [ctx state payload] state)}
       :info     {msg-type (fn [ctx state payload] state)}
       :state    spec of the state, optional
-      :specs    {:call {msg-type payload-spec} :cast {...} :info {...}}, optional
+      :replies  {msg-type reply-spec} for call messages, optional
+   Message types are namespaced keywords; the spec registered under one,
+   if any, is the spec of its payload.
       :persist  true to store the state, optional
       :on-error :restart | :resume | :stop}
    Handlers may return a Task<object> (t/async) instead of a value.
@@ -258,12 +264,21 @@
                           {:actor type :message msg-type :spec spec :state state})))))))
 
 (defn- payload-problem
-  "The rejection data when a payload does not conform to the handler's
-   spec, nil when it does or when the handler has no spec."
-  [definition kind type msg-type payload]
-  (when-let [spec (get-in definition [:specs kind msg-type])]
+  "The rejection data when a payload does not conform to the spec registered
+   under the message type, nil when it does or when there is no such spec."
+  [type msg-type payload]
+  (when-let [spec (s/get-spec msg-type)]
     (when-not (s/valid? spec payload)
-      {:actor type :message msg-type :spec spec :explain (s/explain-str spec payload)})))
+      {:actor type :message msg-type :spec msg-type :explain (s/explain-str spec payload)})))
+
+(defn- conform-reply!
+  "Throws when a call's reply does not conform to the spec the clause named."
+  [definition type msg-type value]
+  (when-let [spec (get-in definition [:replies msg-type])]
+    (when-not (s/valid? spec value)
+      (throw (ex-info (str "Actor " type ": the reply to " msg-type " does not conform to " spec ": "
+                           (s/explain-str spec value))
+                      {:actor type :message msg-type :spec spec :reply value})))))
 
 (defn- store!
   "Stores the state when the actor persists and the state changed."
@@ -302,14 +317,14 @@
    reply is what `call` expects, {:ok? true :value value} or {:ok? false
    :value rejection}; for a cast or an info message it is nil. A message
    the actor rejects, because no handler takes it or its payload does not
-   conform to the handler's spec, leaves the state as it is."
+   conform to the message's spec, leaves the state as it is."
   [ctx settings kind state msg-type payload]
   (t/async
     (let [type (:actor/type (:actor/self ctx))
           definition (definition-of type)
           handler (get-in definition [kind msg-type])
           problem (if handler
-                    (payload-problem definition kind type msg-type payload)
+                    (payload-problem type msg-type payload)
                     ;; an unknown message is the sender's mistake, not the actor's: rejected, no restart
                     {:actor type :message msg-type
                      :explain (str "no " (name kind) " handler for " msg-type)})]
@@ -329,6 +344,7 @@
                                            "; call handlers return (reply value state)")
                                       {:actor type :message msg-type})))
                   [value new-state] result]
+              (conform-reply! definition type msg-type value)
               (conform-state! definition (:state-check settings) type msg-type new-state state)
               (t/await (store! ctx definition new-state state))
               [{:ok? true :value value} new-state])
@@ -364,15 +380,16 @@
 ;; ── Introspection ────────────────────────────────────────────────
 
 (defn describe
-  "What an actor type expects: its state spec, the messages it handles and
-   their payload specs (as s/describe forms), whether it persists and its
-   error policy."
+  "What an actor type expects: its state spec, the messages it handles
+   with their payload specs and, for calls, their reply specs (as
+   s/describe forms), whether it persists and its error policy."
   [type]
   (let [definition (definition-of type)
         messages (fn [kind]
                    (into (sorted-map)
                          (map (fn [[msg-type _]]
-                                [msg-type (some-> (get-in definition [:specs kind msg-type]) s/describe)]))
+                                [msg-type (cond-> {:payload (some-> (s/get-spec msg-type) s/describe)}
+                                            (= kind :call) (assoc :reply (some-> (get-in definition [:replies msg-type]) s/describe)))]))
                          (get definition kind)))]
     {:type type
      :state (some-> (:state definition) s/describe)
@@ -385,7 +402,8 @@
 (defn message-generator
   "A test.check generator of [message-type payload] for the messages of the
    given kind (:call, :cast or :info) an actor type declares, with payloads
-   generated from their specs (nil for a message without one). With it a
+   generated from the specs registered under the message types (nil for a
+   message without one). With it a
    property can send an actor every valid message it accepts:
 
      (prop/for-all [[type payload] (actors/message-generator :world :call)]
@@ -400,7 +418,7 @@
     (when (empty? messages)
       (throw (ex-info (str "Actor " type " has no " (name kind) " messages") {:actor type})))
     (gen/one-of (for [[msg-type _] messages
-                      :let [spec (get-in definition [:specs kind msg-type])]]
+                      :let [spec (s/get-spec msg-type)]]
                   (gen/tuple (gen/return msg-type)
                              (if spec (s/gen spec) (gen/return nil)))))))
 
@@ -421,16 +439,24 @@
   "Defines an actor type and a function that returns references to its
    actors: (defactor ant ...) defines (ant id).
 
+     (s/def :counter/add int?)                 ; the payload of :counter/add
+
      (defactor counter
        \"Counts.\"
-       {:state ::count                      ; options, optional: spec of the state,
-        :on-error :restart}                 ;   error policy, :persist
-       (init [ctx id] 0)                    ; -> state
-       (call :get [ctx state] (reply state state))
-       (call :add ::amount [ctx state n]    ; optional spec of the payload
+       {:state ::count                           ; options, optional: spec of the state,
+        :on-error :restart}                      ;   error policy, :persist
+       (init [ctx id] 0)                         ; -> state
+       (call :counter/get ::count [ctx state]    ; optional spec of the reply
+         (reply state state))
+       (call :counter/add [ctx state n]
          (reply (+ state n) (+ state n)))
-       (cast :reset [ctx state] 0)
-       (info :tick [ctx state] (inc state)))
+       (cast :counter/reset [ctx state] 0)
+       (info :counter/tick [ctx state] (inc state)))
+
+   A message type is a namespaced keyword; the spec registered under it, if
+   any, is the spec of its payload, so a message is declared the way a key
+   is: (s/def :counter/add int?). A call clause may name a spec for its
+   reply after the message type.
 
    The first argument of every handler is the actor's context (see
    `context`): what it sends through (`call`, `cast`), its timers
@@ -440,10 +466,10 @@
    (see `reply`); cast and info handlers return the new state.
 
    With a :state spec the state is checked after init and after every
-   message; a violation is a bug in the actor, so the actor fails and its
-   :on-error policy applies. A payload that fails its spec is rejected
-   before the handler runs: the caller gets an ex-info, the actor is
-   untouched.
+   message, and a reply is checked against its spec; a violation is a bug
+   in the actor, so the actor fails and its :on-error policy applies. A
+   payload that fails its spec is rejected before the handler runs: the
+   caller gets an ex-info, the actor is untouched.
 
    With {:persist true} the state is stored after init and after every
    message that changed it, and an actor that is activated again (after
@@ -460,16 +486,21 @@
                     (call cast info) (let [[msg-type & more] clause
                                            [spec more] (if (vector? (first more)) [nil more] [(first more) (rest more)])
                                            [args & b] more]
+                                       (when-not (qualified-keyword? msg-type)
+                                         (throw (ex-info (str "defactor " name ": a message type is a namespaced keyword, like :"
+                                                              name "/" (clojure.core/name msg-type) ", got " msg-type) {})))
+                                       (when (and spec (not= kind 'call))
+                                         (throw (ex-info (str "defactor " name ": only a call has a reply to spec, " msg-type " is a " kind) {})))
                                        [(keyword kind) msg-type spec (handler-fn args b 3)])
                     (throw (ex-info (str "defactor " name ": unknown clause " kind) {}))))
         init (some (fn [[k _ _ f]] (when (= k :init) f)) clauses)
         resume (some (fn [[k _ _ f]] (when (= k :resume) f)) clauses)
         handlers (reduce (fn [m [k msg-type _ f]] (if (#{:init :resume} k) m (assoc-in m [k msg-type] f))) {} clauses)
-        specs (reduce (fn [m [k msg-type spec _]] (if spec (assoc-in m [k msg-type] spec) m)) {} clauses)]
+        replies (reduce (fn [m [_ msg-type spec _]] (if spec (assoc m msg-type spec) m)) {} clauses)]
     (when-not init
       (throw (ex-info (str "defactor " name ": an init clause is required") {})))
     `(do
-       (register-actor! ~type (merge {:init ~init :specs ~specs} (when ~resume {:resume ~resume}) ~handlers ~options))
+       (register-actor! ~type (merge {:init ~init :replies ~replies} (when ~resume {:resume ~resume}) ~handlers ~options))
        (defn ~(with-meta name {:doc (or doc (str "Reference to the " name " actor with the given id."))
                                :actor/type type})
          [~'id]

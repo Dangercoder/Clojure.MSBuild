@@ -29,22 +29,22 @@
   "One tick: every ant steps concurrently (each ant actor still handles its
    own message alone; the world serialises what they do to the grid)."
   [system ant-count]
-  (t/wait-all (mapv #(actors/call system (ant %) :step) (range ant-count))))
+  (t/wait-all (mapv #(actors/call system (ant %) :ant/step) (range ant-count))))
 
 (defn simulate!
   "Runs the simulation on the given actor system and returns the final
    snapshot."
   [system {:keys [ants ticks size render? seed]}]
   (let [w (world "main")]
-    (actors/call! system w :configure #:world{:size size :seed seed :food-places (quot (* size size) 50)
+    (actors/call! system w :world/configure #:world{:size size :seed seed :food-places (quot (* size size) 50)
                                               :home-size (logic/nest-size ants)})
     (when render? (render/clear!))
     (dotimes [tick ticks]
       (step-all! system ants)
       (when render?
-        (render/draw! (actors/call! system w :snapshot) tick)
+        (render/draw! (actors/call! system w :world/snapshot) tick)
         (Thread/Sleep 30)))
-    (actors/call! system w :snapshot)))
+    (actors/call! system w :world/snapshot)))
 
 (defn -main [& args]
   (let [options (parse-args args)
