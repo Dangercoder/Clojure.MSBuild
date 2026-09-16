@@ -1,42 +1,45 @@
 (ns ants.colony-test
   "Runs the actors for real: an Orleans silo in the test process. The tests
-   share the silo and the world, so each one uses its own ants."
+   share the silo and the world, so each one uses its own ants. What the
+   actors do is tested on the local system in ants.actors-test; here it is
+   Orleans: activation, timers, the wire, persistence on files and a second
+   silo."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.clr.async.task.alpha :as t]
-            [clojure.spec.alpha :as s]
-            [clojure.test.check.generators :as gen]
-            [clojure.test.check.properties :as prop]
-            [clojure.test.check.clojure-test :refer [defspec]]
-            [ants.model :as model]
-            [orleans.actors :as actors :refer [defactor reply]]
+            [clojure.string :as str]
+            [ants.test-actors :refer [counter ledger]]
             [ants.world :refer [world]]
-            [ants.ant :refer [ant]]))
+            [ants.ant :refer [ant]]
+            [orleans.actors :as actors]
+            [orleans.actors.silo :as silo]
+            [orleans.actors.storage :as storage]
+            [orleans.actors.storage.edn-files :as edn-files]))
 
-;; A throwaway actor for the state checks: its state must stay a natural number.
-(s/def ::count nat-int?)
-(s/def ::amount int?)
+(def ^:private storage-dir
+  (System.IO.Path/Combine (System.IO.Path/GetTempPath) (str "ants-actors-" (System.Guid/NewGuid))))
 
-(defactor counter
-  {:state ::count}
-  (init [self id] 0)
-  (call :get [self n] (reply n n))
-  (call :add ::amount [self n amount] (reply (+ n amount) (+ n amount))))
-
-(def ^:private silo (atom nil))
+(def ^:private store (edn-files/storage storage-dir))
+(def ^:private system (atom nil))
 
 (use-fixtures :once
   (fn [f]
-    (reset! silo (actors/start! {:silo-port 11211 :gateway-port 30100}))
+    (reset! system (silo/start! {:silo-port 11211 :gateway-port 30100 :storage store}))
     (try
-      (actors/call! (world "main") :configure #:world{:size 20 :seed 3 :food-places 10 :home-size 8})
+      (actors/call! @system (world "main") :world/configure #:world{:size 20 :seed 3 :food-places 10 :home-size 8})
       (f)
-      (finally (actors/shutdown! @silo)))))
+      (finally
+        (silo/shutdown! @system)
+        (when (System.IO.Directory/Exists storage-dir)
+          (System.IO.Directory/Delete storage-dir true))))))
+
+(defn- call! [ref type & [payload]]
+  (actors/call! @system ref type payload))
 
 (defn- step! [ids]
-  (t/wait-all (mapv #(actors/call (ant %) :step) ids)))
+  (t/wait-all (mapv #(actors/call @system (ant %) :ant/step) ids)))
 
 (defn- at-home? [state]
-  (:cell/home? (:view/here (actors/call! (world "main") :look (select-keys state [:ant/x :ant/y :ant/dir])))))
+  (:cell/home? (:view/here (call! (world "main") :world/look (select-keys state [:ant/x :ant/y :ant/dir])))))
 
 (defn- occupied? [snapshot {:ant/keys [x y]}]
   (some (fn [[cx cy _ _ _ ant?]] (and ant? (= cx x) (= cy y))) (:snapshot/cells snapshot)))
@@ -48,7 +51,7 @@
   (set (for [[x y _ _ _ ant?] (:snapshot/cells snapshot) :when ant?] [x y])))
 
 (deftest an-ant-is-created-on-first-contact
-  (let [{:ant/keys [x y food? steps] :as state} (actors/call! (ant 200) :state)]
+  (let [{:ant/keys [x y food? steps] :as state} (call! (ant 200) :ant/state)]
     (is (integer? x))
     (is (integer? y))
     (is (false? food?))
@@ -58,8 +61,8 @@
 (deftest ants-live-in-the-world
   (let [ids (range 100 105)]
     (dotimes [_ 30] (step! ids))
-    (let [states (mapv #(actors/call! (ant %) :state) ids)
-          snapshot (actors/call! (world "main") :snapshot)]
+    (let [states (mapv #(call! (ant %) :ant/state) ids)
+          snapshot (call! (world "main") :world/snapshot)]
       (is (every? #(= 30 (:ant/steps %)) states) "every ant handled every step")
       (is (every? #(occupied? snapshot %) states) "the world knows where each ant is")
       (is (some (complement at-home?) states) "at least one ant left the nest"))))
@@ -67,64 +70,108 @@
 (deftest casts-are-handled-eventually
   (let [ids (range 300 305)]
     (dotimes [_ 20] (step! ids))
-    (actors/cast (world "main") :clear-trails)
-    (let [trails (fn [] (count (filter #(pos? (nth % 3)) (:snapshot/cells (actors/call! (world "main") :snapshot)))))]
+    (actors/cast @system (world "main") :world/clear-trails)
+    (let [trails (fn [] (count (filter #(pos? (nth % 3)) (:snapshot/cells (call! (world "main") :world/snapshot)))))]
       (is (loop [n 0]
             (cond (zero? (trails)) true
                   (= n 50) false
                   :else (do (System.Threading.Thread/Sleep 20) (recur (inc n)))))
           "the trails are gone once the cast is handled"))))
 
-(deftest unknown-messages-are-errors
-  (is (thrown? Exception (actors/call! (ant 400) :fly))))
-
-(deftest states-and-messages-are-described
-  (let [{:keys [state call]} (actors/describe :world)]
-    (is (= '(keys :req [:world/size :world/home :world/cells :world/collected]) state))
-    (is (= '(keys :req [:ant/id :move/from :move/to]) (:move call)))
-    (is (nil? (:snapshot call)) "no payload spec")))
-
 (deftest bad-messages-are-rejected-without-touching-the-actor
   (let [ids (range 500 503)]
     (dotimes [_ 5] (step! ids))
-    (let [before (actors/call! (world "main") :snapshot)]
+    (let [before (call! (world "main") :world/snapshot)]
       (testing "the caller gets the explanation"
-        (is (thrown-with-msg? Exception #"rejected :move" (actors/call! (world "main") :move {:bogus 1})))
-        (is (thrown-with-msg? Exception #"rejected :look" (actors/call! (world "main") :look #:ant{:x -1 :y 2 :dir 9}))))
+        (is (thrown-with-msg? Exception #"rejected :world/move" (call! (world "main") :world/move {:bogus 1})))
+        (is (thrown-with-msg? Exception #"rejected :world/fly" (call! (world "main") :world/fly))))
       (testing "the world is untouched: no restart, same ants in place"
-        (is (= (ants-in before) (ants-in (actors/call! (world "main") :snapshot))))))))
+        (is (= (ants-in before) (ants-in (call! (world "main") :world/snapshot))))))))
 
 (deftest values-survive-the-wire
   (testing "what another silo would receive"
     (let [payload {:a [1 2.5 "three" :four 'five] :s #{1 2} :nested {:deep [nil true]}}]
-      (is (= payload (actors/round-trip @silo :any payload))))
-    (is (= 'clojure.core/inc (actors/round-trip @silo :any #'clojure.core/inc)) "a var travels as its symbol"))
+      (is (= payload (silo/round-trip @system :test/any payload))))
+    (is (= 'clojure.core/inc (silo/round-trip @system :test/any #'clojure.core/inc)) "a var travels as its symbol")
+    (is (= (ant 3) (silo/round-trip @system :test/any (ant 3))) "a ref is data"))
   (testing "a function cannot leave the process"
-    (is (thrown-with-msg? Exception #"cannot leave the process" (actors/round-trip @silo :any {:f (fn [] 1)})))))
+    (is (thrown-with-msg? Exception #"cannot leave the process" (silo/round-trip @system :test/any {:f (fn [] 1)})))))
 
 (deftest a-state-violation-restarts-the-actor
-  (is (= 2 (actors/call! (counter 1) :add 2)))
-  (is (= 5 (actors/call! (counter 1) :add 3)))
-  (is (thrown-with-msg? Exception #"does not conform" (actors/call! (counter 1) :add -9))
+  (is (= 2 (call! (counter 1) :counter/add 2)))
+  (is (thrown-with-msg? Exception #"does not conform" (call! (counter 1) :counter/add -9))
       "the handler produced a negative count")
-  (is (= 0 (actors/call! (counter 1) :get)) "back to a fresh state")
-  (is (thrown-with-msg? Exception #"rejected :add" (actors/call! (counter 1) :add "two"))
-      "a bad payload is rejected instead")
-  (is (= 0 (actors/call! (counter 1) :get)) "and did not restart anything"))
+  (is (= 0 (call! (counter 1) :counter/get)) "back to a fresh state"))
 
-;; ── Every valid message, generated from the specs ────────────────
+;; ── Persistence ──────────────────────────────────────────────────
 
-(defspec the-world-handles-every-valid-message 100
-  (prop/for-all [messages (gen/vector (actors/message-generator :world :call) 1 5)]
-    (actors/check-state! 5000)                          ; check the whole grid after each message, not a sample
-    (try
-      (doseq [[type payload] messages]
-        (actors/call! (world "under-test") type payload))
-      (s/valid? ::model/look-view (actors/call! (world "under-test") :look #:ant{:x 0 :y 0 :dir 0}))
-      (finally (actors/check-state! true)))))
+(deftest persisting-actors-resume-where-they-left
+  (is (= 7 (call! (ledger 1) :ledger/add 7)))
+  (is (= :stopping (call! (ledger 1) :ledger/stop)) "deactivates after this message")
+  (is (= 7 (call! (ledger 1) :ledger/get)) "a fresh activation resumed from the stored state")
+  (is (= 8 (call! (ledger 1) :ledger/add 1)))
+  (testing "a crash restarts from the last stored state, which is the last one that conformed"
+    (is (thrown-with-msg? Exception #"does not conform" (call! (ledger 1) :ledger/add -100)))
+    (is (= 8 (call! (ledger 1) :ledger/get))))
+  (testing "the state is an EDN file, what would be on the wire"
+    (is (= 8 (read-string (slurp (System.IO.Path/Combine storage-dir "ledger" "1.edn")))))
+    (is (= 8 (storage/read-state store :ledger "1"))))
+  (testing "any id is a file inside the storage directory"
+    (is (= 1 (call! (ledger "../../escape") :ledger/add 1)))
+    (is (System.IO.File/Exists (System.IO.Path/Combine storage-dir "ledger" "%2E%2E%2F%2E%2E%2Fescape.edn")))))
 
-(defspec the-ant-handles-every-valid-message 30
-  (prop/for-all [messages (gen/vector (actors/message-generator :ant :call) 1 10)]
-    (doseq [[type payload] messages]
-      (actors/call! (ant "under-test") type payload))
-    (s/valid? ::model/ant-state (actors/call! (ant "under-test") :state))))
+;; ── A second silo ────────────────────────────────────────────────
+
+(defn- run-second-silo
+  "Runs test/ants/second_silo.cljr in a second process that joins this test's
+   silo. Returns {:exit code :output text}."
+  []
+  (let [dotnet (or (System.Environment/GetEnvironmentVariable "DOTNET_HOST_PATH") System.Environment/ProcessPath)
+        app (.Location (System.Reflection.Assembly/GetEntryAssembly))
+        info (doto (System.Diagnostics.ProcessStartInfo. dotnet)
+               (.set_UseShellExecute false)
+               (.set_RedirectStandardOutput true)
+               (.set_RedirectStandardError true))]
+    (doseq [a [app "--clj-mode" "script" "test/ants/second_silo.cljr"]] (.Add (.ArgumentList info) a))
+    (doseq [[k v] {"SILO_PORT" "11212" "GATEWAY_PORT" "30101" "PRIMARY_PORT" "11211"
+                   "ACTORS_DIR" storage-dir "CLOJURE_LOAD_PATH" "test"}]
+      (.set_Item (.Environment info) k v))
+    (let [process (System.Diagnostics.Process/Start info)
+          output (.ReadToEndAsync (.StandardOutput process))
+          errors (.ReadToEndAsync (.StandardError process))]
+      (when-not (.WaitForExit process 180000)
+        (.Kill process true)
+        (throw (ex-info "the second silo did not finish in time" {})))
+      {:exit (.ExitCode process)
+       :output (str (t/result output) "\n" (t/result errors))})))
+
+(defn- cluster-recovered?
+  "After a silo leaves, the others need a moment to see it gone and to take
+   over its share of the grain directory; until then messages routed through
+   it fail. True once this silo counts one active silo and both an existing
+   and a fresh actor answer again."
+  []
+  (loop [tries 0]
+    (let [ok? (try (and (= 1 (t/result (silo/active-silos @system)))
+                        (call! (world "main") :world/snapshot)
+                        (zero? (call! (counter (str "probe-" tries)) :counter/get)))
+                   (catch Exception _ false))]
+      (cond ok? true
+            (= tries 300) false
+            :else (do (System.Threading.Thread/Sleep 200) (recur (inc tries)))))))
+
+(deftest a-second-silo-reaches-the-same-actors
+  ;; The world is activated on this silo before the second one joins; the
+  ;; script asserts that what it sees is this world (size 20). Its effects are
+  ;; checked through a persisting actor: when a silo leaves, the others take
+  ;; over its share of the grain directory, and an actor whose registration
+  ;; was there is activated afresh, so an actor that does not persist can
+  ;; lose its state on a cluster change. The world does not persist; the
+  ;; ledger does.
+  (call! (world "main") :world/look #:ant{:x 0 :y 0 :dir 0})
+  (let [{:keys [exit output]} (run-second-silo)]
+    (is (zero? exit) output)
+    (is (str/includes? output "second silo: ok") output)
+    (is (cluster-recovered?) "the cluster noticed the second silo leaving")
+    (is (= 5 (call! (ledger "shared") :ledger/get))
+        "what the other silo wrote to a persisting actor is there after it left")))

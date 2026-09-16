@@ -1,0 +1,165 @@
+;; IHost and LogLevel live in shared-framework assemblies that are not loaded
+;; until something uses them; ClojureCLR resolves type names against loaded
+;; assemblies, so load them first.
+(assembly-load "Microsoft.Extensions.Hosting.Abstractions")
+(assembly-load "Microsoft.Extensions.Logging.Abstractions")
+
+(ns orleans.actors.silo
+  "Actors on Microsoft Orleans. `start` runs a silo in this process that
+   hosts every defined actor type and returns a system for `actors/call`
+   and `actors/cast`. Every actor type is hosted by the same Orleans grain
+   class (Clojure.Orleans.ActorGrain, in the glue); the grain key is
+   \"type/id\" and the runtime dispatches on the type. Orleans gives the
+   rest: actors are virtual (they exist as soon as they are addressed, are
+   activated on the first message and deactivated when idle), each actor
+   handles one message at a time, and a crashed actor is simply
+   re-initialised (:on-error). The context an actor gets here sends
+   through the grain factory and keeps its timers on the grain."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [clojure.string :as str]
+            [orleans.actors :as actors]
+            [orleans.actors.storage.edn-files :as edn-files]
+            [orleans.actors.wire :as wire])
+  (:import [Clojure.Orleans Actors ActorGrain ActorMessage ActorReply IActorHost IClojureWire]
+           [Microsoft.Extensions.Hosting IHost]
+           [Microsoft.Extensions.Logging LogLevel]
+           [System TimeSpan]
+           [System.Threading Timeout]))
+
+(set! *warn-on-reflection* true)
+
+(def ^:private task-of-object "System.Threading.Tasks.Task`1[System.Object]")
+
+;; ── Messages and refs on the grain side ──────────────────────────
+
+(defn- message ^ActorMessage [type payload]
+  (ActorMessage. (subs (str type) 1) payload))   ; keeps the namespace of a qualified keyword
+
+(defn- ref-key ^String [{:actor/keys [type id]}]
+  (str (name type) "/" id))
+
+(defn- key->ref [^String key]
+  (let [[type id] (str/split key #"/" 2)]
+    (actors/actor-ref (keyword type) id)))
+
+(defn- grain-call [factory ref type payload]
+  (t/async
+    (let [^ActorReply r (t/await (.Call (Actors/Ref factory (ref-key ref)) (message type payload)))]
+      {:ok? (.Ok r) :value (.Value r)})))
+
+(alter-meta! #'grain-call assoc :tag task-of-object)
+
+(defn- grain-cast [factory ref type payload]
+  (.Cast (Actors/Ref factory (ref-key ref)) (message type payload)))
+
+;; ── The context of an actor hosted by a grain ────────────────────
+
+(defrecord GrainMessaging [factory]
+  actors/Messaging
+  (-call [_ ref type payload] (grain-call factory ref type payload))
+  (-cast [_ ref type payload] (grain-cast factory ref type payload)))
+
+(defrecord GrainHost [^ActorGrain grain]
+  actors/Host
+  (-timer [_ type payload due period]
+    (.Timer grain (message type payload)
+            (TimeSpan/FromMilliseconds (double due))
+            (if period (TimeSpan/FromMilliseconds (double period)) Timeout/InfiniteTimeSpan)))
+  (-clear-timers [_] (.ClearTimers grain))
+  (-stop [_] (.Stop grain)))
+
+(defn- actor-host
+  "The IActorHost the grains call: it hands every event to the runtime with
+   a context for the grain, and keeps the state on the grain."
+  [storage settings]
+  (let [context (fn [^ActorGrain grain]
+                  (actors/context (key->ref (.Key grain)) (->GrainMessaging (.Factory grain)) storage (->GrainHost grain)))
+        handle (fn [kind ^ActorGrain grain ^ActorMessage message]
+                 (t/async
+                   (let [[reply state] (t/await (actors/handle (context grain) settings kind (.State grain)
+                                                               (keyword (.Type message)) (.Payload message)))]
+                     (set! (.State grain) state)
+                     (when reply
+                       (ActorReply. (boolean (:ok? reply)) (:value reply))))))]
+    (reify IActorHost
+      (OnActivate [_ grain]
+        (t/async
+          (set! (.State grain) (t/await (actors/activate (context grain) settings)))
+          nil))
+      (OnDeactivate [_ _grain _reason] (t/completed-task))
+      (OnCall [_ grain message] (handle :call grain message))
+      (OnCast [_ grain message] (handle :cast grain message))
+      (OnInfo [_ grain message] (handle :info grain message))
+      (OnError [_ grain error]
+        (t/async
+          (set! (.State grain) (t/await (actors/recover (context grain) settings (.State grain) error)))
+          nil)))))
+
+(defn- clojure-wire []
+  (reify IClojureWire
+    (Write [_ value] (wire/write value))
+    (Read [_ text] (wire/read text))))
+
+;; ── The silo ─────────────────────────────────────────────────────
+
+(defrecord Silo [^IHost host storage settings]
+  actors/Messaging
+  (-call [_ ref type payload] (grain-call (Actors/GrainFactory host) ref type payload))
+  (-cast [_ ref type payload] (grain-cast (Actors/GrainFactory host) ref type payload)))
+
+(defn start
+  "Starts an Orleans silo in this process hosting all defined actors and
+   returns a Task of the silo, a system for `actors/call` and
+   `actors/cast`. Options:
+     :silo-port    11111
+     :gateway-port 30000
+     :primary-port join the cluster whose primary silo listens on that port
+                   on this machine (the silo is a primary itself otherwise).
+                   Actors are shared by every silo of a cluster: an actor
+                   lives on one of them and is reached from all
+     :storage      where persisting actors keep their state, an
+                   orleans.actors.storage/Storage: EDN files under .actors in
+                   the working directory by default
+                   (orleans.actors.storage.edn-files); silos of one cluster
+                   share it
+     :state-check  see orleans.actors/settings
+     :log-level    LogLevel/Warning"
+  ([] (start {}))
+  ([{:keys [silo-port gateway-port primary-port storage log-level]
+     :or {silo-port 11111 gateway-port 30000 primary-port 0 log-level LogLevel/Warning}
+     :as options}]
+   (let [storage (or storage (edn-files/storage ".actors"))
+         settings (actors/settings options)]
+     (t/async
+       (let [host (t/await (Actors/StartSiloAsync (actor-host storage settings) (clojure-wire)
+                                                  (int silo-port) (int gateway-port) (int primary-port) log-level))]
+         (->Silo host storage settings))))))
+
+(alter-meta! #'start assoc :tag task-of-object)
+
+(defn start!
+  "Blocking start, for -main, tests and the REPL."
+  ([] (start! {}))
+  ([options] (t/result (start options))))
+
+(defn round-trip
+  "Serializes a message the way it would travel to another silo and reads
+   it back: what the other side would receive. For tests and curiosity."
+  [silo type payload]
+  (.Payload (Actors/RoundTrip (:host silo) (message type payload))))
+
+(defn active-silos
+  "A Task of the number of silos the cluster considers active, as seen
+   from this silo."
+  [silo]
+  (Actors/ActiveSiloCount (:host silo)))
+
+(defn shutdown
+  "Stops the silo started with start. Returns a Task."
+  [silo]
+  (Actors/StopSiloAsync (:host silo)))
+
+(defn shutdown!
+  "Blocking shutdown, for -main, tests and the REPL."
+  [silo]
+  (t/result (shutdown silo)))

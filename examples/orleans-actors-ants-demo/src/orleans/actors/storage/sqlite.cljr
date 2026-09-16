@@ -1,0 +1,68 @@
+;; Microsoft.Data.Sqlite and System.Data.Common are not loaded until
+;; something uses them; ClojureCLR resolves type names against loaded
+;; assemblies, so load them first.
+(assembly-load "System.Data.Common")
+(assembly-load "Microsoft.Data.Sqlite")
+
+(ns orleans.actors.storage.sqlite
+  "Storage in a SQLite database: one table, actors(type, id, state), the
+   state as EDN through orleans.actors.wire. Durable, shared by every silo
+   with access to the file, and the shape any database takes here:
+   Postgres or FoundationDB are these same three functions against a
+   server."
+  (:require [orleans.actors.storage :as storage]
+            [orleans.actors.wire :as wire])
+  (:import [Microsoft.Data.Sqlite SqliteConnection SqliteCommand SqliteParameter]
+           [System.Data.Common DbCommand]))
+
+(set! *warn-on-reflection* true)
+
+(defn- execute
+  "Runs sql with the named parameters on a connection from the pool and
+   returns what f makes of the command. SqliteCommand hides some members
+   of DbCommand with its own, so the command is used as a DbCommand."
+  [^String connection-string ^String sql parameters f]
+  (with-open [connection (SqliteConnection. connection-string)]
+    (.Open connection)
+    (let [^DbCommand command (SqliteCommand. sql connection)]
+      (doseq [[name value] parameters]
+        (.Add (.Parameters command) (SqliteParameter. ^String name value)))
+      (f command))))
+
+(defn- scalar [^DbCommand command] (.ExecuteScalar command))
+(defn- non-query [^DbCommand command] (.ExecuteNonQuery command))
+
+(defrecord Sqlite [^String connection-string]
+  storage/Storage
+  (read-state [_ type id]
+    (let [text (execute connection-string
+                        "SELECT state FROM actors WHERE type = $type AND id = $id"
+                        {"$type" (name type) "$id" (str id)}
+                        scalar)]
+      (if (string? text)
+        (wire/read text)
+        storage/none)))
+  (write-state [_ type id state]
+    (execute connection-string
+             "INSERT INTO actors (type, id, state) VALUES ($type, $id, $state)
+              ON CONFLICT (type, id) DO UPDATE SET state = excluded.state"
+             {"$type" (name type) "$id" (str id) "$state" (wire/write state)}
+             non-query)
+    nil)
+  (clear-state [_ type id]
+    (execute connection-string
+             "DELETE FROM actors WHERE type = $type AND id = $id"
+             {"$type" (name type) "$id" (str id)}
+             non-query)
+    nil))
+
+(defn storage
+  "Storage in the SQLite database at the given path, created with its table
+   when it does not exist."
+  [path]
+  (let [connection-string (str "Data Source=" path)]
+    (execute connection-string
+             "CREATE TABLE IF NOT EXISTS actors (type TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY (type, id))"
+             {}
+             non-query)
+    (->Sqlite connection-string)))

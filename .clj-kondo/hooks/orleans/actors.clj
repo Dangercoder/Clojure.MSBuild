@@ -16,7 +16,7 @@
   (let [[doc body] (if (string? (first body)) [(first body) (rest body)] [nil body])
         [options body] (if (map? (first body)) [(first body) (rest body)] [nil body])
         handlers (for [[kind & clause] body
-                       :let [clause (if (= kind 'init) clause (rest clause))          ; drop the message type
+                       :let [clause (if ('#{init resume} kind) clause (rest clause))  ; drop the message type
                              [spec clause] (if (vector? (first clause)) [nil clause] [(first clause) (rest clause)])
                              [args & handler-body] clause]]
                    `(clojure.core/fn ~args ~spec ~@args ~@handler-body))]                          ; the payload spec counts as used

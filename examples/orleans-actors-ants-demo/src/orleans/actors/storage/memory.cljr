@@ -1,0 +1,20 @@
+(ns orleans.actors.storage.memory
+  "Storage in an atom: for tests and the REPL. It lives as long as the
+   process, so a persisting actor still resumes after a stop or a crash."
+  (:require [orleans.actors.storage :as storage]))
+
+(defrecord Memory [store]
+  storage/Storage
+  (read-state [_ type id] (get @store [type id] storage/none))
+  (write-state [_ type id state] (swap! store assoc [type id] state) nil)
+  (clear-state [_ type id] (swap! store dissoc [type id]) nil))
+
+(defn storage
+  "A fresh in-memory storage."
+  []
+  (->Memory (atom {})))
+
+(defn contents
+  "Everything stored, as {[type id] state}."
+  [storage]
+  @(:store storage))

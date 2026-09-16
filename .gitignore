@@ -13,3 +13,4 @@ packages/
 *.swp
 .cpcache/
 .smoke/
+.actors/

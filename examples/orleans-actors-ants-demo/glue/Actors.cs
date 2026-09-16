@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Net;
 using System.Text;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -40,7 +41,8 @@ public interface IActorGrain : IGrainWithStringKey
     Task Cast(ActorMessage message);
 }
 
-/// <summary>Implemented in Clojure (orleans.actors) and installed with <see cref="Actors.SetHost"/>.</summary>
+/// <summary>Implemented in Clojure (orleans.actors.silo) and given to <see cref="Actors.StartSiloAsync"/>;
+/// grains receive it through dependency injection.</summary>
 public interface IActorHost
 {
     Task OnActivate(ActorGrain grain);
@@ -53,16 +55,22 @@ public interface IActorHost
 }
 
 /// <summary>How Clojure values are written to and read from the wire between silos. Implemented
-/// in Clojure (EDN with a tagged literal for vars) and installed with <see cref="Actors.SetWire"/>.</summary>
+/// in Clojure (EDN) and given to <see cref="Actors.StartSiloAsync"/>.</summary>
 public interface IClojureWire
 {
     string Write(object value);
     object Read(string text);
 }
 
-/// <summary>The generic grain. State and behaviour belong to the Clojure runtime.</summary>
+/// <summary>The generic grain. State and behaviour belong to the Clojure runtime; the grain keeps
+/// the state slot and the timers.</summary>
 public sealed class ActorGrain : Grain, IActorGrain
 {
+    private readonly IActorHost host;
+    private readonly List<IDisposable> timers = new();
+
+    public ActorGrain(IActorHost host) => this.host = host;
+
     /// <summary>The actor's state, owned by the Clojure runtime.</summary>
     public object? State { get; set; }
 
@@ -70,23 +78,20 @@ public sealed class ActorGrain : Grain, IActorGrain
 
     public IGrainFactory Factory => GrainFactory;
 
-    private static IActorHost Host =>
-        Actors.Host ?? throw new InvalidOperationException("The Clojure actor runtime is not started: call orleans.actors/start! first.");
-
-    public override Task OnActivateAsync(CancellationToken cancellationToken) => Host.OnActivate(this);
+    public override Task OnActivateAsync(CancellationToken cancellationToken) => host.OnActivate(this);
 
     public override Task OnDeactivateAsync(DeactivationReason reason, CancellationToken cancellationToken) =>
-        Host.OnDeactivate(this, reason.ReasonCode.ToString());
+        host.OnDeactivate(this, reason.ReasonCode.ToString());
 
     public async Task<ActorReply> Call(ActorMessage message)
     {
         try
         {
-            return (ActorReply)(await Host.OnCall(this, message))!;
+            return (ActorReply)(await host.OnCall(this, message))!;
         }
         catch (Exception e)
         {
-            await Host.OnError(this, e);
+            await host.OnError(this, e);
             throw;
         }
     }
@@ -95,16 +100,14 @@ public sealed class ActorGrain : Grain, IActorGrain
     {
         try
         {
-            await Host.OnCast(this, message);
+            await host.OnCast(this, message);
         }
         catch (Exception e)
         {
-            await Host.OnError(this, e);
+            await host.OnError(this, e);
             throw;
         }
     }
-
-    private readonly List<IDisposable> timers = new();
 
     /// <summary>Delivers <paramref name="message"/> to the actor's info handler after <paramref name="due"/>,
     /// then every <paramref name="period"/> (Timeout.InfiniteTimeSpan for a single delivery).
@@ -116,11 +119,11 @@ public sealed class ActorGrain : Grain, IActorGrain
             {
                 try
                 {
-                    await Host.OnInfo(this, message);
+                    await host.OnInfo(this, message);
                 }
                 catch (Exception e)
                 {
-                    await Host.OnError(this, e);
+                    await host.OnError(this, e);
                     throw;
                 }
             },
@@ -137,7 +140,7 @@ public sealed class ActorGrain : Grain, IActorGrain
     }
 
     /// <summary>Deactivates the actor once the current message is handled. It is re-activated
-    /// (with a fresh init) by the next message sent to it.</summary>
+    /// (with a fresh init, or a resume) by the next message sent to it.</summary>
     public void Stop() => DeactivateOnIdle();
 }
 
@@ -151,6 +154,10 @@ public sealed class ClojureValue { }
 /// </summary>
 public sealed class ClojureCodec : IGeneralizedCodec
 {
+    private readonly IClojureWire wire;
+
+    public ClojureCodec(IClojureWire wire) => this.wire = wire;
+
     public static bool IsClojureType(Type type) =>
         type == typeof(ClojureValue)
         || typeof(clojure.lang.IPersistentCollection).IsAssignableFrom(type)
@@ -160,9 +167,6 @@ public sealed class ClojureCodec : IGeneralizedCodec
         || type == typeof(clojure.lang.BigInt)
         || type == typeof(clojure.lang.Ratio);
 
-    private static IClojureWire Wire =>
-        Actors.Wire ?? throw new InvalidOperationException("The Clojure actor runtime is not started: call orleans.actors/start! first.");
-
     public bool IsSupportedType(Type type) => IsClojureType(type);
 
     public void WriteField<TBufferWriter>(ref Writer<TBufferWriter> writer, uint fieldIdDelta, Type expectedType, object value)
@@ -171,7 +175,7 @@ public sealed class ClojureCodec : IGeneralizedCodec
         if (ReferenceCodec.TryWriteReferenceField(ref writer, fieldIdDelta, expectedType, value))
             return;
 
-        var bytes = Encoding.UTF8.GetBytes(Wire.Write(value));
+        var bytes = Encoding.UTF8.GetBytes(wire.Write(value));
         writer.WriteFieldHeader(fieldIdDelta, expectedType, typeof(ClojureValue), WireType.LengthPrefixed);
         writer.WriteVarUInt32((uint)bytes.Length);
         writer.Write(bytes);
@@ -185,7 +189,7 @@ public sealed class ClojureCodec : IGeneralizedCodec
         field.EnsureWireType(WireType.LengthPrefixed);
         var length = reader.ReadVarUInt32();
         var bytes = reader.ReadBytes(length);
-        var value = Wire.Read(Encoding.UTF8.GetString(bytes));
+        var value = wire.Read(Encoding.UTF8.GetString(bytes));
         ReferenceCodec.RecordObject(reader.Session, value);
         return value;
     }
@@ -201,30 +205,44 @@ public sealed class ClojureCopier : IGeneralizedCopier
 
 public static class Actors
 {
-    public static IActorHost? Host { get; private set; }
-
-    public static IClojureWire? Wire { get; private set; }
-
-    public static void SetHost(IActorHost host) => Host = host;
-
-    public static void SetWire(IClojureWire wire) => Wire = wire;
-
     public static IActorGrain Ref(IGrainFactory factory, string key) => factory.GetGrain<IActorGrain>(key);
 
-    /// <summary>Starts an in-process Orleans silo (localhost clustering) and returns the host.</summary>
-    public static async Task<IHost> StartSiloAsync(int siloPort, int gatewayPort, LogLevel logLevel)
+    /// <summary>
+    /// Starts an Orleans silo in this process and returns the host. The actor host and the wire
+    /// are registered as services: grains and the codec get them injected, nothing is static.
+    /// Localhost clustering: the silo is the primary of its cluster unless
+    /// <paramref name="primarySiloPort"/> names the silo to join. Clustering across machines is
+    /// a membership provider here instead.
+    /// </summary>
+    public static async Task<IHost> StartSiloAsync(IActorHost actorHost, IClojureWire wire, int siloPort, int gatewayPort, int primarySiloPort, LogLevel logLevel)
     {
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
         builder.Logging.SetMinimumLevel(logLevel);
+        builder.Services.AddSingleton(actorHost);
+        builder.Services.AddSingleton(wire);
         builder.Services.AddSingleton<IGeneralizedCodec, ClojureCodec>();
         builder.Services.AddSingleton<IGeneralizedCopier, ClojureCopier>();
-        builder.UseOrleans(silo => silo.UseLocalhostClustering(siloPort, gatewayPort));
+        builder.UseOrleans(silo =>
+        {
+            if (primarySiloPort > 0)
+                silo.UseLocalhostClustering(siloPort, gatewayPort, new IPEndPoint(IPAddress.Loopback, primarySiloPort));
+            else
+                silo.UseLocalhostClustering(siloPort, gatewayPort);
+        });
         var host = builder.Build();
         await host.StartAsync();
         return host;
     }
 
-    public static IGrainFactory GrainFactory(IHost host) => (IGrainFactory)host.Services.GetService(typeof(IGrainFactory))!;
+    public static IGrainFactory GrainFactory(IHost host) => host.Services.GetRequiredService<IGrainFactory>();
+
+    /// <summary>The number of silos the cluster currently considers active.</summary>
+    public static async Task<int> ActiveSiloCount(IHost host)
+    {
+        var management = GrainFactory(host).GetGrain<IManagementGrain>(0);
+        var hosts = await management.GetHosts(onlyActive: true);
+        return hosts.Count;
+    }
 
     /// <summary>Serializes a message the way it would travel to another silo and reads it back.</summary>
     public static ActorMessage RoundTrip(IHost host, ActorMessage message)
