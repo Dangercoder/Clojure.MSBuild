@@ -1,0 +1,135 @@
+;; Npgsql and System.Data.Common are not loaded until something uses them;
+;; ClojureCLR resolves type names against loaded assemblies, so load them first.
+(assembly-load "System.Data.Common")
+(assembly-load "Npgsql")
+
+(ns bank.bench
+  "One account with a million entries (or --entries n): how long it takes to
+   activate it, to ask its balance at any moment, to find an old entry by
+   its transfer id and to book one more.
+
+   The account (\"bench-<n>\") is loaded straight into ledger_entries with
+   generate_series: n credits of 1, one a second from 2020-01-01, so entry
+   s has balance s and the balance at a moment is the number of seconds
+   since then. The table's constraints are dropped for the load and built
+   again after it, which is what a bulk load does. Then everything goes
+   through the account actor on a silo, the way the demo uses it."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [bank.account :refer [account]]
+            [bank.cluster :as cluster]
+            [orleans.actors :as actors]
+            [orleans.actors.silo :as silo])
+  (:import [Npgsql NpgsqlCommand NpgsqlConnection]
+           [System.Diagnostics Stopwatch]))
+
+(set! *warn-on-reflection* true)
+
+(def ^:private start-micros
+  "2020-01-01T00:00:00Z in microseconds since the epoch."
+  1577836800000000)
+
+(defn- log [& parts] (println (apply str parts)) (flush))
+
+(defn- sql
+  "Runs a statement (no timeout); returns the first column of the first row."
+  [^String statement]
+  (with-open [connection (NpgsqlConnection. (cluster/connection-string))]
+    (.Open connection)
+    (with-open [command (NpgsqlCommand. statement connection)]
+      (.set_CommandTimeout command 0)
+      (.ExecuteScalar command))))
+
+(defn- lines
+  "Runs a query and returns its first column, one string per row."
+  [^String statement]
+  (with-open [connection (NpgsqlConnection. (cluster/connection-string))]
+    (.Open connection)
+    (with-open [command (NpgsqlCommand. statement connection)]
+      (with-open [reader (.ExecuteReader command)]
+        (loop [rows []]
+          (if (.Read reader) (recur (conj rows (str (.GetValue reader 0)))) rows))))))
+
+(defn- seconds [^Stopwatch clock] (format "%.1f s" (/ (.ElapsedMilliseconds clock) 1000.0)))
+
+(def ^:private build
+  "Settings for building an index of a hundred million rows, in the same
+   command as the build (a setting lasts for the connection)."
+  "SET maintenance_work_mem = '1GB'; SET max_parallel_maintenance_workers = 4; ")
+
+(defn- load! [id n]
+  (let [loaded (sql (str "SELECT coalesce(max(seq), 0) FROM ledger_entries WHERE account_id = '" id "'"))]
+    (if (= n (long loaded))
+      (log "Account " id " is loaded already: " n " entries.")
+      (let [clock (Stopwatch/StartNew)]
+        (when (pos? (long loaded))
+          (throw (ex-info (str id " is half loaded (" loaded " entries); delete its rows first") {})))
+        (log "Loading " n " entries into " id " (constraints dropped, built again after)...")
+        (sql "ALTER TABLE ledger_entries DROP CONSTRAINT ledger_entries_pkey, DROP CONSTRAINT ledger_entries_transfer")
+        (sql "DROP INDEX ledger_entries_booked_at")
+        (sql (str "INSERT INTO ledger_entries (account_id, seq, transfer_id, kind, amount, balance_after, booked_at) "
+                  "SELECT '" id "', s, 'b' || s, 2, 1, s, timestamptz '2020-01-01 00:00:00+00' + s * interval '1 second' "
+                  "FROM generate_series(1::bigint, " n "::bigint) AS s"))
+        (log "  rows in " (seconds clock))
+        (sql (str build "ALTER TABLE ledger_entries ADD CONSTRAINT ledger_entries_pkey PRIMARY KEY (account_id, seq)"))
+        (log "  primary key (account_id, seq) at " (seconds clock))
+        (sql (str build "ALTER TABLE ledger_entries ADD CONSTRAINT ledger_entries_transfer UNIQUE (account_id, transfer_id)"))
+        (log "  unique (account_id, transfer_id) at " (seconds clock))
+        (sql (str build "CREATE INDEX ledger_entries_booked_at ON ledger_entries (account_id, booked_at)"))
+        (sql "ANALYZE ledger_entries")
+        (log "  index (account_id, booked_at) and analyze at " (seconds clock))))))
+
+(defn- timed
+  "Calls f n times; returns [results {:p50 :p99 :max} in milliseconds]."
+  [n f]
+  (let [samples (vec (for [i (range n)]
+                       (let [clock (Stopwatch/StartNew)
+                             result (f i)]
+                         [result (.TotalMilliseconds (.Elapsed clock))])))
+        sorted (vec (sort (map second samples)))
+        at (fn [q] (nth sorted (min (dec (count sorted)) (long (* q (count sorted))))))]
+    [(mapv first samples) {:p50 (at 0.5) :p99 (at 0.99) :max (peek sorted)}]))
+
+(defn- ms [{:keys [p50 p99 max]}]
+  (format "p50 %.2f ms, p99 %.2f ms, max %.2f ms" p50 p99 max))
+
+(defn bench!
+  "Loads the account when needed and measures. Returns true when every
+   answer was the one expected."
+  [{:keys [entries samples] :or {entries 1000000 samples 1000}}]
+  (let [id (str "bench-" entries)
+        _ (load! id entries)
+        size (sql "SELECT pg_size_pretty(pg_total_relation_size('ledger_entries'))")
+        system (t/result (cluster/start-silo 8))
+        rng (System.Random. 42)]
+    (try
+      (log "")
+      (log "ledger_entries: " size " on disk, of which " entries " rows are " id ".")
+      ;; the first call through a fresh silo pays for placement and JIT: not the account's cost
+      (actors/call! system (account "bench-warmup") :account/summary)
+      (let [clock (Stopwatch/StartNew)
+            summary (actors/call! system (account id) :account/summary)]
+        (log "Activating the account (resume reads its last entry): "
+             (format "%.1f ms" (.TotalMilliseconds (.Elapsed clock))) ", " (pr-str (dissoc summary :account/at))))
+      (let [moments (vec (repeatedly samples #(+ start-micros (* 1000000 (long (inc (.Next rng (int entries))))) (.Next rng 1000000))))
+            [balances latency] (timed samples #(actors/call! system (account id) :account/balance-at (nth moments %)))
+            expected (mapv #(quot (- % start-micros) 1000000) moments)
+            right? (= balances expected)]
+        (log "Balance at " samples " random moments between 2020 and 2023: " (ms latency)
+             (if right? ", every one right" ", WRONG"))
+        (let [keys (vec (repeatedly samples #(str "b" (inc (.Next rng (int entries))))))
+              [found latency] (timed samples #(actors/call! system (account id) :account/entry (nth keys %)))
+              right-too? (= (map :entry/seq found) (map #(parse-long (subs % 1)) keys))]
+          (log "An old entry by its transfer id, " samples " times: " (ms latency) (if right-too? ", every one right" ", WRONG"))
+          (let [clock (Stopwatch/StartNew)
+                entry (actors/call! system (account id) :account/credit #:transfer{:id (str "bench-" (System.Guid/NewGuid)) :amount 5})
+                took (.TotalMilliseconds (.Elapsed clock))]
+            (log "Booking one more credit: " (format "%.1f ms" took) ", seq " (:entry/seq entry) ", balance " (:entry/balance entry))
+            (log "")
+            (log "The query behind a balance at a moment:")
+            (doseq [line (lines (str "EXPLAIN (ANALYZE, BUFFERS) SELECT balance_after FROM ledger_entries "
+                                     "WHERE account_id = '" id "' AND booked_at <= timestamptz '2021-07-15 12:00:00+00' "
+                                     "ORDER BY booked_at DESC LIMIT 1"))]
+              (log "  " line))
+            (and right? right-too? (= (inc entries) (:entry/seq entry))))))
+      (finally
+        (silo/shutdown! system)))))

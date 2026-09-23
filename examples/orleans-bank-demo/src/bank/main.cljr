@@ -2,8 +2,10 @@
   "dotnet run                      the chaos demo (see bank.chaos)
    dotnet run -- chaos --seconds 60 --silos 4 --accounts 50 --kill-every 4
    dotnet run -- silo 0            one silo of the cluster, until killed
-   dotnet run -- audit <run>       audit a past run, in a fresh silo"
+   dotnet run -- audit <run>       audit a past run, in a fresh silo
+   dotnet run -- bench [--entries 1000000]     one account with that many entries"
   (:require [bank.audit :as audit]
+            [bank.bench :as bench]
             [bank.chaos :as chaos]
             [bank.cluster :as cluster]
             [orleans.actors.silo :as silo]))
@@ -47,5 +49,6 @@
                 (System.Environment/Exit (if ok? 0 1)))
       "silo" (serve-silo (first more))
       "audit" (System.Environment/Exit (int (audit-run (first more))))
+      "bench" (System.Environment/Exit (if (bench/bench! (options more)) 0 1))
       (do (println "usage: dotnet run -- [chaos [--seconds n ...] | silo <i> | audit <run>]")
           (System.Environment/Exit 2)))))

@@ -1,51 +1,64 @@
-# A bank that survives `kill -9`: Orleans grain storage on PostgreSQL, from ClojureCLR
+# A bank that survives `kill -9`: Orleans on PostgreSQL, from ClojureCLR
 
 Accounts and transfers as Clojure actors on a cluster of
-[Microsoft Orleans](https://learn.microsoft.com/dotnet/orleans/) silos. Their
-state is persisted by Orleans' own grain storage in PostgreSQL, and a chaos
+[Microsoft Orleans](https://learn.microsoft.com/dotnet/orleans/) silos, with
+everything durable in PostgreSQL. An account keeps an append-only journal,
+one ledger row per entry with the balance after it, so its balance at any
+moment in the past is one index lookup, whether it has ten entries or a
+hundred million. Transfers are kept by Orleans' own grain storage. A chaos
 monkey kills a silo process every few seconds while thousands of transfers
 are in flight. At the end an audit reads the books back from the database:
-every transfer happened exactly once or not at all, and not one öre
-appeared or vanished.
+every transfer happened exactly once or not at all, every journal explains
+its balance entry by entry, and the books balanced at every moment of the
+run, not only at the end.
 
 ```
 docker compose up -d        # PostgreSQL 17 with Orleans' tables (sql/)
 dotnet run                  # 3 silos, 20 accounts, 30 s of transfers, a kill -9 every 6 s
 dotnet run -- chaos --silos 4 --accounts 50 --seconds 60 --kill-every 4 --workers 32
 dotnet run -- audit <run>   # audit a past run in a fresh process, from nothing but the database
+dotnet run -- bench         # one account with a million entries (--entries n for more): activation, balance at a moment
 dotnet test                 # the saga, a deterministic simulation of the cluster, and the real thing on PostgreSQL
 ```
 
 ```
 Starting 3 silos on PostgreSQL (logs in .bank/)...
-Cluster up: 3 silos. Run 20260923-201755: opening 20 accounts with 10000 each.
+Cluster up: 3 silos. Run 20260923-205429: opening 20 accounts with 10000 each.
 Moving money for 30 s with 16 drivers; a silo is killed every 6 s.
   0s  silos ●●●  transfers      0  retried calls     0  in accounts 200000 = 200000
-  2s  silos ●●●  transfers    482  retried calls     0  in accounts 188303 + 11697 in flight
-  4s  silos ●●●  transfers    945  retried calls     0  in accounts 185536 + 14464 in flight
-  ✗ kill -9 silo 1 (pid 13919)
-  6s  silos ●○●  transfers   1355  retried calls     6  in accounts (a silo is down, asking again)
-  8s  silos ●○●  transfers   1624  retried calls    13  in accounts 177804 + 22196 in flight
-  ↻ restart silo 1
- 10s  silos ●●●  transfers   1957  retried calls    13  in accounts 179820 + 20180 in flight
- 13s  silos ●●●  transfers   2365  retried calls    22  in accounts 185781 + 14219 in flight
-  ✗ kill -9 silo 2 (pid 13920)
-  ↻ restart silo 2
- 20s  silos ●●●  transfers   3289  retried calls    29  in accounts (a silo is down, asking again)
- 23s  silos ●●●  transfers   3781  retried calls    33  in accounts 184790 + 15210 in flight
-  ✗ kill -9 silo 2 (pid 13954)
- 25s  silos ●●○  transfers   4307  retried calls    33  in accounts 186916 + 13084 in flight
- 27s  silos ●●○  transfers   4813  retried calls    33  in accounts 185025 + 14975 in flight
-  ↻ restart silo 2
- 29s  silos ●●●  transfers   5290  retried calls    33  in accounts 193643 + 6357 in flight
+  2s  silos ●●●  transfers    408  retried calls     0  in accounts 198342 + 1658 in flight
+  4s  silos ●●●  transfers    848  retried calls     0  in accounts 199818 + 182 in flight
+  ✗ kill -9 silo 0 (pid 19585)
+  ↻ restart silo 0
+ 11s  silos ●●●  transfers   2298  retried calls     9  in accounts (a silo is down, asking again)
+ 13s  silos ●●●  transfers   2826  retried calls    18  in accounts 195399 + 4601 in flight
+  ✗ kill -9 silo 0 (pid 19627)
+ 15s  silos ○●●  transfers   3304  retried calls    18  in accounts 195782 + 4218 in flight
+ 17s  silos ○●●  transfers   3736  retried calls    18  in accounts 194351 + 5649 in flight
+  ↻ restart silo 0
+ 19s  silos ●●●  transfers   4225  retried calls    18  in accounts 198998 + 1002 in flight
+ 22s  silos ●●●  transfers   4679  retried calls    18  in accounts 195933 + 4067 in flight
+ 24s  silos ●●●  transfers   5335  retried calls    18  in accounts 195964 + 4036 in flight
+  ✗ kill -9 silo 0 (pid 19648)
+ 26s  silos ○●●  transfers   5426  retried calls    24  in accounts 200000 = 200000
+  ↻ restart silo 0
+ 28s  silos ●●●  transfers   6066  retried calls    24  in accounts 195106 + 4894 in flight
 Time. Stopping the drivers and the monkey (3 silos killed).
- 33s  silos ●●●  transfers   5830  retried calls    33  in accounts 200000 = 200000
+ 33s  silos ●●●  transfers   6920  retried calls    24  in accounts 200000 = 200000
   every transfer is finished
 
-Audit of run 20260923-201755, from PostgreSQL:
-  transfers done 5154, declined for lack of funds 676, never started 0, pending 0
-  62 transfers were cut off by a crash and finished later by their reminder
+The books at moments of the run, each account asked for its balance then:
+  20:54:39.861759  accounts 197518 + on its way 2482 = 200000  ✓
+  20:54:48.407037  accounts 191166 + on its way 8834 = 200000  ✓
+  20:54:55.961890  accounts 193245 + on its way 6755 = 200000  ✓
+  20:55:03.109078  accounts 199373 + on its way 627 = 200000  ✓
+  20:55:10.014700  accounts 196904 + on its way 3096 = 200000  ✓
+
+Audit of run 20260923-205429, from PostgreSQL:
+  transfers done 6137, declined for lack of funds 783, never started 0, pending 0
+  10 transfers were cut off by a crash and finished later by their reminder
   money in the accounts 200000, opened with 200000
+  every journal explains its balance, entry by entry; the books balanced at each of the 13040 moments something was booked
   ✓ every transfer happened exactly once, or not at all; not one öre appeared or vanished
 ```
 
@@ -56,41 +69,57 @@ has to stay.
 
 ## What is in PostgreSQL
 
-Everything that has to survive a crash goes through Orleans' ADO.NET
-providers (`glue/Postgres.cs`), into Orleans' own tables (`sql/`, the
-scripts from the Orleans repository):
+Everything that has to survive a crash is committed to the database:
 
+- the accounts' journals (`ledger_entries`, `sql/09-ledger.sql`), the
+  bank's own table: one row per entry, never updated;
+- grain storage (`orleansstorage`), named `bank`: every transfer's and
+  every run's state, one row each, with the version Orleans uses as its
+  ETag;
 - cluster membership (`orleansmembershiptable`): which silos exist, so a
   restarted silo finds the others and a dead one is declared dead;
-- grain storage (`orleansstorage`), named `ledger`: every account's and
-  every transfer's state, one row each, with the version Orleans uses as
-  its ETag;
 - reminders (`orleansreminderstable`): durable timers, which is how an
   interrupted transfer gets finished.
 
-States are written by the actor library's EDN grain storage serializer, so
-a row is the Clojure value:
+The last three are Orleans' ADO.NET providers (`glue/Postgres.cs`) and
+Orleans' own tables (`sql/01`–`08`, the scripts from the Orleans
+repository). An account's journal is rows:
 
 ```
-$ psql -h localhost -p 5433 -U orleans bank -c "select convert_from(payloadbinary, 'UTF8') from orleansstorage where grainidextensionstring = 'transfer/20260923-201755-t42'"
-{:transfer/id "20260923-201755-t42", :transfer/status :done, :transfer/from "20260923-201755-a18", :transfer/to "20260923-201755-a13", :transfer/amount 1948}
+$ psql -h localhost -p 5433 -U orleans bank -c "select seq, transfer_id, kind, amount, balance_after, booked_at from ledger_entries where account_id = '20260923-205429-a3' order by seq limit 5"
+ seq |       transfer_id       | kind | amount | balance_after |           booked_at
+-----+-------------------------+------+--------+---------------+-------------------------------
+   1 | 20260923-205429-a3-open |    0 |  10000 |         10000 | 2026-09-23 20:54:39.360872+00
+   2 | 20260923-205429-t60     |    1 |    104 |          9896 | 2026-09-23 20:54:39.886476+00
+   3 | 20260923-205429-t130    |    2 |    345 |         10241 | 2026-09-23 20:54:39.983214+00
+   4 | 20260923-205429-t132    |    1 |   1115 |          9126 | 2026-09-23 20:54:39.99846+00
+   5 | 20260923-205429-t52     |    1 |   2118 |          7008 | 2026-09-23 20:54:40.011214+00
+```
+
+and a state in grain storage is the Clojure value, written by the actor
+library's EDN grain storage serializer:
+
+```
+$ psql -h localhost -p 5433 -U orleans bank -c "select convert_from(payloadbinary, 'UTF8') from orleansstorage where grainidextensionstring = 'transfer/20260923-205429-t60'"
+{:transfer/id "20260923-205429-t60", :transfer/status :done, :transfer/from "20260923-205429-a3", :transfer/to "20260923-205429-a1", :transfer/amount 104, :transfer/debited-at 1790196879886476, :transfer/credited-at 1790196880036079}
 ```
 
 ## Why it holds
 
-**An account's state is its own.** An account is an actor with
-`{:persist :ledger}`: its balance and its entries are its grain's record in
-the `ledger` grain storage, written by nothing but that account. There is no
-`UPDATE accounts SET balance = ...` from anywhere else, and no transaction
-across two accounts: money moves by messages. Orleans runs an actor one
-message at a time and commits its new state before the reply leaves, so a
-caller that got `:debited` knows the debit is in the database.
+**An account's journal is its own.** An account is a journaled actor
+(`{:journal :ledger}`, `src/bank/account.cljr`): what happened to it is its
+rows in `ledger_entries`, appended by nothing but that account. There is no
+`UPDATE accounts SET balance = ...` from anywhere, and no transaction across
+two accounts: money moves by messages. Orleans runs an actor one message at
+a time, and the account appends its entry before it replies, so a caller
+that got a debit entry knows the debit is in the database.
 
 **Every movement is idempotent.** A debit or credit carries the id of the
-transfer it belongs to, and an account records what it did for each id (its
-entries). A message it has heard before is answered from its entries, not
-applied again (`src/bank/account.cljr`). That is what makes retrying safe,
-and after a crash everything gets retried.
+transfer it belongs to, and the journal has one entry per transfer id at
+most (`unique (account_id, transfer_id)`). A message the account has heard
+before appends nothing: the insert finds the id and the account answers
+with the entry it booked then. That is what makes retrying safe, and after
+a crash everything gets retried.
 
 **A transfer is a saga with a durable timer.** A transfer is an actor of its
 own that owns the intent (`src/bank/transfer.cljr`):
@@ -111,13 +140,79 @@ alive, the transfer resumes from its stored state, and step 2 runs again.
 Whatever part of it had already happened is answered from the accounts'
 entries. The audit counts those transfers (`:transfer/recovered?`).
 
-**The ETag stops the one failure that is left.** While a cluster changes,
-Orleans can for a moment have the same actor active on two silos, each with
-the state it read. The record's version decides: the first write wins, the
-second fails with `InconsistentStateException`, and that activation restarts
-from what is stored. Without it, two activations of one account would each
-debit from the same balance, and the second write would silently erase the
-first.
+**The seq and the ETag stop the one failure that is left.** While a cluster
+changes, Orleans can for a moment have the same actor active on two silos,
+each with the state it read. For an account, the entry's seq decides: both
+activations append the seq after the end they read, the primary key
+`(account_id, seq)` takes the first, and the second fails and restarts
+from the journal. For a transfer in grain storage, the record's version does
+the same: the second write fails with `InconsistentStateException`. Without
+them, two activations of one account would each debit from the same
+balance, and the second would silently erase the first.
+
+## The balance at any moment
+
+Because an account is the only writer of its journal, it knows its next seq
+and its next balance without asking anyone, so every row can carry
+`balance_after`, the running balance, at no cost: no lock, no read before
+the write. That makes the balance at a moment the last row booked at or
+before it:
+
+```sql
+SELECT balance_after FROM ledger_entries
+WHERE account_id = $1 AND booked_at <= $2
+ORDER BY booked_at DESC LIMIT 1;
+```
+
+one descent of the `(account_id, booked_at)` index, which is the account's
+`:account/balance-at` (through `orleans.actors/entry-at`). An account's
+state in memory is only where its journal ends (seq, balance, time), so
+activating it reads one row too, however long its history.
+
+`dotnet run -- bench` loads an account with a million entries (one credit a
+second from 2020 on, straight into the table with `generate_series`) and
+asks it, through the actor on a silo:
+
+```
+ledger_entries: 210 MB on disk, of which 1000000 rows are bench-1000000.
+Activating the account (resume reads its last entry): 14,7 ms
+Balance at 1000 random moments between 2020 and 2023: p50 1,56 ms, p99 2,77 ms, max 16,19 ms, every one right
+An old entry by its transfer id, 1000 times: p50 1,62 ms, p99 2,24 ms, max 19,72 ms, every one right
+Booking one more credit: 76,0 ms, seq 1000001, balance 1000005
+
+  Limit  (actual time=0.073..0.074 rows=1 loops=1)
+    Buffers: shared hit=4
+    ->  Index Scan Backward using ledger_entries_booked_at on ledger_entries
+  Execution Time: 0.108 ms
+```
+
+The query reads four index pages; most of the 1.5 ms is the trip through
+Orleans and Npgsql. A B-tree over a hundred million rows of one account is
+one or two levels deeper than over a million, so the lookup should stay in
+the same range; `--entries 100000000` runs the same measurement at that
+size, which is not in this README (its rows alone are 9 GB before the
+indexes are built).
+
+**One moment for the whole bank.** Between a transfer's debit and its
+credit the money is in no account, so the accounts' balances at a moment
+add up to what was deposited minus what was on its way then. That only
+works if a credit is never booked before its debit, and the silos' clocks
+disagree. So an entry is booked at `max(the silo's clock, the account's
+previous entry + 1 µs, the time of the entry that caused it)`
+(`orleans.actors/next-at`): the credit message carries the debit's time.
+With that, the entries of all accounts up to any moment are a consistent
+cut. The audit sweeps every entry of the run in time order and checks,
+at each moment something was booked, that the accounts plus the money on
+its way hold what was deposited. The demo also asks the accounts for their
+balances at five moments of the run (the books at the end of the output).
+
+**What this does not do.** `booked_at` is when the bank recorded an entry.
+A bank that books entries with a value date in the past needs a second
+time axis (bitemporal data). An account that takes thousands of entries a
+second would need its appends batched, since an actor books one message at
+a time, or to be split into sub-accounts. A ledger with years of history
+would be partitioned by month, which keeps the lookup one descent.
+
 
 ## Tests
 
@@ -126,14 +221,20 @@ first.
 - `test/bank/bank_test.cljr`: the saga on the actor library's local host,
   with no Orleans and no database. A transfer moves money once, is
   declined without funds, and survives a crash before or after every
-  single write it causes. A stale second activation of an account cannot
-  overwrite it. The audit finds what is wrong.
+  single write it causes. An account answers a repeated message from its
+  journal, comes back from its last entry, and gives its balance at any
+  moment. A credit is never booked before its debit, even on a silo whose
+  clock is a second behind. A stale second activation cannot append past
+  the journal, nor overwrite a transfer's record. The audit finds what is
+  wrong.
 - **A deterministic simulation of the cluster.**
   `the-books-balance-whatever-crashes` generates everything: transfers
   started through either half of a split cluster, timer and reminder
-  ticks, splits (`local/fork`: a second system on the same storage, so
-  actors can be active twice), heals, restarts of the whole cluster, and
-  the exact writes that crash, before or after being stored. The local
+  ticks, splits (`local/fork`: a second system on the same storage and
+  journals, so actors can be active twice, with a clock up to five seconds
+  off), heals, restarts of the whole cluster, and the exact writes that
+  crash, before or after being stored. After each case the audit checks
+  the books at every moment of it. The local
   host does nothing the test does not say, on the test's thread, so every
   case is reproducible from its seed and a failure shrinks to the smallest
   schedule that breaks. With the version check switched off, test.check finds
@@ -147,6 +248,13 @@ first.
   ;; one it never saw
   ```
 
+  The same with the journal's seq check switched off:
+  `[[:split 0] [:transfer 0 0 1 1] [:tick 1] [:transfer 0 0 1 1] [:tick 0]]`.
+  And with the credit ignoring its debit's time, test.check finds that a
+  clock two milliseconds ahead is enough for a credit to be booked before
+  its debit, so that for a moment the money is in both accounts:
+  `[[:split 2000] [:transfer 0 0 1 1] [:tick 1] [:transfer 0 1 1 1]]`.
+
   This works because an actor handles one message at a time and its only
   contact with the outside world is its messages and its storage record,
   which has a small, precise contract (read with a version, write with it,
@@ -156,26 +264,33 @@ first.
   cluster runs, and the one thing it does not model is the thread
   scheduler.
 - `test/bank/postgres_test.cljr`: the real thing, when the database is up
-  (it says so and passes otherwise). An account's state is its own row, in
-  EDN, and a new silo resumes it. A row written behind an activation's back
-  makes its next write fail on the ETag, and the account restarts from the
-  row. A short chaos run with processes killed balances the books.
+  (it says so and passes otherwise). An account's journal is its rows in
+  `ledger_entries`, a new silo resumes it from the last one, and its
+  balance at a moment comes from the table. A row appended behind an
+  activation's back makes its next append fail on the seq, and the account
+  restarts from the table. A transfer's or run's state is its row in grain
+  storage, in EDN, and a row written behind its back makes the next write
+  fail on the ETag. A short chaos run with processes killed balances the
+  books.
 
 ## Layout
 
 - `src/bank/model.cljr` accounts, transfers and their messages as specs.
-- `src/bank/account.cljr` the account actor; `src/bank/transfer.cljr` the
+- `src/bank/account.cljr` the account actor and its journal;
+  `src/bank/ledger.cljr` the journal in PostgreSQL; `src/bank/transfer.cljr` the
   transfer saga; `src/bank/run.cljr` a run of the demo, so an audit can
   find its accounts and transfers later.
-- `src/bank/audit.cljr` the books check: a pure function of the states,
-  plus asking the actors for them.
+- `src/bank/audit.cljr` the books check: a pure function of the journals
+  and states, plus asking the actors for them.
 - `src/bank/cluster.cljr` silos and the client on PostgreSQL, silo
-  processes; `src/bank/chaos.cljr` the demo; `src/bank/main.cljr` the
-  command line.
+  processes; `src/bank/chaos.cljr` the demo; `src/bank/bench.cljr` the
+  million-entry account; `src/bank/main.cljr` the command line.
 - `glue/Postgres.cs` the Orleans configuration: ADO.NET clustering, the
-  `ledger` grain storage, reminders, failure detection tuned for a demo.
-- `sql/` Orleans' PostgreSQL scripts (dotnet/orleans v10.3.1, `src/AdoNet`),
-  run in order by `docker-compose.yml`.
+  `bank` grain storage, reminders, failure detection tuned for a demo.
+- `sql/` Orleans' PostgreSQL scripts (dotnet/orleans v10.3.1, `src/AdoNet`)
+  and the bank's `09-ledger.sql`, run in order by `docker-compose.yml`. A
+  database created before the ledger existed needs `09-ledger.sql` run by
+  hand, or `docker compose down -v` and up again.
 - The actor library, `orleans.actors`, and its C# glue are the ants
   example's (`../orleans-actors-ants-demo`), through
   `ClojureExtraSourceDirs` and a project reference.
@@ -195,6 +310,10 @@ first.
 - A silo started by the demo leaves the cluster gracefully when its standard
   input says `stop` or closes, so ending the demo, or killing the driver,
   leaves no silo behind. Silo logs are in `.bank/`.
-- An account keeps an entry for every transfer it took part in, forever. A
-  real ledger would drop entries after a retention window longer than any
-  retry can take, which is how payment APIs expire their idempotency keys.
+- Orleans has its own event-sourcing API, `JournaledGrain` with a custom
+  storage provider, for the same idea. The actor library keeps one grain
+  class for every actor type, so its journal is a host capability instead.
+- `bench` drops the table's constraints while it loads and builds them
+  again after: run it when nothing else uses the database. Its account
+  stays in the table; `DELETE FROM ledger_entries WHERE account_id LIKE
+  'bench-%'` removes it.

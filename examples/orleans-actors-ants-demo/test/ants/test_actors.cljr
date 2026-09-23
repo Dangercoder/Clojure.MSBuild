@@ -49,6 +49,27 @@
     (when (= 2 n) (t/await (actors/cancel-reminder ctx :nag/tick)))
     (inc n)))
 
+;; Journaled: every addition is an entry with the total after it, keyed by
+;; the id it comes with, so an addition that is repeated counts once.
+(s/def :tally/add (s/keys :req [:tally/id :tally/n]))
+(s/def :tally/id string?)
+(s/def :tally/n pos-int?)
+
+(defactor tally
+  {:journal :tallies}
+  (init [ctx id] {:total 0 :seq 0 :at 0})
+  (resume [ctx {:entry/keys [total seq at]}] {:total total :seq seq :at at})
+  (call :tally/add [ctx {:keys [total seq at] :as state} {:tally/keys [id n]}]
+    (let [entry #:entry{:seq (inc seq) :key id :total (+ total n) :at (actors/next-at ctx at)}
+          {:keys [appended? existing]} (t/await (actors/append! ctx entry))]
+      (if appended?
+        (reply (:entry/total entry) {:total (:entry/total entry) :seq (:entry/seq entry) :at (:entry/at entry)})
+        (reply (:entry/total existing) state))))
+  (call :tally/total-at [ctx state at]
+    (reply (:entry/total (t/await (actors/entry-at ctx at))) state))
+  (call :tally/entries [ctx state]
+    (reply (t/await (actors/entries ctx 0 100)) state)))
+
 ;; Promises a natural number and answers with something else.
 (defactor liar
   {:state ::count}

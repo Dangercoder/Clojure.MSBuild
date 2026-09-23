@@ -50,6 +50,7 @@ the trails.
 | a supervisor | `{:on-error :restart}` (default), `:resume` or `:stop` on the actor | the runtime re-initialises a crashed actor; the caller still gets the error |
 | `GenServer.stop/1` | `(actors/stop ctx)` | `DeactivateOnIdle` |
 | persistent state (DETS, Mnesia...) | `{:persist true}` or `{:persist :ledger}`, `(resume [ctx stored] ...)`, `(actors/forget ctx)` | the grain's own record in an Orleans grain storage (`IGrainStorage`), guarded by its ETag |
+| an event log per process (no OTP equivalent) | `{:journal :ledger}`, `(actors/append! ctx entry)`, `(actors/entry-at ctx t)` | a journal the host keeps (the bank: a PostgreSQL table); `JournaledGrain` is Orleans' own take |
 | a timer that survives a crash (no OTP equivalent) | `(actors/remind-every ctx ms :type)`, `(actors/cancel-reminder ctx :type)` | Orleans reminders, kept by the cluster's reminder service |
 | a typespec / struct | `{:state ::spec}` on the actor; `(s/def :world/move ...)` for a message's payload; `(call :world/move ::moved? ...)` for its reply | state and reply checked after every message, payload on every incoming one |
 
@@ -98,8 +99,10 @@ because they are Orleans: an actor calling itself works locally and
 deadlocks on a silo, and nothing crosses the wire locally.
 `local/restart` gives a system that kept only what a durable host keeps
 (the stored states and the reminders), as after every silo went down, and
-`local/fork` a second system on the same storage, so an actor can be active
-twice with the state each read, as it can be for a moment on a cluster. The
+`local/fork` a second system on the same storage and journals, so an actor
+can be active twice with the state each read, as it can be for a moment on
+a cluster, optionally with a clock that is off by a skew. The clock is
+logical, so nothing depends on the time of day. The
 stored records have versions that play the ETag: a write from an activation
 that is out of date throws. A `:crash` function makes writes fail before or
 after they are stored. Everything happens on the caller's thread in the
@@ -184,6 +187,24 @@ are written by an `IGrainStorageSerializer` that writes EDN, so a row in a
 database reads as the Clojure value it holds. The bank example
 (`../orleans-bank-demo`) runs the same library on PostgreSQL.
 
+**Journals.** An actor whose history matters more than its latest state is
+journaled: `{:journal :ledger}` instead of `:persist`. It appends entries to
+its own journal (`actors/append!`), each naming the seq it takes (the one
+after the last it knows of) and, optionally, an idempotency key; an append
+whose key is already there appends nothing and returns the entry recorded
+under it, and an append of a seq that is taken throws, which is the fence
+against a second activation of the same actor. On a fresh activation
+`resume` gets the last entry, so an entry carries what the state is rebuilt
+from (a running balance, say), and a long history costs nothing to
+activate. `actors/entry-at` gives the entry as of any moment,
+`entry-by-key` and `entries` the rest, and `actors/next-at` stamps an entry
+after the previous one and after its cause, whatever the silo's clock says.
+Where the entries go is an `orleans.actors.journal/Journal`, given to a
+silo by name (`:journals`); the actor never sees it, only its own journal
+through its host. The local system keeps journals in memory. The bank
+example keeps its accounts' journals in a PostgreSQL table, one row per
+entry.
+
 **Reminders.** A timer (`send-after`, `send-every`) belongs to the
 activation and ends with it. `(actors/remind-every ctx ms :type)` registers
 an Orleans reminder instead: kept by the cluster's reminder service, it
@@ -252,7 +273,8 @@ persistence and the error policy, is Clojure.
 
 - `src/orleans/actors.cljr` the DSL, the context protocols and the runtime.
 - `src/orleans/actors/silo.cljr` the Orleans host; `local.cljr` the in-process
-  host for tests; `wire.cljr` values as EDN.
+  host for tests; `journal.cljr` the journal protocol and its in-memory
+  implementation; `wire.cljr` values as EDN.
 - `src/ants/model.cljr` the colony as specs: actor states, messages and
   replies, what an ant sees.
 - `src/ants/logic.cljr` the colony rules as pure functions (ranking, weighted
