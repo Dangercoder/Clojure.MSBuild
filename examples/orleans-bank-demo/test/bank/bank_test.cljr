@@ -1,0 +1,204 @@
+(ns bank.bank-test
+  "The bank on the local system: no Orleans, no database, every crash
+   under the test's control. The runtime is the one the silos use, so the
+   saga proved here is the saga the chaos demo runs; bank.postgres-test
+   runs it on silos backed by PostgreSQL."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [bank.account :refer [account]]
+            [bank.audit :as audit]
+            [bank.run :as run]
+            [bank.transfer :refer [transfer]]
+            [orleans.actors :as actors]
+            [orleans.actors.local :as local]))
+
+(defn- open!
+  "Opens a run with n accounts of `opening` each."
+  [system run-id n opening]
+  (actors/call! system (run/run run-id) :run/open #:run{:accounts n :opening opening})
+  (doseq [i (range n)
+          :let [id (run/account-id run-id i)]]
+    (actors/call! system (account id) :account/deposit #:transfer{:id (audit/opening-id id) :amount opening})))
+
+(defn- start! [system run-id from to amount]
+  (let [[n _] (actors/call! system (run/run run-id) :run/reserve 1)
+        id (run/transfer-id run-id n)]
+    [id (actors/call! system (transfer id) :transfer/start
+                      #:transfer{:from (run/account-id run-id from) :to (run/account-id run-id to) :amount amount})]))
+
+(defn- balance [system run-id i]
+  (actors/call! system (account (run/account-id run-id i)) :account/get-balance))
+
+(defn- settle!
+  "Fires timers and reminders until no transfer has a reminder left, as the
+   cluster does over time. Returns the number of rounds it took."
+  [system]
+  (loop [rounds 0]
+    (local/run-timers! system)
+    (local/run-reminders! system)
+    (if (or (= rounds 50) (empty? @(:reminders system)))
+      rounds
+      (recur (inc rounds)))))
+
+(deftest a-transfer-moves-money-once
+  (let [system (local/system)]
+    (open! system "r" 2 100)
+    (let [[id reply] (start! system "r" 0 1 30)]
+      (is (= :pending reply) "accepted, nothing moved yet")
+      (is (= 100 (balance system "r" 0)))
+      (is (= {:transfer/retry {:due 5000 :period 5000}} (local/reminders system (transfer id)))
+          "the reminder is registered before anything moves")
+      (local/run-timers! system)
+      (is (= :done (actors/call! system (transfer id) :transfer/get-status)))
+      (is (= [70 130] [(balance system "r" 0) (balance system "r" 1)]))
+      (local/run-timers! system)
+      (is (empty? (local/reminders system (transfer id))) "settled: the reminder is gone")
+      (is (= :done (actors/call! system (transfer id) :transfer/start
+                                 #:transfer{:from "r-a0" :to "r-a1" :amount 30}))
+          "starting it again starts nothing")
+      (settle! system)
+      (is (= [70 130] [(balance system "r" 0) (balance system "r" 1)]))
+      (is (:ok? (audit/audit system "r"))))))
+
+(deftest a-transfer-without-funds-is-declined
+  (let [system (local/system)]
+    (open! system "r" 2 100)
+    (let [[id _] (start! system "r" 0 1 101)]
+      (settle! system)
+      (is (= :declined (actors/call! system (transfer id) :transfer/get-status)))
+      (is (= [100 100] [(balance system "r" 0) (balance system "r" 1)]))
+      (is (= [:declined 101] (get-in (actors/call! system (account "r-a0") :account/statement) [:account/entries id])))
+      (is (:ok? (audit/audit system "r"))))))
+
+(deftest an-account-answers-a-repeated-message-from-its-entries
+  (let [system (local/system)
+        debit #:transfer{:id "t" :amount 60}]
+    (actors/call! system (account "x") :account/deposit #:transfer{:id "open" :amount 100})
+    (is (= :debited (actors/call! system (account "x") :account/debit debit)))
+    (is (= :debited (actors/call! system (account "x") :account/debit debit)) "the same debit: the same answer")
+    (is (= 40 (actors/call! system (account "x") :account/get-balance)) "and the money moved once")
+    (is (= :declined (actors/call! system (account "x") :account/debit #:transfer{:id "u" :amount 60})))
+    (actors/call! system (account "x") :account/credit #:transfer{:id "v" :amount 500})
+    (is (= :declined (actors/call! system (account "x") :account/debit #:transfer{:id "u" :amount 60}))
+        "a declined debit stays declined, even once there is money")))
+
+(deftest a-transfer-survives-a-crash-at-every-write
+  ;; For each write a transfer causes (its own, the debit, the credit), a
+  ;; run where the host dies right before it, and one where it dies right
+  ;; after it; then the whole system restarts and the reminders do the rest.
+  (doseq [phase [:before-write :after-write]
+          nth-write (range 6)]
+    (testing (str "crash " (name phase) " write " nth-write)
+      (let [writes (atom 0)
+            armed (atom false)
+            system (local/system {:crash (fn [_ p]
+                                           (when @armed
+                                             (when (= p :before-write) (swap! writes inc))
+                                             (and (= p phase) (= (inc nth-write) @writes))))})]
+        (open! system "c" 2 100)
+        (reset! armed true)
+        (let [[id _] (try (start! system "c" 0 1 30) (catch Exception _ [(run/transfer-id "c" 0) nil]))
+              _ (try (local/run-timers! system) (catch Exception _ nil))
+              _ (reset! armed false)
+              system (local/restart system)]
+          (settle! system)
+          (let [status (actors/call! system (transfer id) :transfer/get-status)
+                books (audit/audit system "c")]
+            (is (#{:done :blank} status) "finished, or never started")
+            (when (and (= :done status) (= phase :before-write) (pos? nth-write))
+              (is (:transfer/recovered? (actors/call! system (transfer id) :transfer/show))
+                  "a crash after the start: its reminder finished it"))
+            (is (= (if (= :done status) [70 130] [100 100]) [(balance system "c" 0) (balance system "c" 1)]))
+            (is (:ok? books) (pr-str (:problems books)))))))))
+
+;; ── Two activations of one actor ─────────────────────────────────
+
+(deftest a-stale-activation-cannot-overwrite-the-account
+  ;; While a cluster changes, an actor can be active on two silos at once,
+  ;; each with the state it read. The storage's version decides: the first
+  ;; write wins, the second is refused and that activation starts over from
+  ;; what is stored.
+  (let [a (local/system)
+        b (local/fork a)]
+    (actors/call! a (account "x") :account/deposit #:transfer{:id "open" :amount 100})
+    (is (= 100 (actors/call! b (account "x") :account/get-balance)) "active in b too, with 100")
+    (is (= :debited (actors/call! a (account "x") :account/debit #:transfer{:id "t1" :amount 60})))
+    (is (thrown-with-msg? Exception #"Version conflict"
+                          (actors/call! b (account "x") :account/debit #:transfer{:id "t2" :amount 60}))
+        "b still believes in 100: its write is refused")
+    (is (= :declined (actors/call! b (account "x") :account/debit #:transfer{:id "t2" :amount 60}))
+        "restarted from what is stored, b sees 40")
+    (is (= 40 (actors/call! a (account "x") :account/get-balance)))))
+
+;; ── A deterministic simulation ───────────────────────────────────
+;; The operations, the crashes and the moments the cluster splits in two are
+;; all generated data, and the local systems do nothing the test did not
+;; say. A failure is reproducible from its seed and shrinks to the smallest
+;; schedule that breaks the books.
+
+(def ^:private op
+  (gen/frequency [[8 (gen/tuple (gen/return :transfer) (gen/choose 0 1) (gen/choose 0 3) (gen/choose 1 3) (gen/choose 1 80))]
+                  [3 (gen/tuple (gen/return :tick) (gen/choose 0 1))]
+                  [1 (gen/return [:split])]
+                  [1 (gen/return [:heal])]
+                  [1 (gen/return [:restart])]]))
+
+(def ^:private crashes
+  "Which writes crash, and when: [n :before-write] dies before the n-th
+   write of the run is stored, [n :after-write] right after."
+  (gen/set (gen/tuple (gen/choose 1 150) (gen/elements [:before-write :after-write])) {:max-elements 10}))
+
+(defn- step
+  "Applies one operation to the cluster, a vector of one or two systems on
+   the same storage."
+  [cluster [kind via a b amount]]
+  (let [system (nth cluster (mod (or via 0) (count cluster)))]
+    (case kind
+      :transfer (do (try (start! system "p" a (mod (+ a b) 4) amount) (catch Exception _ nil))
+                    cluster)
+      :tick (do (try (local/run-timers! system) (catch Exception _ nil))
+                (try (local/run-reminders! system) (catch Exception _ nil))
+                cluster)
+      :split (if (= 1 (count cluster)) (conj cluster (local/fork (first cluster))) cluster)
+      :heal [(first cluster)]
+      :restart [(local/restart (first cluster))])))
+
+(defn- simulate
+  "Runs the operations with the given crashes, then lets the cluster
+   settle without faults and audits the books."
+  [ops crash-set]
+  (let [writes (atom 0)
+        armed (atom false)
+        crash (fn [_ phase]
+                (when @armed
+                  (let [n (if (= phase :before-write) (swap! writes inc) @writes)]
+                    (contains? crash-set [n phase]))))
+        system (local/system {:crash crash})]
+    (open! system "p" 4 100)
+    (reset! armed true)
+    (let [cluster (reduce step [system] ops)]
+      (reset! armed false)
+      (let [system (local/restart (first cluster))]
+        (settle! system)
+        (audit/audit system "p")))))
+
+(defspec the-books-balance-whatever-crashes 100
+  (prop/for-all [ops (gen/vector op 1 40)
+                 crash-set crashes]
+    (:ok? (simulate ops crash-set))))
+
+(deftest the-audit-finds-what-is-wrong
+  (let [opening 100
+        accounts [#:account{:id "a" :balance 70 :entries {"a-open" [:deposit 100] "t" [:debit 30]}}
+                  #:account{:id "b" :balance 100 :entries {"b-open" [:deposit 100]}}]
+        transfers [#:transfer{:id "t" :status :done :from "a" :to "b" :amount 30}]
+        {:keys [ok? problems total expected]} (audit/check {:opening opening :accounts accounts :transfers transfers})]
+    (is (not ok?))
+    (is (= [170 200] [total expected]))
+    (is (some #(re-find #"t: done, but a has \[:debit 30\] and b has nil" %) problems) (pr-str problems)))
+  (is (:ok? (audit/check {:opening 100
+                          :accounts [#:account{:id "a" :balance 100 :entries {"a-open" [:deposit 100]}}]
+                          :transfers [#:transfer{:id "t" :status :blank}]}))
+      "a transfer nobody started moved nothing"))

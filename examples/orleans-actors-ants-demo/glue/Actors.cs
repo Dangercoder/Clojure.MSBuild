@@ -5,7 +5,10 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Orleans.Concurrency;
+using Orleans.Configuration;
+using Orleans.Hosting;
 using Orleans.Runtime;
+using Orleans.Storage;
 using Orleans.Serialization;
 using Orleans.Serialization.Buffers;
 using Orleans.Serialization.Cloning;
@@ -62,12 +65,25 @@ public interface IClojureWire
     object Read(string text);
 }
 
-/// <summary>The generic grain. State and behaviour belong to the Clojure runtime; the grain keeps
-/// the state slot and the timers.</summary>
-public sealed class ActorGrain : Grain, IActorGrain
+/// <summary>What a persisting actor's state is stored as: the Clojure value, written by
+/// <see cref="EdnGrainStorageSerializer"/> as EDN.</summary>
+[GenerateSerializer]
+public sealed class ClojureState
 {
+    [Id(0)] public object? Value { get; set; }
+}
+
+/// <summary>The generic grain. State and behaviour belong to the Clojure runtime; the grain keeps
+/// the state slot, the timers and reminders, and its own record in an Orleans grain storage.</summary>
+public sealed class ActorGrain : Grain, IActorGrain, IRemindable
+{
+    /// <summary>The state name of an actor's record in its grain storage.</summary>
+    public const string StateName = "state";
+
     private readonly IActorHost host;
     private readonly List<IDisposable> timers = new();
+    private readonly GrainState<ClojureState> stored = new(new ClojureState());
+    private IGrainStorage? storage;
 
     public ActorGrain(IActorHost host) => this.host = host;
 
@@ -139,6 +155,61 @@ public sealed class ActorGrain : Grain, IActorGrain
         timers.Clear();
     }
 
+    // ── Persistence: the actor's own record, nobody else's ──────────
+
+    private IGrainStorage Storage(string provider) =>
+        storage ??= ServiceProvider.GetKeyedService<IGrainStorage>(provider)
+                    ?? throw new InvalidOperationException(
+                        $"No grain storage named \"{provider}\" is configured on this silo (actor {Key})");
+
+    /// <summary>Reads the actor's record from the grain storage named <paramref name="provider"/>:
+    /// its state, or <paramref name="none"/> when nothing is stored. The record's ETag is kept, so a
+    /// write from a second activation of the same actor fails instead of overwriting.</summary>
+    public async Task<object?> ReadStored(string provider, object none)
+    {
+        await Storage(provider).ReadStateAsync(StateName, this.GetGrainId(), stored);
+        return stored.RecordExists ? stored.State.Value : none;
+    }
+
+    /// <summary>Writes the actor's record. Throws InconsistentStateException when the record
+    /// changed since this activation read it.</summary>
+    public Task WriteStored(string provider, object? value)
+    {
+        stored.State = new ClojureState { Value = value };
+        return Storage(provider).WriteStateAsync(StateName, this.GetGrainId(), stored);
+    }
+
+    /// <summary>Removes the actor's record.</summary>
+    public Task ClearStored(string provider) => Storage(provider).ClearStateAsync(StateName, this.GetGrainId(), stored);
+
+    // ── Reminders: durable timers, kept by the cluster's reminder service ──
+
+    /// <summary>Delivers a message of type <paramref name="name"/> to the actor's info handler after
+    /// <paramref name="due"/>, then every <paramref name="period"/>. Unlike a timer it outlives the
+    /// activation and the silo: the reminder service activates the actor wherever it is.</summary>
+    public Task Remind(string name, TimeSpan due, TimeSpan period) => this.RegisterOrUpdateReminder(name, due, period);
+
+    /// <summary>Cancels the reminder named <paramref name="name"/>, if there is one.</summary>
+    public async Task Unremind(string name)
+    {
+        var reminder = await this.GetReminder(name);
+        if (reminder is not null)
+            await this.UnregisterReminder(reminder);
+    }
+
+    public async Task ReceiveReminder(string reminderName, TickStatus status)
+    {
+        try
+        {
+            await host.OnInfo(this, new ActorMessage(reminderName, null));
+        }
+        catch (Exception e)
+        {
+            await host.OnError(this, e);
+            throw;
+        }
+    }
+
     /// <summary>Deactivates the actor once the current message is handled. It is re-activated
     /// (with a fresh init, or a resume) by the next message sent to it.</summary>
     public void Stop() => DeactivateOnIdle();
@@ -203,6 +274,32 @@ public sealed class ClojureCopier : IGeneralizedCopier
     public object? DeepCopy(object? input, CopyContext context) => input;
 }
 
+/// <summary>
+/// How grain storage writes an actor's state: as EDN text, the same as on the wire, so a row in the
+/// database reads as the Clojure value it holds. Other types go through Orleans' own serializer.
+/// </summary>
+public sealed class EdnGrainStorageSerializer : IGrainStorageSerializer
+{
+    private readonly IClojureWire wire;
+    private readonly OrleansGrainStorageSerializer fallback;
+
+    public EdnGrainStorageSerializer(IClojureWire wire, Serializer serializer)
+    {
+        this.wire = wire;
+        fallback = new OrleansGrainStorageSerializer(serializer);
+    }
+
+    public BinaryData Serialize<T>(T? input) =>
+        input is ClojureState state
+            ? BinaryData.FromString(wire.Write(state.Value!))
+            : fallback.Serialize(input);
+
+    public T? Deserialize<T>(BinaryData input) =>
+        typeof(T) == typeof(ClojureState)
+            ? (T)(object)new ClojureState { Value = wire.Read(input.ToString()) }
+            : fallback.Deserialize<T>(input);
+}
+
 public static class Actors
 {
     public static IActorGrain Ref(IGrainFactory factory, string key) => factory.GetGrain<IActorGrain>(key);
@@ -213,25 +310,66 @@ public static class Actors
     /// Localhost clustering: the silo is the primary of its cluster unless
     /// <paramref name="primarySiloPort"/> names the silo to join. Clustering across machines is
     /// a membership provider here instead.
+    /// <para><paramref name="configure"/>, when given, configures everything else about the silo:
+    /// clustering, grain storage, reminders. Without it the silo uses localhost clustering and keeps
+    /// actor states (in the "Default" grain storage) and reminders in memory.</para>
     /// </summary>
-    public static async Task<IHost> StartSiloAsync(IActorHost actorHost, IClojureWire wire, int siloPort, int gatewayPort, int primarySiloPort, LogLevel logLevel)
+    public static async Task<IHost> StartSiloAsync(IActorHost actorHost, IClojureWire wire, int siloPort, int gatewayPort, int primarySiloPort, LogLevel logLevel,
+                                                   Action<ISiloBuilder>? configure = null)
     {
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
         builder.Logging.SetMinimumLevel(logLevel);
         builder.Services.AddSingleton(actorHost);
-        builder.Services.AddSingleton(wire);
-        builder.Services.AddSingleton<IGeneralizedCodec, ClojureCodec>();
-        builder.Services.AddSingleton<IGeneralizedCopier, ClojureCopier>();
+        AddClojureValues(builder.Services, wire);
         builder.UseOrleans(silo =>
         {
-            if (primarySiloPort > 0)
-                silo.UseLocalhostClustering(siloPort, gatewayPort, new IPEndPoint(IPAddress.Loopback, primarySiloPort));
+            if (configure is not null)
+            {
+                silo.Configure<EndpointOptions>(o =>
+                {
+                    o.AdvertisedIPAddress = IPAddress.Loopback;
+                    o.SiloPort = siloPort;
+                    o.GatewayPort = gatewayPort;
+                });
+                configure(silo);
+            }
             else
-                silo.UseLocalhostClustering(siloPort, gatewayPort);
+            {
+                if (primarySiloPort > 0)
+                    silo.UseLocalhostClustering(siloPort, gatewayPort, new IPEndPoint(IPAddress.Loopback, primarySiloPort));
+                else
+                    silo.UseLocalhostClustering(siloPort, gatewayPort);
+                silo.AddMemoryGrainStorageAsDefault();
+                silo.UseInMemoryReminderService();
+            }
         });
         var host = builder.Build();
         await host.StartAsync();
         return host;
+    }
+
+    /// <summary>
+    /// Starts an Orleans client in this process: a process that sends to actors without hosting
+    /// any. <paramref name="configure"/> says how it finds the cluster (its clustering).
+    /// </summary>
+    public static async Task<IHost> StartClientAsync(IClojureWire wire, LogLevel logLevel, Action<IClientBuilder> configure)
+    {
+        var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
+        builder.Logging.SetMinimumLevel(logLevel);
+        AddClojureValues(builder.Services, wire);
+        builder.UseOrleansClient(configure);
+        var host = builder.Build();
+        await host.StartAsync();
+        return host;
+    }
+
+    /// <summary>Clojure values on the wire and in grain storage, through <paramref name="wire"/>.</summary>
+    private static void AddClojureValues(IServiceCollection services, IClojureWire wire)
+    {
+        services.AddSingleton(wire);
+        services.AddSingleton<IGeneralizedCodec, ClojureCodec>();
+        services.AddSingleton<IGeneralizedCopier, ClojureCopier>();
+        services.AddSingleton<IGrainStorageSerializer, EdnGrainStorageSerializer>();
     }
 
     public static IGrainFactory GrainFactory(IHost host) => host.Services.GetRequiredService<IGrainFactory>();

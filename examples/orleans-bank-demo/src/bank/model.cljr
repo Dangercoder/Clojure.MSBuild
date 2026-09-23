@@ -1,0 +1,65 @@
+(ns bank.model
+  "The bank as specs: what an account and a transfer are, and the messages
+   they take. Money is whole numbers (öre, cents); a balance is never
+   negative.
+
+   Every movement of money carries the id of the transfer it belongs to,
+   and an account records what it did for each id (its entries). That is
+   what makes a message safe to deliver twice: a debit the account already
+   made is answered from its entries instead of being made again, so a
+   transfer that crashed halfway can simply run again."
+  (:require [clojure.spec.alpha :as s]))
+
+(s/def ::amount (s/int-in 1 1000000))
+
+(s/def :account/id (s/and string? seq))
+(s/def :account/balance nat-int?)
+(s/def :transfer/id (s/and string? seq))
+(s/def :transfer/amount ::amount)
+
+;; ── Accounts ─────────────────────────────────────────────────────
+
+;; What an account did for a transfer: [kind amount]. :declined is a debit
+;; it refused for lack of funds, remembered so that it refuses it again.
+(s/def ::entry (s/tuple #{:deposit :debit :credit :declined} ::amount))
+(s/def :account/entries (s/every-kv :transfer/id ::entry))
+(s/def ::account (s/keys :req [:account/id :account/balance :account/entries]))
+
+(s/def ::movement (s/keys :req [:transfer/id :transfer/amount]))
+(s/def :account/deposit ::movement)
+(s/def :account/debit ::movement)
+(s/def :account/credit ::movement)
+
+(s/def ::debit-outcome #{:debited :declined})
+
+;; ── Transfers ────────────────────────────────────────────────────
+
+(s/def :transfer/from :account/id)
+(s/def :transfer/to :account/id)
+
+;; :blank a transfer nobody started; :pending started, money on its way;
+;; :done and :declined are final.
+(s/def :transfer/status #{:blank :pending :done :declined})
+
+(s/def :transfer/recovered? boolean?)          ; finished by its reminder, after a crash
+
+(s/def :transfer/start
+  (s/and (s/keys :req [:transfer/from :transfer/to :transfer/amount])
+         #(not= (:transfer/from %) (:transfer/to %))))
+
+(s/def ::transfer
+  (s/and (s/keys :req [:transfer/id :transfer/status]
+                 :opt [:transfer/from :transfer/to :transfer/amount :transfer/recovered?])
+         (fn [{:transfer/keys [status amount]}]
+           (or (= :blank status) (some? amount)))))
+
+;; ── A run of the demo ────────────────────────────────────────────
+
+(s/def :run/id (s/and string? seq))
+(s/def :run/accounts pos-int?)
+(s/def :run/opening ::amount)
+(s/def :run/reserved nat-int?)
+(s/def ::run (s/keys :req [:run/id :run/reserved] :opt [:run/accounts :run/opening]))
+
+(s/def :run/open (s/keys :req [:run/accounts :run/opening]))
+(s/def :run/reserve pos-int?)

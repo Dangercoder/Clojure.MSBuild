@@ -1,0 +1,30 @@
+(ns bank.run
+  "A run of the demo, as an actor: which accounts it opened, with how much,
+   and how many transfer ids it handed out. Everything a later audit needs
+   to find the run's accounts and transfers again, from nothing but the
+   database: accounts are \"<run>-a<i>\", transfers \"<run>-t<n>\".
+
+   Transfer ids are handed out in blocks (:run/reserve), so the drivers do
+   not ask for every single one. An id that was reserved and never used is
+   a transfer nobody started: :blank, which moved nothing."
+  (:require [bank.model :as model]
+            [orleans.actors :refer [defactor reply]]))
+
+(defn account-id [run i] (str run "-a" i))
+(defn transfer-id [run n] (str run "-t" n))
+
+(defactor run
+  "A run, addressed as (run id)."
+  {:state ::model/run :persist :ledger}
+
+  (init [ctx id]
+    #:run{:id id :reserved 0})
+
+  (call :run/open [ctx state {:run/keys [accounts opening]}]
+    (reply :ok (assoc state :run/accounts accounts :run/opening opening)))
+
+  (call :run/reserve [ctx {:run/keys [reserved] :as state} n]
+    (reply [reserved (+ reserved n)] (assoc state :run/reserved (+ reserved n))))
+
+  (call :run/show ::model/run [ctx state]
+    (reply state state)))

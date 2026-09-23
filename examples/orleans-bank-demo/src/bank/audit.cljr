@@ -1,0 +1,98 @@
+(ns bank.audit
+  "Checks a run's books: that no money appeared or vanished, and that every
+   transfer happened exactly once or not at all. `check` is a pure function
+   of the accounts' and transfers' states; `audit` asks the actors for
+   them, so it works the same on the local system in a test and against
+   the PostgreSQL-backed cluster, any time after the run."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [bank.account :refer [account]]
+            [bank.run :as run]
+            [bank.transfer :refer [transfer]]
+            [orleans.actors :as actors]))
+
+(defn opening-id
+  "The transfer id of an account's opening deposit."
+  [account-id]
+  (str account-id "-open"))
+
+(defn- entry-total [entries]
+  (reduce (fn [sum [_ [kind amount]]]
+            (case kind
+              (:deposit :credit) (+ sum amount)
+              :debit (- sum amount)
+              :declined sum))
+          0 entries))
+
+(defn check
+  "The findings for a run's final states: {:ok? :total :expected :counts
+   :recovered :problems}, :recovered the number of transfers a crash
+   interrupted and their reminder finished. `accounts` and `transfers` are the states the actors
+   report; `opening` what each account was opened with."
+  [{:keys [opening accounts transfers]}]
+  (let [by-id (into {} (map (juxt :account/id identity)) accounts)
+        entry (fn [account-id transfer-id] (get-in by-id [account-id :account/entries transfer-id]))
+        known (into (set (map (comp opening-id :account/id) accounts)) (map :transfer/id) transfers)
+        total (reduce + (map :account/balance accounts))
+        expected (* opening (count accounts))
+        problems
+        (concat
+          (when (not= total expected)
+            [(str "the accounts hold " total ", they were opened with " expected)])
+          (for [{:account/keys [id balance entries]} accounts
+                :let [explained (entry-total entries)]
+                :when (not= balance explained)]
+            (str id ": the balance is " balance " but its entries add up to " explained))
+          (for [{:account/keys [id entries]} accounts
+                [transfer-id _] entries
+                :when (not (known transfer-id))]
+            (str id ": an entry for " transfer-id ", which no transfer of the run knows"))
+          (when-not (every? #(= [:deposit opening] (entry (:account/id %) (opening-id (:account/id %)))) accounts)
+            ["an account was not opened with its deposit"])
+          (for [{:transfer/keys [id status from to amount]} transfers
+                :let [debit (entry from id) credit (entry to id)
+                      problem (case status
+                                :done (when-not (and (= [:debit amount] debit) (= [:credit amount] credit))
+                                        (str "done, but " from " has " (pr-str debit) " and " to " has " (pr-str credit)))
+                                :declined (when-not (and (= [:declined amount] debit) (nil? credit))
+                                            (str "declined, but " from " has " (pr-str debit) " and " to " has " (pr-str credit)))
+                                :pending "still pending"
+                                :blank nil)]
+                :when problem]
+            (str id ": " problem))
+          (for [{:transfer/keys [id status]} transfers
+                :when (= :blank status)
+                {:account/keys [entries] account-id :account/id} accounts
+                :when (contains? entries id)]
+            (str id ": never started, but " account-id " has an entry for it")))]
+    {:ok? (empty? problems)
+     :total total
+     :expected expected
+     :counts (frequencies (map :transfer/status transfers))
+     :recovered (count (filter :transfer/recovered? transfers))
+     :problems (vec problems)}))
+
+(defn- ask-all
+  "Sends the call to every ref, `width` at a time, and returns the replies."
+  [system refs type width]
+  (into []
+        (mapcat (fn [batch]
+                  (let [tasks (mapv #(actors/call system % type) batch)]
+                    (mapv t/result tasks))))
+        (partition-all width refs)))
+
+(defn audit
+  "Audits the run with the given id: reads its record, every account and
+   every transfer it handed out, and checks them. Blocking."
+  [system run-id]
+  (let [{:run/keys [accounts opening reserved]} (actors/call! system (run/run run-id) :run/show)]
+    (when-not accounts
+      (throw (ex-info (str "No run " run-id " was opened") {:run run-id})))
+    (check {:opening opening
+            :accounts (ask-all system (mapv #(account (run/account-id run-id %)) (range accounts)) :account/statement 64)
+            :transfers (ask-all system (mapv #(transfer (run/transfer-id run-id %)) (range reserved)) :transfer/show 256)})))
+
+(defn pending
+  "The ids of the run's transfers that are still :pending, out of those given."
+  [system transfer-ids]
+  (let [statuses (ask-all system (mapv transfer transfer-ids) :transfer/get-status 256)]
+    (vec (keep (fn [[id status]] (when (= :pending status) id)) (map vector transfer-ids statuses)))))

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- What the bank's silos run on: PostgreSQL, through Orleans' own ADO.NET providers, for
+       cluster membership, grain storage and reminders. The actor glue itself is the ants
+       example's (../../orleans-actors-ants-demo/glue). -->
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Bank.Orleans</RootNamespace>
+    <EnablePreviewFeatures>true</EnablePreviewFeatures>
+    <NoWarn>CA2252</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Orleans.Clustering.AdoNet" Version="10.3.1" />
+    <PackageReference Include="Microsoft.Orleans.Persistence.AdoNet" Version="10.3.1" />
+    <PackageReference Include="Microsoft.Orleans.Reminders.AdoNet" Version="10.3.1" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <ProjectReference Include="../../orleans-actors-ants-demo/glue/Clojure.Orleans.csproj" />
+  </ItemGroup>
+
+</Project>

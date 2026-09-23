@@ -1,0 +1,51 @@
+(ns bank.main
+  "dotnet run                      the chaos demo (see bank.chaos)
+   dotnet run -- chaos --seconds 60 --silos 4 --accounts 50 --kill-every 4
+   dotnet run -- silo 0            one silo of the cluster, until killed
+   dotnet run -- audit <run>       audit a past run, in a fresh silo"
+  (:require [bank.audit :as audit]
+            [bank.chaos :as chaos]
+            [bank.cluster :as cluster]
+            [orleans.actors.silo :as silo]))
+
+(defn- options [args]
+  (into {} (for [[k v] (partition 2 args)]
+             [(keyword (subs k 2)) (parse-long v)])))
+
+(defn- serve-silo
+  "Runs silo i until it is killed, or until its standard input says stop
+   or closes (the process that started it is gone): then it leaves the
+   cluster politely, so the others do not have to find out it is dead."
+  [i]
+  (let [i (parse-long i)
+        system (clojure.clr.async.task.alpha/result (cluster/start-silo i))
+        leave (fn [] (silo/shutdown! system) (System.Environment/Exit 0))]
+    (System.Console/add_CancelKeyPress
+      (gen-delegate System.ConsoleCancelEventHandler [_ _] (leave)))
+    (println "silo" i "up" (cluster/silo-ports i))
+    (flush)
+    (loop []
+      (let [line (read-line)]
+        (if (or (nil? line) (= "stop" line))
+          (leave)
+          (recur))))))
+
+(defn- audit-run [run-id]
+  ;; a silo of its own: this process hosts the actors it reads, resumed from PostgreSQL
+  (let [system (clojure.clr.async.task.alpha/result (cluster/start-silo 9))]
+    (try
+      (let [result (audit/audit system run-id)]
+        (chaos/report run-id result)
+        (if (:ok? result) 0 1))
+      (finally
+        (silo/shutdown! system)))))
+
+(defn -main [& args]
+  (let [[mode & more] args]
+    (case (or mode "chaos")
+      "chaos" (let [{:keys [ok?]} (chaos/demo! (options more))]
+                (System.Environment/Exit (if ok? 0 1)))
+      "silo" (serve-silo (first more))
+      "audit" (System.Environment/Exit (int (audit-run (first more))))
+      (do (println "usage: dotnet run -- [chaos [--seconds n ...] | silo <i> | audit <run>]")
+          (System.Environment/Exit 2)))))

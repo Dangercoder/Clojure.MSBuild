@@ -9,15 +9,11 @@
             [clojure.test.check.properties :as prop]
             [clojure.test.check.clojure-test :refer [defspec]]
             [ants.model :as model]
-            [ants.test-actors :refer [counter ledger diary liar]]
+            [ants.test-actors :refer [counter ledger liar vault nag]]
             [ants.world :refer [world]]
             [ants.ant :refer [ant]]
             [orleans.actors :as actors]
-            [orleans.actors.local :as local]
-            [orleans.actors.storage :as storage]
-            [orleans.actors.storage.edn-files :as edn-files]
-            [orleans.actors.storage.memory :as memory]
-            [orleans.actors.storage.sqlite :as sqlite]))
+            [orleans.actors.local :as local]))
 
 (defn- colony
   "A local system with a small configured world."
@@ -94,13 +90,12 @@
   (is (true? (:persist (actors/describe :ledger))))
   (is (false? (:persist (actors/describe :counter)))))
 
-;; ── Persistence, through the storage protocol ─────────────────────
+;; ── Persistence: each actor's own record, kept by the host ────────
 
 (deftest persisting-actors-resume-where-they-left
-  (let [store (memory/storage)
-        system (local/system {:storage store})]
+  (let [system (local/system)]
     (is (= 7 (actors/call! system (ledger 1) :ledger/add 7)))
-    (is (= 7 (storage/read-state store :ledger "1")) "stored after the message")
+    (is (= 7 (local/stored system (ledger 1))) "stored after the message")
     (is (= :stopping (actors/call! system (ledger 1) :ledger/stop)))
     (is (nil? (local/state system (ledger 1))) "deactivated")
     (is (= 7 (actors/call! system (ledger 1) :ledger/get)) "resumed from the stored state")
@@ -109,59 +104,41 @@
       (is (= 7 (actors/call! system (ledger 1) :ledger/get))))
     (testing "forget starts over"
       (is (= :forgotten (actors/call! system (ledger 1) :ledger/forget)))
-      (is (storage/none? (storage/read-state store :ledger "1")))
+      (is (actors/none? (local/stored system (ledger 1))))
       (is (= 0 (actors/call! system (ledger 1) :ledger/get))))
     (testing "without persistence a stop starts over"
       (is (= 3 (actors/call! system (counter 9) :counter/add 3)))
       (actors/call! system (counter 9) :counter/stop)
-      (is (= 0 (actors/call! system (counter 9) :counter/get))))
-    (testing "the same actors on a fresh system with the same storage"
-      (is (= 7 (actors/call! (local/system {:storage store}) (ledger 2) :ledger/add 7)))
-      (is (= 8 (actors/call! (local/system {:storage store}) (ledger 2) :ledger/add 1))))))
+      (is (= 0 (actors/call! system (counter 9) :counter/get)))
+      (is (actors/none? (local/stored system (counter 9))) "nothing stored"))
+    (testing "after a restart only what was stored is left"
+      (is (= 5 (actors/call! system (ledger 2) :ledger/add 5)))
+      (is (= 4 (actors/call! system (counter 2) :counter/add 4)))
+      (let [system (local/restart system)]
+        (is (empty? (local/active system)))
+        (is (= 6 (actors/call! system (ledger 2) :ledger/add 1)))
+        (is (= 0 (actors/call! system (counter 2) :counter/get)))))))
 
-(deftest an-actor-can-use-the-storage-itself
-  (let [store (memory/storage)
-        system (local/system {:storage store})]
-    (is (= 2 (do (actors/call! system (diary "d") :diary/note "one")
-                 (actors/call! system (diary "d") :diary/note "two"))))
-    (is (= ["one" "two"] (storage/read-state store :notes "d")))))
+(deftest a-named-storage-keeps-its-actors-apart
+  (let [system (local/system)]
+    (actors/call! system (vault 1) :vault/put "gold")
+    (is (= #{"gold"} (local/stored system (vault 1) "vaults")))
+    (is (actors/none? (local/stored system (vault 1))) "not in the default storage")
+    (is (= "vaults" (:storage (actors/describe :vault))))))
 
-(deftest edn-files-keep-any-id-inside-the-directory
-  (let [dir (System.IO.Path/Combine (System.IO.Path/GetTempPath) (str "ants-storage-" (System.Guid/NewGuid)))
-        store (edn-files/storage dir)]
-    (try
-      (doseq [id ["1" "../../escape" "a b/c" "åäö" "" ".."]]
-        (testing (pr-str id)
-          (storage/write-state store :ledger id {:n 8 :id id})
-          (let [file (edn-files/file-of store :ledger id)]
-            (is (System.IO.File/Exists file))
-            (is (.StartsWith file (str (System.IO.Path/GetFullPath dir) "/")) "inside the directory")
-            (is (= (str "{:n 8, :id " (pr-str id) "}") (System.IO.File/ReadAllText file)) "what would be on the wire"))
-          (is (= {:n 8 :id id} (storage/read-state store :ledger id)))
-          (storage/clear-state store :ledger id)
-          (is (storage/none? (storage/read-state store :ledger id)))))
-      (is (= "%2E%2E%2F%2E%2E%2Fescape" (edn-files/encode "../../escape")))
-      (is (= 8 (actors/call! (local/system {:storage store}) (ledger "x") :ledger/add 8)))
-      (is (= 8 (actors/call! (local/system {:storage store}) (ledger "x") :ledger/get)) "a fresh system reads the file")
-      (finally
-        (System.IO.Directory/Delete dir true)))))
-
-(deftest sqlite-keeps-state-in-a-database
-  (let [file (System.IO.Path/Combine (System.IO.Path/GetTempPath) (str "ants-" (System.Guid/NewGuid) ".db"))
-        store (sqlite/storage file)]
-    (try
-      (is (= 8 (actors/call! (local/system {:storage store}) (ledger "x") :ledger/add 8)))
-      (is (= 9 (actors/call! (local/system {:storage store}) (ledger "x") :ledger/add 1)) "a fresh system reads the row")
-      (is (= 9 (storage/read-state store :ledger "x")))
-      (is (= 9 (storage/read-state (sqlite/storage file) :ledger "x")) "and so does a fresh connection")
-      (doseq [id ["../../escape" "åäö" "" "it's"]]
-        (storage/write-state store :ledger id {:id id})
-        (is (= {:id id} (storage/read-state store :ledger id)) (pr-str id)))
-      (storage/clear-state store :ledger "x")
-      (is (storage/none? (storage/read-state store :ledger "x")))
-      (is (= 0 (actors/call! (local/system {:storage store}) (ledger "x") :ledger/get)) "forgotten")
-      (finally
-        (System.IO.File/Delete file)))))
+(deftest reminders-outlive-the-activation
+  (let [system (local/system)]
+    (is (= :started (actors/call! system (nag 1) :nag/start)))
+    (is (= {:nag/tick {:due 60000 :period 60000}} (local/reminders system (nag 1))))
+    (actors/call! system (nag 1) :nag/stop)
+    (is (nil? (local/state system (nag 1))) "deactivated")
+    (is (= 1 (local/run-reminders! system)) "the reminder activates it again")
+    (let [system (local/restart system)]
+      (local/run-reminders! system)
+      (is (= 2 (actors/call! system (nag 1) :nag/count)) "and survives a restart")
+      (local/run-reminders! system)
+      (is (= 3 (actors/call! system (nag 1) :nag/count)))
+      (is (empty? (local/reminders system (nag 1))) "cancelled on the third tick"))))
 
 ;; ── Every valid message, generated from the specs ────────────────
 ;; A fresh system per case, with the whole grid checked after every message.

@@ -1,0 +1,25 @@
+# PostgreSQL for the bank: cluster membership, grain storage and reminders.
+# The scripts in sql/ are Orleans' own (dotnet/orleans v10.3.1, src/AdoNet), run in order on
+# the first start; the data lives in a named volume, so it survives `docker compose down`.
+services:
+  postgres:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "max_connections=200"]
+    container_name: orleans-bank-postgres
+    environment:
+      POSTGRES_USER: orleans
+      POSTGRES_PASSWORD: orleans
+      POSTGRES_DB: bank
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "orleans", "-d", "bank"]
+      interval: 2s
+      retries: 30
+
+volumes:
+  pgdata:
+    name: orleans-bank-pgdata

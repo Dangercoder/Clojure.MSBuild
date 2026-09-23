@@ -1,0 +1,48 @@
+(ns bank.account
+  "An account: a balance and the entries that explain it, one per transfer
+   id. Nothing but the account touches them; money moves by sending it
+   messages, and every message names the transfer it belongs to, so the
+   account applies each transfer once however often it hears about it.
+
+   The state is persisted in the grain storage named \"ledger\" (PostgreSQL
+   on a silo) after every message that changed it, before the reply leaves:
+   a caller that got :debited knows the debit is committed."
+  (:require [bank.model :as model]
+            [orleans.actors :as actors :refer [defactor reply]]))
+
+(defn- apply-once
+  "Records entry for the transfer id and moves the balance by delta, unless
+   the account already has an entry for that id."
+  [state id entry delta]
+  (if (contains? (:account/entries state) id)
+    state
+    (-> state
+        (update :account/balance + delta)
+        (assoc-in [:account/entries id] entry))))
+
+(defactor account
+  "An account, addressed as (account id)."
+  {:state ::model/account :persist :ledger}
+
+  (init [ctx id]
+    #:account{:id id :balance 0 :entries {}})
+
+  (call :account/deposit :account/balance [ctx state {:transfer/keys [id amount]}]
+    (let [state (apply-once state id [:deposit amount] amount)]
+      (reply (:account/balance state) state)))
+
+  (call :account/debit ::model/debit-outcome [ctx {:account/keys [balance entries] :as state} {:transfer/keys [id amount]}]
+    (if-let [[kind] (get entries id)]
+      (reply (if (= kind :declined) :declined :debited) state)     ; heard it before: same answer
+      (if (<= amount balance)
+        (reply :debited (apply-once state id [:debit amount] (- amount)))
+        (reply :declined (assoc-in state [:account/entries id] [:declined amount])))))
+
+  (call :account/credit [ctx state {:transfer/keys [id amount]}]
+    (reply :credited (apply-once state id [:credit amount] amount)))
+
+  (call :account/get-balance :account/balance [ctx state]
+    (reply (:account/balance state) state))
+
+  (call :account/statement ::model/account [ctx state]
+    (reply state state)))

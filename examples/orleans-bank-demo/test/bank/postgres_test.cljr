@@ -1,0 +1,88 @@
+;; Npgsql and System.Data.Common are not loaded until something uses them;
+;; ClojureCLR resolves type names against loaded assemblies, so load them first.
+(assembly-load "System.Data.Common")
+(assembly-load "Npgsql")
+
+(ns bank.postgres-test
+  "The bank on silos backed by PostgreSQL: what Orleans' grain storage
+   does with an actor's state. Needs the database from docker-compose.yml
+   (or BANK_POSTGRES); without it these tests say so and pass."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.clr.async.task.alpha :as t]
+            [bank.account :refer [account]]
+            [bank.chaos :as chaos]
+            [bank.cluster :as cluster]
+            [orleans.actors :as actors]
+            [orleans.actors.silo :as silo])
+  (:import [Npgsql NpgsqlConnection NpgsqlCommand]))
+
+(defn- sql
+  "Runs a query with named parameters; returns the first column of the first
+   row, or the number of rows it changed."
+  [query params]
+  (with-open [connection (NpgsqlConnection. (cluster/connection-string))]
+    (.Open connection)
+    (with-open [command (NpgsqlCommand. ^String query connection)]
+      (doseq [[k v] params] (.AddWithValue (.Parameters command) ^String k v))
+      (if (re-find #"(?i)^\s*select" query)
+        (.ExecuteScalar command)
+        (.ExecuteNonQuery command)))))
+
+(def ^:private reachable?
+  (delay (try (sql "select 1" {}) true
+              (catch Exception e
+                (println "PostgreSQL is not reachable, skipping bank.postgres-test:" (.Message e))
+                false))))
+
+(defn- row
+  "The stored row of an actor, as the text in the database."
+  [key]
+  (sql "select convert_from(payloadbinary, 'UTF8') from orleansstorage where grainidextensionstring = @key and serviceid = 'clojure-bank'"
+       {"key" key}))
+
+(defn- unique [prefix] (str prefix "-" (System.Guid/NewGuid)))
+
+(defmacro ^:private with-silo [[name] & body]
+  `(let [~name (t/result (cluster/start-silo 7))]
+     (try ~@body (finally (silo/shutdown! ~name)))))
+
+(deftest a-state-is-the-actors-own-row-in-edn
+  (when @reachable?
+    (let [id (unique "pg")]
+      (with-silo [s]
+        (actors/call! s (account id) :account/deposit #:transfer{:id "open" :amount 500})
+        (actors/call! s (account id) :account/debit #:transfer{:id "t1" :amount 120}))
+      (is (= #:account{:id id :balance 380 :entries {"open" [:deposit 500] "t1" [:debit 120]}}
+             (read-string (row (str "account/" id))))
+          "the row is the state, readable as EDN")
+      (testing "a new silo resumes the account from its row"
+        (with-silo [s]
+          (is (= 380 (actors/call! s (account id) :account/get-balance)))
+          (is (= :debited (actors/call! s (account id) :account/debit #:transfer{:id "t1" :amount 120}))
+              "and still knows the debit it made")
+          (is (= 380 (actors/call! s (account id) :account/get-balance))))))))
+
+(deftest the-etag-refuses-a-second-writer
+  ;; Someone else writes the account's row behind the activation's back, as a
+  ;; second activation of the same actor would during a cluster change. The
+  ;; activation's next write carries the version it read: refused. The
+  ;; account restarts from the row, and the row wins.
+  (when @reachable?
+    (let [id (unique "etag")
+          key (str "account/" id)]
+      (with-silo [s]
+        (actors/call! s (account id) :account/deposit #:transfer{:id "open" :amount 100})
+        (is (= 1 (sql "update orleansstorage set payloadbinary = convert_to(@edn, 'UTF8'), version = version + 1 where grainidextensionstring = @key"
+                      {"key" key "edn" (pr-str #:account{:id id :balance 7 :entries {"open" [:deposit 7]}})})))
+        (is (thrown-with-msg? Exception #"(?i)version conflict|etag|inconsistent"
+                              (actors/call! s (account id) :account/deposit #:transfer{:id "more" :amount 1}))
+            "the stale write is refused")
+        (is (= 7 (actors/call! s (account id) :account/get-balance)) "restarted from what is stored")
+        (is (= 8 (actors/call! s (account id) :account/deposit #:transfer{:id "more" :amount 1})))))))
+
+(deftest a-short-chaos-run-balances-the-books
+  (when @reachable?
+    (let [{:keys [ok? counts problems]} (chaos/demo! {:silos 2 :seconds 12 :kill-every 5 :down 2 :accounts 6 :workers 4})]
+      (is ok? (pr-str problems))
+      (is (pos? (:done counts 0)))
+      (is (zero? (:pending counts 0))))))

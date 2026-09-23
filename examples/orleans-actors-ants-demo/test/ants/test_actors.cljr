@@ -2,8 +2,7 @@
   "Small actors for the tests, hosted by both the local system and a silo."
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.spec.alpha :as s]
-            [orleans.actors :as actors :refer [defactor reply]]
-            [orleans.actors.storage :as storage]))
+            [orleans.actors :as actors :refer [defactor reply]]))
 
 ;; A counter: its state must stay a natural number.
 (s/def ::count nat-int?)
@@ -28,15 +27,27 @@
   (call :ledger/forget [ctx n] (t/await (actors/forget ctx)) (actors/stop ctx) (reply :forgotten n))
   (call :ledger/stop [ctx n] (actors/stop ctx) (reply :stopping n)))
 
-;; Keeps a note of every message in its own storage, outside its state.
-(s/def :diary/note string?)
+;; Persists in a storage of its own, "vaults".
+(s/def :vault/put string?)
 
-(defactor diary
-  (init [ctx id] [])
-  (call :diary/note [ctx entries text]
-    (let [entries (conj entries text)]
-      (t/await (actors/as-async (storage/write-state (:actor/storage ctx) :notes (:actor/id (:actor/self ctx)) entries)))
-      (reply (count entries) entries))))
+(defactor vault
+  {:persist :vaults}
+  (init [ctx id] #{})
+  (call :vault/put [ctx items item] (reply :ok (conj items item))))
+
+;; Counts the ticks of a reminder, which it cancels on the third, and
+;; persists the count: a reminder can wake it up on a fresh activation.
+(defactor nag
+  {:state ::count :persist true}
+  (init [ctx id] 0)
+  (call :nag/start [ctx n]
+    (t/await (actors/remind-every ctx 60000 :nag/tick))
+    (reply :started n))
+  (call :nag/count ::count [ctx n] (reply n n))
+  (call :nag/stop [ctx n] (actors/stop ctx) (reply :stopping n))
+  (info :nag/tick [ctx n]
+    (when (= 2 n) (t/await (actors/cancel-reminder ctx :nag/tick)))
+    (inc n)))
 
 ;; Promises a natural number and answers with something else.
 (defactor liar

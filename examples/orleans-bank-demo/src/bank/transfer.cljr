@@ -1,0 +1,96 @@
+(ns bank.transfer
+  "A transfer: moves an amount from one account to another, exactly once,
+   whatever crashes on the way.
+
+   Two accounts cannot change in one database transaction here, and they
+   should not: each account's state is its own. So the transfer is an actor
+   of its own that owns the intent, and drives the accounts by messages:
+
+     1. :transfer/start records the order (:pending), registers a reminder
+        and replies once both are committed. Nothing has moved yet.
+     2. It debits the source account, then credits the destination. Both
+        messages carry the transfer's id, so repeating them is harmless:
+        the accounts answer from their entries.
+     3. It records the outcome (:done or :declined), and only then cancels
+        the reminder.
+
+   A crash anywhere (the silo of the transfer or of an account killed, a
+   write that fails, a timeout) leaves the transfer :pending with its
+   reminder registered. The reminder lives in the cluster's reminder
+   service (PostgreSQL), not in the activation: when it is due, Orleans
+   activates the transfer again, on whichever silo is alive, it resumes from
+   its stored state and runs step 2 again. Money is debited once, credited
+   once, and never lost in between."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [bank.account :refer [account]]
+            [bank.model :as model]
+            [orleans.actors :as actors :refer [defactor reply]]))
+
+(def retry-ms
+  "How often an unfinished transfer is retried by its reminder."
+  5000)
+
+(defn- move!
+  "Step 2: debits the source and credits the destination. Returns a Task of
+   the final state."
+  [ctx {:transfer/keys [id from to amount] :as state}]
+  (t/async
+    (let [movement #:transfer{:id id :amount amount}
+          debit (t/await (actors/call ctx (account from) :account/debit movement))]
+      (if (= :declined debit)
+        (assoc state :transfer/status :declined)
+        (let [_ (t/await (actors/call ctx (account to) :account/credit movement))]
+          (assoc state :transfer/status :done))))))
+
+(alter-meta! #'move! assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- advance
+  "What the transfer does when it is woken up, by its timer right after the
+   start or, when that did not finish it, by its reminder (by :reminder):
+   a transfer the reminder finished is marked :transfer/recovered?."
+  [ctx state by]
+  (t/async
+    (if (= :pending (:transfer/status state))
+      (let [state (cond-> (t/await (move! ctx state))
+                    (= by :reminder) (assoc :transfer/recovered? true))]
+        ;; the final state is stored when this handler returns; the reminder
+        ;; goes after that, in a message of its own
+        (actors/send-after ctx 0 :transfer/settle)
+        state)
+      (let [_ (t/await (actors/cancel-reminder ctx :transfer/retry))]
+        state))))
+
+(alter-meta! #'advance assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defactor transfer
+  "A transfer, addressed as (transfer id). The id is the idempotency key:
+   starting the same transfer twice starts it once."
+  {:state ::model/transfer :persist :ledger}
+
+  (init [ctx id]
+    #:transfer{:id id :status :blank})
+
+  (call :transfer/start :transfer/status [ctx state order]
+    (if (= :blank (:transfer/status state))
+      (let [_ (t/await (actors/remind-every ctx retry-ms :transfer/retry))]
+        (actors/send-after ctx 0 :transfer/drive)
+        (reply :pending (merge state order {:transfer/status :pending})))
+      (reply (:transfer/status state) state)))
+
+  (call :transfer/get-status :transfer/status [ctx state]
+    (reply (:transfer/status state) state))
+
+  (call :transfer/show ::model/transfer [ctx state]
+    (reply state state))
+
+  ;; right after the start, while the activation lives
+  (info :transfer/drive [ctx state]
+    (t/await (advance ctx state :timer)))
+
+  ;; the reminder: after a crash, on any silo
+  (info :transfer/retry [ctx state]
+    (t/await (advance ctx state :reminder)))
+
+  (info :transfer/settle [ctx state]
+    (t/await (actors/cancel-reminder ctx :transfer/retry))
+    state))

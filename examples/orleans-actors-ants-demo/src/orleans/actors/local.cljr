@@ -5,7 +5,24 @@
    once the message has been handled, and as long as the handlers wait on
    nothing outside the process that happens before the Task is returned,
    so a test can send a message and look at the state (`state`) right
-   after. Timers are recorded and fired by `run-timers!`.
+   after. Timers are recorded and fired by `run-timers!`, reminders by
+   `run-reminders!`.
+
+   The system is also the host's durable side: the stored states of
+   persisting actors (`stored`) and the reminders (`reminders`) belong to
+   it, not to the actors, exactly as on a silo they belong to the grain
+   storage and the reminder service. A stored record has a version, which
+   an activation reads with the state and has to match when it writes, as
+   the ETag of an Orleans grain storage: a write from an activation that
+   is out of date throws. `restart` gives a system that kept only the
+   stored states and reminders, as after a crash of every silo; `fork`
+   gives a second system on the same ones next to the first, so an actor
+   can be active twice, as it can for a moment when a cluster changes.
+
+   Everything happens on the caller's thread, in the order the caller
+   says, and faults come from the :crash function: a test that generates
+   the messages, the restarts and the crashes is deterministic, and
+   test.check can shrink a failure to the smallest schedule that breaks.
 
    The runtime is the one the Orleans host uses (orleans.actors/activate,
    handle and recover), so specs, persistence and the :on-error policy
@@ -17,8 +34,7 @@
        (actors/call! system (counter 1) :add 2)
        (local/state system (counter 1)))       ; => 2"
   (:require [clojure.clr.async.task.alpha :as t]
-            [orleans.actors :as actors]
-            [orleans.actors.storage.memory :as memory])
+            [orleans.actors :as actors])
   (:import [System IDisposable]))
 
 (set! *warn-on-reflection* true)
@@ -27,6 +43,32 @@
 
 (defn- without-timer [timers id]
   (vec (remove #(= id (:id %)) timers)))
+
+(defn- crash!
+  "Throws when the system's :crash function says the host dies here."
+  [system ref phase]
+  (when-let [crash? (:crash system)]
+    (when (crash? ref phase)
+      (throw (ex-info (str "crash " (name phase) " of " (:actor/type ref) "/" (:actor/id ref))
+                      {:crash phase :actor ref})))))
+
+(defn- write-versioned!
+  "Stores the state when the record still has the version this activation
+   read, as Orleans' grain storage does with its ETag; throws when it does
+   not: another activation of the same actor wrote in between."
+  [system ref provider state]
+  (let [key [provider ref]
+        expected (get-in @(:activations system) [ref :versions provider] 0)
+        [before after] (swap-vals! (:stored system)
+                                   (fn [stored]
+                                     (if (= expected (get-in stored [key :version] 0))
+                                       (assoc stored key {:state state :version (inc expected)})
+                                       stored)))]
+    (when (identical? before after)
+      (throw (ex-info (str "Version conflict writing " (:actor/type ref) "/" (:actor/id ref) ": read version " expected
+                           ", stored version " (get-in before [key :version] 0))
+                      {:actor ref :expected expected :stored (get-in before [key :version] 0)})))
+    (swap! (:activations system) assoc-in [ref :versions provider] (inc expected))))
 
 (defrecord LocalHost [system ref]
   actors/Host
@@ -37,12 +79,30 @@
         (Dispose [_]
           (swap! (:activations system) update-in [ref :timers] without-timer (:id timer))))))
   (-clear-timers [_] (swap! (:activations system) assoc-in [ref :timers] []))
+  (-remind [_ type due period]
+    (swap! (:reminders system) assoc-in [ref type] {:due due :period period})
+    nil)
+  (-unremind [_ type]
+    (swap! (:reminders system) (fn [reminders]
+                                 (let [left (dissoc (get reminders ref) type)]
+                                   (if (empty? left) (dissoc reminders ref) (assoc reminders ref left)))))
+    nil)
+  (-read-state [_ provider]
+    (let [{:keys [state version] :or {state actors/none version 0}} (get @(:stored system) [provider ref])]
+      (swap! (:activations system) assoc-in [ref :versions provider] version)
+      state))
+  (-write-state [_ provider state]
+    (crash! system ref :before-write)
+    (write-versioned! system ref provider state)
+    (crash! system ref :after-write)
+    nil)
+  (-clear-state [_ provider] (write-versioned! system ref provider actors/none) nil)
   (-stop [_] (swap! (:activations system) assoc-in [ref :stopping?] true)))
 
 (defn- context [system ref]
-  (actors/context ref system (:storage system) (->LocalHost system ref)))
+  (actors/context ref system (->LocalHost system ref)))
 
-(defrecord LocalSystem [activations storage settings]
+(defrecord LocalSystem [activations stored reminders settings crash]
   actors/Messaging
   (-call [this ref type payload] (dispatch this :call ref type payload))
   (-cast [this ref type payload] (dispatch this :cast ref type payload)))
@@ -89,11 +149,53 @@
 (alter-meta! #'dispatch assoc :tag task-of-object)
 
 (defn system
-  "A local actor system. Options: :storage, an orleans.actors.storage/Storage
-   (in memory by default), and :state-check as for orleans.actors.silo/start."
+  "A local actor system. Options: :state-check as for
+   orleans.actors.silo/start, and :crash, for fault injection: a function
+   of the actor's ref and :before-write or :after-write, called whenever a
+   persisting actor's state is written; when it returns true the write
+   throws, before or after the state was stored, as if the host died
+   there."
   ([] (system {}))
-  ([{:keys [storage] :as options}]
-   (->LocalSystem (atom {}) (or storage (memory/storage)) (actors/settings options))))
+  ([{:keys [crash] :as options}]
+   (->LocalSystem (atom {}) (atom {}) (atom {}) (actors/settings options) crash)))
+
+(defn fork
+  "A second system on the stored states and reminders of this one, with
+   activations of its own: the same actor can then be active in both, with
+   the state each read, as it can be on two silos for a moment when a
+   cluster changes. Their writes are ordered by the records' versions: the
+   first one wins, the other throws and its actor restarts from what is
+   stored. Both systems stay usable."
+  [system]
+  (->LocalSystem (atom {}) (:stored system) (:reminders system) (:settings system) (:crash system)))
+
+(defn restart
+  "A new system with the stored states and the reminders of this one and
+   no activations: what is left after every silo of a cluster went down
+   and came back. The old system should not be used afterwards."
+  [system]
+  (fork system))
+
+(defn stored
+  "The stored state of a persisting actor, `orleans.actors/none` when it
+   has none. `provider` is the storage name, \"Default\" for {:persist true}."
+  ([system ref] (stored system ref "Default"))
+  ([system ref provider] (get-in @(:stored system) [[provider ref] :state] actors/none)))
+
+(defn reminders
+  "The reminders of an actor: {message-type {:due ms :period ms}}."
+  [system ref]
+  (get @(:reminders system) ref {}))
+
+(defn run-reminders!
+  "Fires every reminder once, as the reminder service would when its time
+   came, activating the actor first when it is not active. Returns the
+   number of messages delivered."
+  [system]
+  (let [due (vec (for [[ref by-type] @(:reminders system) [type _] by-type] [ref type]))]
+    (doseq [[ref type] due]
+      (t/result (dispatch system :info ref type nil)))
+    (count due)))
 
 (defn state
   "The current state of an actor, nil when it is not active."
