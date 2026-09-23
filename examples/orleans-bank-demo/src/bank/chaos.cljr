@@ -152,17 +152,37 @@
               (sleep 2000)
               (recur left (inc tries) (or first-count (count left)))))))))
 
-(defn report [run-id {:keys [ok? total expected counts recovered problems]}]
+(defn report [run-id {:keys [ok? total expected counts recovered moments problems]}]
   (log "")
   (log "Audit of run " run-id ", from PostgreSQL:")
   (log "  transfers done " (:done counts 0) ", declined for lack of funds " (:declined counts 0)
        ", never started " (:blank counts 0) ", pending " (:pending counts 0))
   (log "  " recovered " transfers were cut off by a crash and finished later by their reminder")
   (log "  money in the accounts " total ", opened with " expected)
+  (log "  every journal explains its balance, entry by entry; the books balanced at each of the "
+       moments " moments something was booked")
   (if ok?
     (log "  ✓ every transfer happened exactly once, or not at all; not one öre appeared or vanished")
     (do (log "  ✗ " (count problems) " problems:")
         (doseq [p (take 20 problems)] (log "    " p)))))
+
+(defn- instant [micros]
+  (.ToString (.AddTicks (System.DateTime. 1970 1 1 0 0 0 System.DateTimeKind/Utc) (* 10 (long micros))) "HH:mm:ss.ffffff"))
+
+(defn- history
+  "The bank at a few moments of the run, from the accounts' balances at
+   those moments (one lookup in each journal) and the transfers on their way."
+  [client run-id {:keys [accounts opening]}]
+  (let [{:run/keys [reserved]} (actors/call! client (run/run run-id) :run/show)
+        transfers (mapv #(actors/call! client (transfer (run/transfer-id run-id %)) :transfer/show) (range reserved))
+        times (sort (keep :transfer/debited-at transfers))]
+    (when (seq times)
+      (log "")
+      (log "The books at moments of the run, each account asked for its balance then:")
+      (doseq [at (map #(nth times (quot (* % (dec (count times))) 4)) (range 5))
+              :let [{:keys [held in-flight]} (audit/books-at client run-id at transfers)]]
+        (log "  " (instant at) "  accounts " held " + on its way " in-flight " = " (+ held in-flight)
+             (if (= (+ held in-flight) (* accounts opening)) "  ✓" "  ✗"))))))
 
 (defn demo!
   "Runs the demo; returns the audit."
@@ -203,6 +223,7 @@
           (status-line client run-id options silos-atom stats clock))
         (wait-for-reminders! client run-id)
         (let [result (retrying (atom 0) #(audit/audit client run-id))]
+          (retrying (atom 0) #(history client run-id options))
           (report run-id result)
           (log "")
           (log "Audit it again later, from nothing but the database: dotnet run -- audit " run-id)

@@ -15,7 +15,7 @@
 
 (defactor run
   "A run, addressed as (run id)."
-  {:state ::model/run :persist :ledger}
+  {:state ::model/run :persist :bank}
 
   (init [ctx id]
     #:run{:id id :reserved 0})

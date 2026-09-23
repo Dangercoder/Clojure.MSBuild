@@ -4,7 +4,7 @@ using Orleans.Hosting;
 namespace Bank.Orleans;
 
 /// <summary>
-/// The cluster on PostgreSQL: membership, the "ledger" grain storage and reminders, all through
+/// The cluster on PostgreSQL: membership, the "bank" grain storage and reminders, all through
 /// Orleans' ADO.NET providers, so everything that has to survive a crash is committed to the
 /// database. The tables are Orleans' own (sql/). Given to orleans.actors.silo/start as :configure
 /// and to orleans.actors.silo/connect.
@@ -29,7 +29,7 @@ public static class Postgres
             o.Invariant = Invariant;
             o.ConnectionString = connectionString;
         });
-        silo.AddAdoNetGrainStorage("ledger", o =>
+        silo.AddAdoNetGrainStorage("bank", o =>
         {
             o.Invariant = Invariant;
             o.ConnectionString = connectionString;

@@ -118,6 +118,14 @@
     "The actor's stored state in the named storage, or `none`; a Task.")
   (-write-state [host provider state] "Stores the actor's state; a Task.")
   (-clear-state [host provider] "Removes the actor's stored state; a Task.")
+  (-append [host journal entry]
+    "Appends an entry to the actor's journal (see orleans.actors.journal);
+     a Task of {:appended? true :entry e} or {:appended? false :existing e}.")
+  (-last-entry [host journal] "The actor's last journal entry, or nil; a Task.")
+  (-entry-at [host journal at] "The actor's journal entry as of `at`, or nil; a Task.")
+  (-entry-by-key [host journal key] "The actor's journal entry with that key, or nil; a Task.")
+  (-entries [host journal after-seq limit] "A page of the actor's journal; a Task.")
+  (-now [host] "The host's clock, in microseconds since the epoch.")
   (-stop [host] "Deactivates the actor after the current message."))
 
 (def none
@@ -176,6 +184,9 @@
       :replies  {msg-type reply-spec} for call messages, optional
    Message types are namespaced keywords; the spec registered under one,
    if any, is the spec of its payload.
+      :journal  the name of the journal a journaled actor records its
+                history in (see `append!`), instead of :persist; its
+                resume gets its last entry
       :persist  true to have the host store the state (in the grain
                 storage named \"Default\" on a silo), or the name of the
                 grain storage to use, optional
@@ -183,6 +194,11 @@
    Handlers may return a Task<object> (t/async) instead of a value.
    `defactor` is the convenient way to build this map."
   [type definition]
+  (when (and (:persist definition) (:journal definition))
+    (throw (ex-info (str "Actor " type ": :persist or :journal, not both") {:actor type})))
+  (when (and (:journal definition) (not (:resume definition)))
+    (throw (ex-info (str "Actor " type ": a journaled actor needs a resume clause, which rebuilds its state from its last entry")
+                    {:actor type})))
   (swap! definitions assoc type definition)
   type)
 
@@ -195,6 +211,14 @@
   ^String [definition]
   (let [persist (:persist definition)]
     (if (true? persist) "Default" (name persist))))
+
+(defn- journal-of
+  "The name of the journal of a journaled actor."
+  ^String [ctx]
+  (let [definition (definition-of (:actor/type (:actor/self ctx)))]
+    (or (some-> (:journal definition) name)
+        (throw (ex-info (str "Actor " (:actor/type (:actor/self ctx)) " has no journal: {:journal :name} in its options")
+                        {:actor (:actor/self ctx)})))))
 
 ;; ── Sending ──────────────────────────────────────────────────────
 
@@ -268,6 +292,61 @@
   (as-async (-unremind (:actor/host ctx) type)))
 
 (alter-meta! #'cancel-reminder assoc :tag task-of-object)
+
+(defn append!
+  "Appends an entry to the actor's own journal, and returns a Task of
+   {:appended? true :entry entry}, or of {:appended? false :existing e}
+   when the journal already has an entry with the same :entry/key (then
+   nothing was appended: the key says it happened already, and e is what
+   happened). The entry names the :entry/seq it takes, the one after the
+   last the actor knows of; when that seq is taken, because another
+   activation of the same actor appended in between, it throws, and the
+   actor restarts from its journal. :entry/at is when it happened, in
+   microseconds, increasing per actor (see `next-at`).
+
+   A journaled actor's state is what its journal says: a handler appends
+   before it replies, and returns the state the entry leads to. On a fresh
+   activation, resume gets the last entry and rebuilds the state from it,
+   so an entry should carry what that takes (a running balance, say)."
+  [ctx entry]
+  (as-async (-append (:actor/host ctx) (journal-of ctx) entry)))
+
+(alter-meta! #'append! assoc :tag task-of-object)
+
+(defn entry-at
+  "A Task of the actor's last journal entry recorded at or before `at`
+   (microseconds since the epoch), nil when there is none: its state at
+   that moment, as its entries record it."
+  [ctx at]
+  (as-async (-entry-at (:actor/host ctx) (journal-of ctx) at)))
+
+(alter-meta! #'entry-at assoc :tag task-of-object)
+
+(defn entry-by-key
+  "A Task of the actor's journal entry with that :entry/key, or nil."
+  [ctx key]
+  (as-async (-entry-by-key (:actor/host ctx) (journal-of ctx) key)))
+
+(alter-meta! #'entry-by-key assoc :tag task-of-object)
+
+(defn entries
+  "A Task of up to limit of the actor's journal entries after after-seq,
+   in order."
+  [ctx after-seq limit]
+  (as-async (-entries (:actor/host ctx) (journal-of ctx) after-seq limit)))
+
+(alter-meta! #'entries assoc :tag task-of-object)
+
+(defn next-at
+  "When an entry happens: the host's clock, but always after the actor's
+   previous entry (last-at) and after any moment it has heard of (after,
+   the time of the entry that caused this one, from another actor). Clocks
+   of different silos disagree; this makes an actor's entries increase and
+   an effect never come before its cause, so the entries of all actors up
+   to any moment are a consistent cut."
+  ([ctx last-at] (next-at ctx last-at nil))
+  ([ctx last-at after]
+   (max (-now (:actor/host ctx)) (inc (or last-at 0)) (or after 0))))
 
 (defn stop
   "Deactivates the actor after the current message. The next message sent
@@ -349,9 +428,13 @@
   (t/async
     (let [{:actor/keys [type id]} (:actor/self ctx)
           definition (definition-of type)
-          stored (if (:persist definition)
-                   (t/await (as-async (-read-state (:actor/host ctx) (provider definition))))
-                   none)
+          stored (cond (:persist definition)
+                       (t/await (as-async (-read-state (:actor/host ctx) (provider definition))))
+
+                       (:journal definition)
+                       (or (t/await (as-async (-last-entry (:actor/host ctx) (name (:journal definition))))) none)
+
+                       :else none)
           state (if (none? stored)
                   (t/await (as-async ((:init definition) ctx id)))
                   (t/await (as-async ((:resume definition (fn [_ stored] stored)) ctx stored))))]
@@ -448,6 +531,7 @@
     {:type type
      :state (some-> (:state definition) s/describe)
      :persist (boolean (:persist definition))
+     :journal (some-> (:journal definition) name)
      :storage (when (:persist definition) (provider definition))
      :on-error (:on-error definition :restart)
      :call (messages :call)
@@ -533,7 +617,11 @@
    the stored state as it is. The state has to be data (see the wire).
    {:persist :ledger} keeps it in the grain storage named \"ledger\"
    instead of the default one. The stored state is the actor's alone: no
-   other actor reads or writes it."
+   other actor reads or writes it.
+
+   With {:journal :ledger} the actor keeps an append-only journal of what
+   happened to it instead of a stored state (see `append!`): its history
+   stays, and what it was at any moment can be read back (`entry-at`)."
   [name & body]
   (let [[doc body] (if (string? (first body)) [(first body) (rest body)] [nil body])
         [options body] (if (map? (first body)) [(first body) (rest body)] [{} body])

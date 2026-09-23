@@ -10,7 +10,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.clr.async.task.alpha :as t]
             [bank.account :refer [account]]
+            [bank.audit :as audit]
             [bank.chaos :as chaos]
+            [bank.run :as run]
             [bank.cluster :as cluster]
             [orleans.actors :as actors]
             [orleans.actors.silo :as silo])
@@ -35,7 +37,7 @@
                 false))))
 
 (defn- row
-  "The stored row of an actor, as the text in the database."
+  "The stored row of an actor in grain storage, as the text in the database."
   [key]
   (sql "select convert_from(payloadbinary, 'UTF8') from orleansstorage where grainidextensionstring = @key and serviceid = 'clojure-bank'"
        {"key" key}))
@@ -46,39 +48,78 @@
   `(let [~name (t/result (cluster/start-silo 7))]
      (try ~@body (finally (silo/shutdown! ~name)))))
 
-(deftest a-state-is-the-actors-own-row-in-edn
+(defn- journal-rows [account-id]
+  (with-open [connection (NpgsqlConnection. (cluster/connection-string))]
+    (.Open connection)
+    (with-open [command (NpgsqlCommand. "select seq, transfer_id, kind, amount, balance_after from ledger_entries where account_id = @a order by seq" connection)]
+      (.AddWithValue (.Parameters command) "a" account-id)
+      (with-open [reader (.ExecuteReader command)]
+        (loop [rows []]
+          (if (.Read reader)
+            (recur (conj rows [(.GetInt64 reader 0) (.GetString reader 1) (.GetInt16 reader 2) (.GetInt64 reader 3) (.GetInt64 reader 4)]))
+            rows))))))
+
+(deftest an-account-is-rows-in-the-ledger
   (when @reachable?
     (let [id (unique "pg")]
       (with-silo [s]
         (actors/call! s (account id) :account/deposit #:transfer{:id "open" :amount 500})
-        (actors/call! s (account id) :account/debit #:transfer{:id "t1" :amount 120}))
-      (is (= #:account{:id id :balance 380 :entries {"open" [:deposit 500] "t1" [:debit 120]}}
-             (read-string (row (str "account/" id))))
-          "the row is the state, readable as EDN")
-      (testing "a new silo resumes the account from its row"
+        (actors/call! s (account id) :account/debit #:transfer{:id "t1" :amount 120})
+        (actors/call! s (account id) :account/debit #:transfer{:id "t2" :amount 900}))
+      (is (= [[1 "open" 0 500 500] [2 "t1" 1 120 380] [3 "t2" 3 900 380]] (journal-rows id))
+          "one row per entry, each with the balance after it")
+      (testing "a new silo resumes the account from its last row"
         (with-silo [s]
-          (is (= 380 (actors/call! s (account id) :account/get-balance)))
-          (is (= :debited (actors/call! s (account id) :account/debit #:transfer{:id "t1" :amount 120}))
+          (is (= #:account{:id id :balance 380 :seq 3} (dissoc (actors/call! s (account id) :account/summary) :account/at)))
+          (is (= :debit (:entry/kind (actors/call! s (account id) :account/debit #:transfer{:id "t1" :amount 120})))
               "and still knows the debit it made")
-          (is (= 380 (actors/call! s (account id) :account/get-balance))))))))
+          (is (= 380 (actors/call! s (account id) :account/get-balance)))
+          (let [[e1 e2] (audit/journal s id)]
+            (is (= 500 (actors/call! s (account id) :account/balance-at (:entry/at e1))))
+            (is (= 500 (actors/call! s (account id) :account/balance-at (dec (:entry/at e2)))))
+            (is (= 380 (actors/call! s (account id) :account/balance-at (:entry/at e2))))))))))
 
-(deftest the-etag-refuses-a-second-writer
-  ;; Someone else writes the account's row behind the activation's back, as a
-  ;; second activation of the same actor would during a cluster change. The
-  ;; activation's next write carries the version it read: refused. The
-  ;; account restarts from the row, and the row wins.
+(deftest the-seq-fences-a-second-writer
+  ;; Someone else appends to the account's journal behind the activation's
+  ;; back, as a second activation of the same account would during a
+  ;; cluster change. The activation's next append takes the same seq: the
+  ;; primary key refuses it, the account restarts from the table, and the
+  ;; row wins.
   (when @reachable?
-    (let [id (unique "etag")
-          key (str "account/" id)]
+    (let [id (unique "fence")]
       (with-silo [s]
         (actors/call! s (account id) :account/deposit #:transfer{:id "open" :amount 100})
-        (is (= 1 (sql "update orleansstorage set payloadbinary = convert_to(@edn, 'UTF8'), version = version + 1 where grainidextensionstring = @key"
-                      {"key" key "edn" (pr-str #:account{:id id :balance 7 :entries {"open" [:deposit 7]}})})))
-        (is (thrown-with-msg? Exception #"(?i)version conflict|etag|inconsistent"
+        (is (= 1 (sql "insert into ledger_entries values (@a, 2, 'elsewhere', 2, 7, 107, now())" {"a" id})))
+        (is (thrown-with-msg? Exception #"Journal conflict"
                               (actors/call! s (account id) :account/deposit #:transfer{:id "more" :amount 1}))
+            "the append of seq 2 is refused")
+        (is (= 107 (actors/call! s (account id) :account/get-balance)) "restarted from the journal")
+        (is (= 108 (:entry/balance (actors/call! s (account id) :account/deposit #:transfer{:id "more" :amount 1}))))
+        (is (= [1 2 3] (map first (journal-rows id))))))))
+
+(deftest a-state-in-grain-storage-is-its-row-in-edn
+  (when @reachable?
+    (let [id (unique "run")]
+      (with-silo [s]
+        (actors/call! s (run/run id) :run/open #:run{:accounts 3 :opening 50})
+        (actors/call! s (run/run id) :run/reserve 10))
+      (is (= #:run{:id id :reserved 10 :accounts 3 :opening 50} (read-string (row (str "run/" id))))
+          "the row is the state, readable as EDN"))))
+
+(deftest the-etag-refuses-a-second-writer
+  ;; The same fence for an actor in Orleans grain storage: its row is
+  ;; written behind its back, and the ETag refuses the activation's next write.
+  (when @reachable?
+    (let [id (unique "etag")
+          key (str "run/" id)]
+      (with-silo [s]
+        (actors/call! s (run/run id) :run/reserve 1)
+        (is (= 1 (sql "update orleansstorage set payloadbinary = convert_to(@edn, 'UTF8'), version = version + 1 where grainidextensionstring = @key"
+                      {"key" key "edn" (pr-str #:run{:id id :reserved 1000})})))
+        (is (thrown-with-msg? Exception #"(?i)version conflict|etag|inconsistent"
+                              (actors/call! s (run/run id) :run/reserve 1))
             "the stale write is refused")
-        (is (= 7 (actors/call! s (account id) :account/get-balance)) "restarted from what is stored")
-        (is (= 8 (actors/call! s (account id) :account/deposit #:transfer{:id "more" :amount 1})))))))
+        (is (= [1000 1001] (actors/call! s (run/run id) :run/reserve 1)) "restarted from what is stored")))))
 
 (deftest a-short-chaos-run-balances-the-books
   (when @reachable?

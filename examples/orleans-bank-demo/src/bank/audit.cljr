@@ -1,9 +1,11 @@
 (ns bank.audit
-  "Checks a run's books: that no money appeared or vanished, and that every
-   transfer happened exactly once or not at all. `check` is a pure function
-   of the accounts' and transfers' states; `audit` asks the actors for
-   them, so it works the same on the local system in a test and against
-   the PostgreSQL-backed cluster, any time after the run."
+  "Checks a run's books: that no money appeared or vanished, that every
+   transfer happened exactly once or not at all, that every journal
+   explains its balance, and that the books balanced not only at the end
+   but at every moment of the run. `check` is a pure function of the
+   accounts' journals and the transfers' states; `audit` asks the actors
+   for them, so it works the same on the local system in a test and
+   against the PostgreSQL-backed cluster, any time after the run."
   (:require [clojure.clr.async.task.alpha :as t]
             [bank.account :refer [account]]
             [bank.run :as run]
@@ -15,45 +17,94 @@
   [account-id]
   (str account-id "-open"))
 
-(defn- entry-total [entries]
-  (reduce (fn [sum [_ [kind amount]]]
-            (case kind
-              (:deposit :credit) (+ sum amount)
-              :debit (- sum amount)
-              :declined sum))
-          0 entries))
+(defn- delta [{:entry/keys [kind amount]}]
+  (case kind
+    (:deposit :credit) amount
+    :debit (- amount)
+    :declined 0))
+
+(defn- journal-problems
+  "What is wrong with one account's journal: gaps in seq, times that do
+   not increase, a balance that does not follow from the one before, a
+   summary that is not where the journal ends."
+  [{:account/keys [id balance seq entries]}]
+  (concat
+    (when (not= (map :entry/seq entries) (range 1 (inc (count entries))))
+      [(str id ": the journal's seq are not 1.." (count entries))])
+    (when (not= seq (count entries))
+      [(str id ": the account ends at seq " seq ", its journal has " (count entries) " entries")])
+    (for [[a b] (partition 2 1 entries) :when (<= (:entry/at b) (:entry/at a))]
+      (str id ": entry " (:entry/seq b) " is not booked after entry " (:entry/seq a)))
+    (first (for [[previous entry] (map vector (cons 0 (map :entry/balance entries)) entries)
+                 :when (not= (:entry/balance entry) (+ previous (delta entry)))]
+             [(str id ": entry " (:entry/seq entry) " has balance " (:entry/balance entry) ", the one before "
+                   previous " and " (name (:entry/kind entry)) " " (:entry/amount entry) " make "
+                   (+ previous (delta entry)))]))
+    (when (not= balance (or (:entry/balance (peek entries)) 0))
+      [(str id ": the balance is " balance " but its journal ends at " (:entry/balance (peek entries)))])))
+
+(defn- moments
+  "Sweeps every entry of every account in time order and checks, at each
+   moment something was booked, that the accounts plus the money on its way
+   (debited, not credited yet) hold what was deposited. Returns
+   [moments-checked problems]."
+  [accounts]
+  (let [groups (partition-by :entry/at (sort-by :entry/at (mapcat :account/entries accounts)))]
+    (loop [groups groups n 0 held 0 in-flight {} deposited 0 problems []]
+      (if-let [group (first groups)]
+        (let [[held in-flight deposited]
+              (reduce (fn [[held in-flight deposited] {:entry/keys [kind key amount]}]
+                        (case kind
+                          :deposit [(+ held amount) in-flight (+ deposited amount)]
+                          :debit [(- held amount) (update in-flight key (fnil + 0) amount) deposited]
+                          :credit [(+ held amount) (update in-flight key (fnil - 0) amount) deposited]
+                          :declined [held in-flight deposited]))
+                      [held in-flight deposited]
+                      group)
+              flying (reduce + 0 (vals in-flight))
+              at (:entry/at (first group))
+              problems (cond-> problems
+                         (not= (+ held flying) deposited)
+                         (conj (str "at " at " µs the accounts hold " held " and " flying " is on its way, but "
+                                    deposited " was deposited"))
+                         (some neg? (vals in-flight))
+                         (conj (str "at " at " µs a transfer was credited before it was debited")))]
+          (recur (rest groups) (inc n) held in-flight deposited (vec (take 20 problems))))
+        [n (vec (distinct problems))]))))
 
 (defn check
   "The findings for a run's final states: {:ok? :total :expected :counts
-   :recovered :problems}, :recovered the number of transfers a crash
-   interrupted and their reminder finished. `accounts` and `transfers` are the states the actors
-   report; `opening` what each account was opened with."
+   :recovered :moments :problems}. `accounts` are the accounts' summaries
+   with their journals as :account/entries, `transfers` the transfers'
+   states, `opening` what each account was opened with. :recovered is the
+   number of transfers a crash interrupted and their reminder finished,
+   :moments the number of moments the books were checked at."
   [{:keys [opening accounts transfers]}]
-  (let [by-id (into {} (map (juxt :account/id identity)) accounts)
-        entry (fn [account-id transfer-id] (get-in by-id [account-id :account/entries transfer-id]))
+  (let [entries-of (into {} (for [{:account/keys [id entries]} accounts]
+                              [id (into {} (map (juxt :entry/key identity)) entries)]))
+        entry (fn [account-id transfer-id] (get-in entries-of [account-id transfer-id]))
+        movement (juxt :entry/kind :entry/amount)
         known (into (set (map (comp opening-id :account/id) accounts)) (map :transfer/id) transfers)
-        total (reduce + (map :account/balance accounts))
+        total (reduce + 0 (map :account/balance accounts))
         expected (* opening (count accounts))
+        [moments moment-problems] (moments accounts)
         problems
         (concat
           (when (not= total expected)
             [(str "the accounts hold " total ", they were opened with " expected)])
-          (for [{:account/keys [id balance entries]} accounts
-                :let [explained (entry-total entries)]
-                :when (not= balance explained)]
-            (str id ": the balance is " balance " but its entries add up to " explained))
+          (mapcat journal-problems accounts)
           (for [{:account/keys [id entries]} accounts
-                [transfer-id _] entries
-                :when (not (known transfer-id))]
-            (str id ": an entry for " transfer-id ", which no transfer of the run knows"))
-          (when-not (every? #(= [:deposit opening] (entry (:account/id %) (opening-id (:account/id %)))) accounts)
+                {:entry/keys [key]} entries
+                :when (not (known key))]
+            (str id ": an entry for " key ", which no transfer of the run knows"))
+          (when-not (every? #(= [:deposit opening] (movement (entry (:account/id %) (opening-id (:account/id %))))) accounts)
             ["an account was not opened with its deposit"])
           (for [{:transfer/keys [id status from to amount]} transfers
                 :let [debit (entry from id) credit (entry to id)
                       problem (case status
-                                :done (when-not (and (= [:debit amount] debit) (= [:credit amount] credit))
+                                :done (when-not (and (= [:debit amount] (movement debit)) (= [:credit amount] (movement credit)))
                                         (str "done, but " from " has " (pr-str debit) " and " to " has " (pr-str credit)))
-                                :declined (when-not (and (= [:declined amount] debit) (nil? credit))
+                                :declined (when-not (and (= [:declined amount] (movement debit)) (nil? credit))
                                             (str "declined, but " from " has " (pr-str debit) " and " to " has " (pr-str credit)))
                                 :pending "still pending"
                                 :blank nil)]
@@ -61,38 +112,63 @@
             (str id ": " problem))
           (for [{:transfer/keys [id status]} transfers
                 :when (= :blank status)
-                {:account/keys [entries] account-id :account/id} accounts
-                :when (contains? entries id)]
-            (str id ": never started, but " account-id " has an entry for it")))]
+                {account-id :account/id} accounts
+                :when (entry account-id id)]
+            (str id ": never started, but " account-id " has an entry for it"))
+          moment-problems)]
     {:ok? (empty? problems)
      :total total
      :expected expected
      :counts (frequencies (map :transfer/status transfers))
      :recovered (count (filter :transfer/recovered? transfers))
+     :moments moments
      :problems (vec problems)}))
 
 (defn- ask-all
   "Sends the call to every ref, `width` at a time, and returns the replies."
-  [system refs type width]
+  [system refs type payload width]
   (into []
         (mapcat (fn [batch]
-                  (let [tasks (mapv #(actors/call system % type) batch)]
+                  (let [tasks (mapv #(actors/call system % type payload) batch)]
                     (mapv t/result tasks))))
         (partition-all width refs)))
 
+(defn journal
+  "An account's whole journal, a page at a time. Blocking."
+  [system account-id]
+  (loop [entries []]
+    (let [page (actors/call! system (account account-id) :account/entries #:page{:after (count entries) :limit 5000})]
+      (if (seq page)
+        (recur (into entries page))
+        entries))))
+
 (defn audit
-  "Audits the run with the given id: reads its record, every account and
-   every transfer it handed out, and checks them. Blocking."
+  "Audits the run with the given id: reads its record, every account with
+   its journal and every transfer it handed out, and checks them. Blocking."
   [system run-id]
   (let [{:run/keys [accounts opening reserved]} (actors/call! system (run/run run-id) :run/show)]
     (when-not accounts
       (throw (ex-info (str "No run " run-id " was opened") {:run run-id})))
-    (check {:opening opening
-            :accounts (ask-all system (mapv #(account (run/account-id run-id %)) (range accounts)) :account/statement 64)
-            :transfers (ask-all system (mapv #(transfer (run/transfer-id run-id %)) (range reserved)) :transfer/show 256)})))
+    (let [ids (mapv #(run/account-id run-id %) (range accounts))
+          summaries (ask-all system (mapv account ids) :account/summary nil 64)]
+      (check {:opening opening
+              :accounts (mapv #(assoc % :account/entries (journal system (:account/id %))) summaries)
+              :transfers (ask-all system (mapv #(transfer (run/transfer-id run-id %)) (range reserved)) :transfer/show nil 256)}))))
+
+(defn books-at
+  "The bank at a moment (µs): what the accounts held then, each asked for
+   its balance at that moment (one lookup in its journal), and what was on
+   its way, debited by a transfer and not credited yet. The two add up to
+   what was deposited by then."
+  [system run-id at transfers]
+  (let [{:run/keys [accounts]} (actors/call! system (run/run run-id) :run/show)]
+    {:held (reduce + 0 (ask-all system (mapv #(account (run/account-id run-id %)) (range accounts)) :account/balance-at at 64))
+     :in-flight (reduce + 0 (for [{:transfer/keys [amount debited-at credited-at]} transfers
+                                  :when (and debited-at (<= debited-at at) (or (nil? credited-at) (> credited-at at)))]
+                              amount))}))
 
 (defn pending
   "The ids of the run's transfers that are still :pending, out of those given."
   [system transfer-ids]
-  (let [statuses (ask-all system (mapv transfer transfer-ids) :transfer/get-status 256)]
+  (let [statuses (ask-all system (mapv transfer transfer-ids) :transfer/get-status nil 256)]
     (vec (keep (fn [[id status]] (when (= :pending status) id)) (map vector transfer-ids statuses)))))

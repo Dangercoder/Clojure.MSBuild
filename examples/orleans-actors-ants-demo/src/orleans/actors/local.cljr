@@ -34,7 +34,8 @@
        (actors/call! system (counter 1) :add 2)
        (local/state system (counter 1)))       ; => 2"
   (:require [clojure.clr.async.task.alpha :as t]
-            [orleans.actors :as actors])
+            [orleans.actors :as actors]
+            [orleans.actors.journal :as journal])
   (:import [System IDisposable]))
 
 (set! *warn-on-reflection* true)
@@ -70,6 +71,12 @@
                       {:actor ref :expected expected :stored (get-in before [key :version] 0)})))
     (swap! (:activations system) assoc-in [ref :versions provider] (inc expected))))
 
+(defn- journal-named
+  "The system's journal of that name, created on first use."
+  [system name]
+  (or (get @(:journals system) name)
+      (get (swap! (:journals system) (fn [js] (if (contains? js name) js (assoc js name (journal/memory))))) name)))
+
 (defrecord LocalHost [system ref]
   actors/Host
   (-timer [_ type payload due period]
@@ -97,12 +104,22 @@
     (crash! system ref :after-write)
     nil)
   (-clear-state [_ provider] (write-versioned! system ref provider actors/none) nil)
+  (-append [_ name entry]
+    (crash! system ref :before-write)
+    (let [result (journal/-append (journal-named system name) ref entry)]
+      (crash! system ref :after-write)
+      result))
+  (-last-entry [_ name] (journal/-last-entry (journal-named system name) ref))
+  (-entry-at [_ name at] (journal/-entry-at (journal-named system name) ref at))
+  (-entry-by-key [_ name key] (journal/-entry-by-key (journal-named system name) ref key))
+  (-entries [_ name after-seq limit] (journal/-entries (journal-named system name) ref after-seq limit))
+  (-now [_] ((:clock system)))
   (-stop [_] (swap! (:activations system) assoc-in [ref :stopping?] true)))
 
 (defn- context [system ref]
   (actors/context ref system (->LocalHost system ref)))
 
-(defrecord LocalSystem [activations stored reminders settings crash]
+(defrecord LocalSystem [activations stored reminders journals settings crash clock]
   actors/Messaging
   (-call [this ref type payload] (dispatch this :call ref type payload))
   (-cast [this ref type payload] (dispatch this :cast ref type payload)))
@@ -148,16 +165,27 @@
 
 (alter-meta! #'dispatch assoc :tag task-of-object)
 
+(defn logical-clock
+  "A clock for the local system: every reading is a millisecond, in
+   microseconds, after the previous one, from 2026-01-01. Nothing depends on
+   the time of day, so a test that reads it is deterministic."
+  []
+  (let [now (atom 1767225600000000)]
+    (fn [] (swap! now + 1000))))
+
 (defn system
   "A local actor system. Options: :state-check as for
    orleans.actors.silo/start, and :crash, for fault injection: a function
    of the actor's ref and :before-write or :after-write, called whenever a
    persisting actor's state is written; when it returns true the write
    throws, before or after the state was stored, as if the host died
-   there."
+   there (appends to a journal count as writes), and :clock, a function
+   of no arguments giving the time in microseconds (`logical-clock` by
+   default)."
   ([] (system {}))
-  ([{:keys [crash] :as options}]
-   (->LocalSystem (atom {}) (atom {}) (atom {}) (actors/settings options) crash)))
+  ([{:keys [crash clock] :as options}]
+   (->LocalSystem (atom {}) (atom {}) (atom {}) (atom {}) (actors/settings options) crash
+                  (or clock (logical-clock)))))
 
 (defn fork
   "A second system on the stored states and reminders of this one, with
@@ -165,16 +193,20 @@
    the state each read, as it can be on two silos for a moment when a
    cluster changes. Their writes are ordered by the records' versions: the
    first one wins, the other throws and its actor restarts from what is
-   stored. Both systems stay usable."
-  [system]
-  (->LocalSystem (atom {}) (:stored system) (:reminders system) (:settings system) (:crash system)))
+   stored. Both systems stay usable. With a skew (microseconds), the
+   fork's clock is that far off the first one's, as the clocks of two
+   silos are."
+  ([system] (fork system 0))
+  ([system skew]
+   (->LocalSystem (atom {}) (:stored system) (:reminders system) (:journals system) (:settings system) (:crash system)
+                  (let [clock (:clock system)] (fn [] (+ skew (clock)))))))
 
 (defn restart
   "A new system with the stored states and the reminders of this one and
    no activations: what is left after every silo of a cluster went down
    and came back. The old system should not be used afterwards."
   [system]
-  (fork system))
+  (fork system 0))
 
 (defn stored
   "The stored state of a persisting actor, `orleans.actors/none` when it

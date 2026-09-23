@@ -10,7 +10,8 @@
         and replies once both are committed. Nothing has moved yet.
      2. It debits the source account, then credits the destination. Both
         messages carry the transfer's id, so repeating them is harmless:
-        the accounts answer from their entries.
+        the accounts answer from their journals. The credit carries the
+        time of the debit, so it is never booked before it.
      3. It records the outcome (:done or :declined), and only then cancels
         the reminder.
 
@@ -37,10 +38,15 @@
   (t/async
     (let [movement #:transfer{:id id :amount amount}
           debit (t/await (actors/call ctx (account from) :account/debit movement))]
-      (if (= :declined debit)
+      (if (= :declined (:entry/kind debit))
         (assoc state :transfer/status :declined)
-        (let [_ (t/await (actors/call ctx (account to) :account/credit movement))]
-          (assoc state :transfer/status :done))))))
+        ;; the credit carries the time of the debit: it is booked after it,
+        ;; whatever the clock of the destination's silo says
+        (let [credit (t/await (actors/call ctx (account to) :account/credit
+                                           (assoc movement :transfer/debited-at (:entry/at debit))))]
+          (assoc state :transfer/status :done
+                       :transfer/debited-at (:entry/at debit)
+                       :transfer/credited-at (:entry/at credit)))))))
 
 (alter-meta! #'move! assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
 
@@ -65,7 +71,7 @@
 (defactor transfer
   "A transfer, addressed as (transfer id). The id is the idempotency key:
    starting the same transfer twice starts it once."
-  {:state ::model/transfer :persist :ledger}
+  {:state ::model/transfer :persist :bank}
 
   (init [ctx id]
     #:transfer{:id id :status :blank})

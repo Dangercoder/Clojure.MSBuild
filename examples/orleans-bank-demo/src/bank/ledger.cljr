@@ -1,0 +1,147 @@
+;; Npgsql and System.Data.Common are not loaded until something uses them;
+;; ClojureCLR resolves type names against loaded assemblies, so load them first.
+(assembly-load "System.Data.Common")
+(assembly-load "Npgsql")
+
+(ns bank.ledger
+  "The accounts' journal in PostgreSQL: the ledger_entries table
+   (sql/09-ledger.sql), one row per entry, as an
+   orleans.actors.journal/Journal. An entry is
+
+     #:entry{:seq 42 :key \"<transfer id>\" :kind :debit :amount 300
+             :balance 9700 :at <microseconds since the epoch>}
+
+   and a row is the same, column for column. The primary key (account_id,
+   seq) is the journal's fence, the unique (account_id, transfer_id) its
+   idempotency key, and the index on (account_id, booked_at) makes the
+   entry as of any moment, and so the balance then, one index lookup."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [orleans.actors :as actors]
+            [orleans.actors.journal :as journal])
+  (:import [Npgsql NpgsqlCommand NpgsqlDataReader NpgsqlDataSource PostgresException]
+           [System AggregateException IDisposable]))
+
+(set! *warn-on-reflection* true)
+
+(def ^:private kinds {:deposit 0 :debit 1 :credit 2 :declined 3})
+(def ^:private kind-of (into {} (map (fn [[k v]] [v k])) kinds))
+
+(def ^:private columns
+  "seq, transfer_id, kind, amount, balance_after, (extract(epoch from booked_at) * 1000000)::bigint")
+
+(defn- row->entry [^NpgsqlDataReader r]
+  #:entry{:seq (.GetInt64 r 0)
+          :key (.GetString r 1)
+          :kind (kind-of (long (.GetInt16 r 2)))
+          :amount (.GetInt64 r 3)
+          :balance (.GetInt64 r 4)
+          :at (.GetInt64 r 5)})
+
+(defn- command ^NpgsqlCommand [^NpgsqlDataSource source ^String sql params]
+  (let [command (.CreateCommand source sql)]
+    (doseq [p params] (.AddWithValue (.Parameters command) ^Object p))
+    command))
+
+(defn- disposing
+  "A Task of what task gives, disposing of x once it is done, whether it
+   completed or failed (t/await cannot sit inside a try, so no with-open)."
+  [^IDisposable x task]
+  (t/async
+    (let [[value error] (t/await (actors/outcome task))]
+      (.Dispose x)
+      (if error (throw error) value))))
+
+(alter-meta! #'disposing assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- read-all [^NpgsqlDataReader reader]
+  (t/async
+    (loop [entries []]
+      (if (t/await (.ReadAsync reader))
+        (recur (conj entries (row->entry reader)))
+        entries))))
+
+(alter-meta! #'read-all assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- execute-reader [^NpgsqlCommand command]
+  (t/async
+    (let [reader (t/await (.ExecuteReaderAsync command))]
+      (t/await (disposing reader (read-all reader))))))
+
+(alter-meta! #'execute-reader assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- query
+  "A Task of the entries the query returns."
+  [source sql params]
+  (let [command (command source sql params)]
+    (disposing command (execute-reader command))))
+
+(alter-meta! #'query assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- first-entry [source sql params]
+  (t/async (first (t/await (query source sql params)))))
+
+(alter-meta! #'first-entry assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- account-of ^String [ref]
+  (when-not (= :account (:actor/type ref))
+    (throw (ex-info (str "The ledger is the accounts' journal, not " (:actor/type ref) "'s") {:actor ref})))
+  (:actor/id ref))
+
+(defn- fence-violation? [^Exception e]
+  (let [e (if (instance? AggregateException e) (.InnerException e) e)]
+    (and (instance? PostgresException e)
+         (= "23505" (.SqlState ^PostgresException e))
+         (= "ledger_entries_pkey" (.ConstraintName ^PostgresException e)))))
+
+(defn- insert!
+  "A Task of the number of rows inserted: 1, or 0 when the transfer id is
+   in the account's journal already. A seq that is taken is a unique
+   violation of the primary key, which propagates."
+  [source account {:entry/keys [seq key kind amount balance at]}]
+  (let [command (command source
+                         (str "INSERT INTO ledger_entries (account_id, seq, transfer_id, kind, amount, balance_after, booked_at) "
+                              "VALUES ($1, $2, $3, $4, $5, $6, timestamptz 'epoch' + $7 * interval '1 microsecond') "
+                              "ON CONFLICT (account_id, transfer_id) DO NOTHING")
+                         [account (long seq) key (short (kinds kind)) (long amount) (long balance) (long at)])]
+    (disposing command (t/async (long (t/await (.ExecuteNonQueryAsync command)))))))
+
+(alter-meta! #'insert! assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defrecord Ledger [^NpgsqlDataSource source]
+  journal/Journal
+  (-append [_ ref entry]
+    (let [account (account-of ref)]
+      (t/async
+        (let [[inserted error] (t/await (actors/outcome (insert! source account entry)))]
+          (cond
+            (and error (fence-violation? error))
+            (throw (ex-info (str "Journal conflict: account " account " appended seq " (:entry/seq entry)
+                                 ", which another activation of it took")
+                            {:actor ref :seq (:entry/seq entry)}))
+
+            error (throw error)
+
+            (= 1 inserted) {:appended? true :entry entry}
+
+            :else {:appended? false
+                   :existing (t/await (first-entry source (str "SELECT " columns " FROM ledger_entries WHERE account_id = $1 AND transfer_id = $2")
+                                                   [account (:entry/key entry)]))})))))
+  (-last-entry [_ ref]
+    (first-entry source (str "SELECT " columns " FROM ledger_entries WHERE account_id = $1 ORDER BY seq DESC LIMIT 1")
+                 [(account-of ref)]))
+  (-entry-at [_ ref at]
+    (first-entry source (str "SELECT " columns " FROM ledger_entries WHERE account_id = $1 "
+                             "AND booked_at <= timestamptz 'epoch' + $2 * interval '1 microsecond' "
+                             "ORDER BY booked_at DESC LIMIT 1")
+                 [(account-of ref) (long at)]))
+  (-entry-by-key [_ ref key]
+    (first-entry source (str "SELECT " columns " FROM ledger_entries WHERE account_id = $1 AND transfer_id = $2")
+                 [(account-of ref) key]))
+  (-entries [_ ref after-seq limit]
+    (query source (str "SELECT " columns " FROM ledger_entries WHERE account_id = $1 AND seq > $2 ORDER BY seq LIMIT $3")
+           [(account-of ref) (long after-seq) (long limit)])))
+
+(defn ledger
+  "The ledger in the database at the connection string."
+  [^String connection-string]
+  (->Ledger (NpgsqlDataSource/Create connection-string)))

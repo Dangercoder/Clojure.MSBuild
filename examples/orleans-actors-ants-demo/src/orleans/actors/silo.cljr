@@ -25,6 +25,7 @@
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.string :as str]
             [orleans.actors :as actors]
+            [orleans.actors.journal :as journal]
             [orleans.actors.wire :as wire])
   (:import [Clojure.Orleans Actors ActorGrain ActorMessage ActorReply IActorHost IClojureWire]
            [Microsoft.Extensions.Hosting IHost]
@@ -71,7 +72,15 @@
   (-call [_ ref type payload] (grain-call factory ref type payload))
   (-cast [_ ref type payload] (grain-cast factory ref type payload)))
 
-(defrecord GrainHost [^ActorGrain grain]
+(defn- journal-named [journals name]
+  (or (get journals name)
+      (throw (ex-info (str "No journal named \"" name "\" is configured on this silo (:journals of silo/start)")
+                      {:journal name}))))
+
+(defn- now-micros []
+  (quot (- (.Ticks System.DateTime/UtcNow) 621355968000000000) 10))
+
+(defrecord GrainHost [^ActorGrain grain journals]
   actors/Host
   (-timer [_ type payload due period]
     (.Timer grain (message type payload) (span due) (if period (span period) Timeout/InfiniteTimeSpan)))
@@ -85,14 +94,20 @@
     (t/async (t/await (.WriteStored grain ^String provider state)) nil))
   (-clear-state [_ provider]
     (t/async (t/await (.ClearStored grain ^String provider)) nil))
+  (-append [_ name entry] (journal/-append (journal-named journals name) (key->ref (.Key grain)) entry))
+  (-last-entry [_ name] (journal/-last-entry (journal-named journals name) (key->ref (.Key grain))))
+  (-entry-at [_ name at] (journal/-entry-at (journal-named journals name) (key->ref (.Key grain)) at))
+  (-entry-by-key [_ name key] (journal/-entry-by-key (journal-named journals name) (key->ref (.Key grain)) key))
+  (-entries [_ name after-seq limit] (journal/-entries (journal-named journals name) (key->ref (.Key grain)) after-seq limit))
+  (-now [_] (now-micros))
   (-stop [_] (.Stop grain)))
 
 (defn- actor-host
   "The IActorHost the grains call: it hands every event to the runtime with
    a context for the grain, and keeps the state on the grain."
-  [settings]
+  [settings journals]
   (let [context (fn [^ActorGrain grain]
-                  (actors/context (key->ref (.Key grain)) (->GrainMessaging (.Factory grain)) (->GrainHost grain)))
+                  (actors/context (key->ref (.Key grain)) (->GrainMessaging (.Factory grain)) (->GrainHost grain journals)))
         handle (fn [kind ^ActorGrain grain ^ActorMessage message]
                  (t/async
                    (let [[reply state] (t/await (actors/handle (context grain) settings kind (.State grain)
@@ -141,15 +156,18 @@
                    true} actors are kept) and reminders, replacing the
                    in-memory, localhost defaults; :primary-port is then
                    ignored, the clustering finds the cluster
+     :journals     {name journal}: the journals journaled actors ({:journal
+                   :name}) record in, orleans.actors.journal/Journal
+                   implementations; a silo has none by default
      :state-check  see orleans.actors/settings
      :log-level    LogLevel/Warning"
   ([] (start {}))
-  ([{:keys [silo-port gateway-port primary-port configure log-level]
+  ([{:keys [silo-port gateway-port primary-port configure log-level journals]
      :or {silo-port 11111 gateway-port 30000 primary-port 0 log-level LogLevel/Warning}
      :as options}]
    (let [settings (actors/settings options)]
      (t/async
-       (let [host (t/await (Actors/StartSiloAsync (actor-host settings) (clojure-wire)
+       (let [host (t/await (Actors/StartSiloAsync (actor-host settings (into {} (map (fn [[k v]] [(name k) v])) journals)) (clojure-wire)
                                                   (int silo-port) (int gateway-port) (int primary-port) log-level
                                                   configure))]
          (->Silo host settings))))))

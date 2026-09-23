@@ -1,11 +1,13 @@
 (ns bank.cluster
   "The bank's cluster on PostgreSQL: silos in this process or in processes
    of their own, and the client the drivers send through. Membership, the
-   \"ledger\" grain storage and reminders are Orleans' ADO.NET providers
-   (glue/Postgres.cs); the database is the one docker-compose.yml starts,
-   or BANK_POSTGRES."
+   \"bank\" grain storage (transfers, runs) and reminders are Orleans'
+   ADO.NET providers (glue/Postgres.cs); the accounts' journal is the
+   ledger_entries table (bank.ledger). The database is the one
+   docker-compose.yml starts, or BANK_POSTGRES."
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.string :as str]
+            [bank.ledger :as ledger]
             [orleans.actors.silo :as silo])
   (:import [Bank.Orleans Postgres]
            [Microsoft.Extensions.Logging LogLevel]
@@ -35,7 +37,8 @@
    the silo, a system for actors/call."
   [i]
   (silo/start (merge (silo-ports i)
-                     {:configure (Postgres/Silo (connection-string) minimum-reminder-period)})))
+                     {:configure (Postgres/Silo (connection-string) minimum-reminder-period)
+                      :journals {:ledger (ledger/ledger (connection-string))}})))
 
 (defn connect!
   "Connects to the cluster as a client, retrying while no silo is up yet.
