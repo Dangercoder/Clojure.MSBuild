@@ -411,7 +411,10 @@
               supervised GenServer coming back after a crash; a persisting
               actor resumes from its stored state, the last one that
               conformed
-     :resume  the state is kept
+     :resume  the state is kept; not for a persisting actor whose write
+              was refused because its record moved (a version conflict):
+              it keeps the version it read, so every later write fails
+              too, where :restart reads the record again
      :stop    the actor is deactivated
    Returns a Task of the state to continue with. The exception itself
    still reaches the caller."

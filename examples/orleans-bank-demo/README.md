@@ -136,9 +136,9 @@ first.
   the exact writes that crash, before or after being stored. The local
   host does nothing the test does not say, on the test's thread, so every
   case is reproducible from its seed and a failure shrinks to the smallest
-  schedule that breaks. With the version check switched off, it takes
-  test.check half a second to find the lost update and shrink it to five
-  steps, no crash needed:
+  schedule that breaks. With the version check switched off, test.check finds
+  the lost update within a second and shrinks it, in about another second,
+  to five steps with no crash at all:
 
   ```clojure
   [[:split] [:transfer 0 0 1 1] [:transfer 1 0 1 1] [:tick 1] [:tick 0]]
@@ -182,6 +182,9 @@ first.
 
 ## Notes
 
+- The repository's `nuget.config` lists a local `packages/` source, which a
+  fresh clone does not have: `mkdir -p ../../packages` before the first
+  build.
 - The database is at `localhost:5433` (user and password `orleans`, database
   `bank`); `BANK_POSTGRES` takes another connection string. Each silo keeps
   a pool of at most 16 connections.
