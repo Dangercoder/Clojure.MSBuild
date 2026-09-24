@@ -5,28 +5,33 @@ using Npgsql.Replication.PgOutput;
 using Npgsql.Replication.PgOutput.Messages;
 using NpgsqlTypes;
 
-namespace Bank.Orleans;
-
-/// <summary>A row added to ledger_entries, as the replicator read it from the WAL, with the LSN
-/// at the end of the transaction that added it: acknowledging that LSN says the row is taken.</summary>
-public sealed record LedgerRow(string AccountId, long Seq, string TransferId, short Kind, long Amount,
-                               long BalanceAfter, DateTime BookedAt, ulong Lsn);
+namespace Replication.Postgres;
 
 /// <summary>
-/// Reads the rows added to the tables of a publication out of PostgreSQL's WAL, through a logical
+/// A change to a row of a published table, as the WAL says it: the table ("schema.name"), the
+/// operation ("insert", "update" or "delete"), the row's columns as PostgreSQL's text for them
+/// (the new row, or for a delete the key the table identifies rows by; null for SQL NULL), and
+/// the LSN at the end of the transaction that made it: acknowledging that LSN says the change is
+/// taken. Nothing here knows what the tables mean.
+/// </summary>
+public sealed record Change(string Table, string Operation, IReadOnlyDictionary<string, string?> Row,
+                            ulong Lsn, DateTime CommittedAt);
+
+/// <summary>
+/// Reads the changes to the tables of a publication out of PostgreSQL's WAL, through a logical
 /// replication slot (pgoutput). The slot is the cursor and PostgreSQL keeps it: a replicator
 /// started on it resumes after the last LSN acknowledged through it, by this process or any
-/// other, so acknowledging late can only repeat rows, never lose one. A slot has one reader at a
-/// time; PostgreSQL refuses a second.
+/// other, so acknowledging late can only repeat changes, never lose one. A slot has one reader at
+/// a time; PostgreSQL refuses a second.
 /// <para>A background pump reads the stream (and answers PostgreSQL's keepalives, so it does not
-/// depend on how often rows are taken) into a bounded channel; <see cref="Drain"/> takes rows
-/// out of it, and only whole transactions go in. When the pump fails, the replicator stops and
-/// <see cref="Fault"/> says why; the owner disposes of it and starts another.</para>
+/// depend on how often changes are taken) into a bounded channel; <see cref="Drain"/> takes them
+/// out, and only whole transactions go in. When the pump fails, the replicator stops and
+/// <see cref="Fault"/> says why; the owner closes it and starts another.</para>
 /// </summary>
 public sealed class Replicator : IAsyncDisposable
 {
     private readonly LogicalReplicationConnection connection;
-    private readonly Channel<LedgerRow> rows;
+    private readonly Channel<Change> changes;
     private readonly CancellationTokenSource stopping = new();
     private readonly Task pump;
     private ulong acknowledged;
@@ -34,7 +39,7 @@ public sealed class Replicator : IAsyncDisposable
     private Replicator(LogicalReplicationConnection connection, string slot, string publication, int capacity)
     {
         this.connection = connection;
-        rows = Channel.CreateBounded<LedgerRow>(new BoundedChannelOptions(capacity) { SingleReader = true, SingleWriter = true });
+        changes = Channel.CreateBounded<Change>(new BoundedChannelOptions(capacity) { SingleReader = true, SingleWriter = true });
         pump = Task.Run(() => Pump(slot, publication, stopping.Token));
     }
 
@@ -67,11 +72,35 @@ public sealed class Replicator : IAsyncDisposable
         return new Replicator(connection, slot, publication, capacity);
     }
 
+    private static string TableOf(RelationMessage relation) => $"{relation.Namespace}.{relation.RelationName}";
+
+    /// <summary>The columns of a tuple as text, in the relation's order. The message objects are
+    /// reused by the next message, so the values are copied out now.</summary>
+    private static async Task<Dictionary<string, string?>> RowOf(RelationMessage relation, ReplicationTuple tuple, CancellationToken ct)
+    {
+        var row = new Dictionary<string, string?>();
+        var i = 0;
+        await foreach (var value in tuple)
+        {
+            var name = relation.Columns[i++].ColumnName;
+            if (value.IsDBNull)
+            {
+                row[name] = null;
+            }
+            else
+            {
+                using var reader = value.GetTextReader();
+                row[name] = await reader.ReadToEndAsync(ct);
+            }
+        }
+        return row;
+    }
+
     private async Task Pump(string slot, string publication, CancellationToken ct)
     {
         try
         {
-            var transaction = new List<LedgerRow>();
+            var transaction = new List<(string Table, string Operation, Dictionary<string, string?> Row)>();
             var options = new PgOutputReplicationOptions(publication, PgOutputProtocolVersion.V1);
             await foreach (var message in connection.StartReplication(new PgOutputReplicationSlot(slot), options, ct))
             {
@@ -80,27 +109,22 @@ public sealed class Replicator : IAsyncDisposable
                     case BeginMessage:
                         transaction.Clear();
                         break;
-                    case InsertMessage insert when insert.Relation.RelationName == "ledger_entries":
-                        // the message object is reused: copy the values out now, in the order of
-                        // the relation's columns, from their text (pgoutput sends text)
-                        var text = new Dictionary<string, string>();
-                        var i = 0;
-                        await foreach (var value in insert.NewRow)
-                        {
-                            var name = insert.Relation.Columns[i++].ColumnName;
-                            using var reader = value.GetTextReader();
-                            text[name] = await reader.ReadToEndAsync(ct);
-                        }
-                        transaction.Add(new LedgerRow(text["account_id"], long.Parse(text["seq"]), text["transfer_id"],
-                                                      short.Parse(text["kind"]), long.Parse(text["amount"]),
-                                                      long.Parse(text["balance_after"]),
-                                                      DateTimeOffset.Parse(text["booked_at"], System.Globalization.CultureInfo.InvariantCulture).UtcDateTime,
-                                                      0));
+                    case InsertMessage insert:
+                        transaction.Add((TableOf(insert.Relation), "insert", await RowOf(insert.Relation, insert.NewRow, ct)));
+                        break;
+                    case UpdateMessage update:
+                        transaction.Add((TableOf(update.Relation), "update", await RowOf(update.Relation, update.NewRow, ct)));
+                        break;
+                    case KeyDeleteMessage delete:
+                        transaction.Add((TableOf(delete.Relation), "delete", await RowOf(delete.Relation, delete.Key, ct)));
+                        break;
+                    case FullDeleteMessage delete:
+                        transaction.Add((TableOf(delete.Relation), "delete", await RowOf(delete.Relation, delete.OldRow, ct)));
                         break;
                     case CommitMessage commit:
                         var lsn = (ulong)commit.TransactionEndLsn;
-                        foreach (var row in transaction)
-                            await rows.Writer.WriteAsync(row with { Lsn = lsn }, ct);
+                        foreach (var (table, operation, row) in transaction)
+                            await changes.Writer.WriteAsync(new Change(table, operation, row, lsn, commit.TransactionCommitTimestamp), ct);
                         transaction.Clear();
                         break;
                 }
@@ -113,21 +137,21 @@ public sealed class Replicator : IAsyncDisposable
         }
         finally
         {
-            rows.Writer.TryComplete();
+            changes.Writer.TryComplete();
         }
     }
 
-    /// <summary>Takes up to <paramref name="max"/> rows that are ready, in WAL order.</summary>
-    public LedgerRow[] Drain(int max)
+    /// <summary>Takes up to <paramref name="max"/> changes that are ready, in WAL order.</summary>
+    public Change[] Drain(int max)
     {
-        var taken = new List<LedgerRow>();
-        while (taken.Count < max && rows.Reader.TryRead(out var row))
-            taken.Add(row);
+        var taken = new List<Change>();
+        while (taken.Count < max && changes.Reader.TryRead(out var change))
+            taken.Add(change);
         return taken.ToArray();
     }
 
-    /// <summary>Says every row up to <paramref name="lsn"/> is taken; PostgreSQL gets it with the
-    /// next status update (within a second) and may drop the WAL before it.</summary>
+    /// <summary>Says every change up to <paramref name="lsn"/> is taken; PostgreSQL gets it with
+    /// the next status update (within a second) and may drop the WAL before it.</summary>
     public void Acknowledge(ulong lsn)
     {
         if (lsn <= Acknowledged) return;

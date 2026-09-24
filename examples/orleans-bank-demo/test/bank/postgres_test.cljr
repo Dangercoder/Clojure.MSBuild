@@ -13,9 +13,11 @@
             [bank.audit :as audit]
             [bank.chaos :as chaos]
             [bank.events :as events]
-            [bank.sink :as sink]
+            [replication.postgres :as replication]
+            [replication.sink :as sink]
             [bank.events :as events]
-            [bank.sink :as sink]
+            [replication.postgres :as replication]
+            [replication.sink :as sink]
             [bank.run :as run]
             [bank.cluster :as cluster]
             [orleans.actors :as actors]
@@ -136,16 +138,16 @@
   "Drains the replicator into the sink until it has every entry of the
    account's journal."
   [system sink account-id]
-  (until #(do (events/drain! system sink)
-              (empty? (sink/missing sink account-id (audit/journal system account-id))))))
+  (until #(do (replication/drain! system events/ledger (fn [batch] (sink/keep! sink batch)))
+              (empty? (events/missing sink account-id (audit/journal system account-id))))))
 
 (deftest the-replicator-streams-the-ledger-and-comes-back
   (when @reachable?
     (let [id (unique "cdc")
-          received (sink/sink)
+          received (sink/sink events/key-of)
           book! (fn [s tid amount] (actors/call! s (account id) :account/deposit #:transfer{:id tid :amount amount}))]
       (with-silo [s]
-        (is (until #(:events/running? (actors/call! s (events/events "bank") :events/status))) "the stream runs")
+        (is (until #(:replicator/running? (replication/status s events/ledger))) "the stream runs")
         (book! s "a" 10) (book! s "b" 20)
         (is (streamed? s received id) "what the account booked came out of the WAL")
         (testing "the connection is killed on PostgreSQL's side: the replicator starts the stream again"
@@ -156,7 +158,7 @@
         (with-silo [s]
           (book! s "d" 40)
           (is (streamed? s received id))
-          (is (= [1 2 3 4] (sort (for [[[account seq] _] (:events @received) :when (= account id)] seq))))
+          (is (= [1 2 3 4] (sort (for [[[account seq] _] (sink/events received) :when (= account id)] seq))))
           (is (zero? (:conflicting (sink/stats received))) "a repeat is the same event")
           (is (until #(sql "select confirmed_flush_lsn >= (select max(0)::pg_lsn from pg_replication_slots) from pg_replication_slots where slot_name = 'bank_events'" {}))
               "the slot moved on"))))))
@@ -172,8 +174,8 @@
   "Drains the replicator into the sink until it has every entry of the
    account's journal."
   [system sink account-id]
-  (until #(do (events/drain! system sink)
-              (empty? (sink/missing sink account-id (audit/journal system account-id))))))
+  (until #(do (replication/drain! system events/ledger (fn [batch] (sink/keep! sink batch)))
+              (empty? (events/missing sink account-id (audit/journal system account-id))))))
 
 (defn- slot-position []
   (sql "select (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint from pg_replication_slots where slot_name = 'bank_events'" {}))
@@ -181,10 +183,10 @@
 (deftest the-replicator-streams-the-ledger-and-comes-back
   (when @reachable?
     (let [id (unique "cdc")
-          received (sink/sink)
+          received (sink/sink events/key-of)
           book! (fn [s tid amount] (actors/call! s (account id) :account/deposit #:transfer{:id tid :amount amount}))]
       (with-silo [s]
-        (is (until #(:events/running? (actors/call! s (events/events "bank") :events/status))) "the stream runs")
+        (is (until #(:replicator/running? (replication/status s events/ledger))) "the stream runs")
         (book! s "a" 10) (book! s "b" 20)
         (is (streamed? s received id) "what the account booked came out of the WAL")
         (testing "the connection is killed on PostgreSQL's side: the replicator starts the stream again"
@@ -196,7 +198,7 @@
           (with-silo [s]
             (book! s "d" 40)
             (is (streamed? s received id))
-            (is (= [1 2 3 4] (sort (for [[[account seq] _] (:events @received) :when (= account id)] seq))))
+            (is (= [1 2 3 4] (sort (for [[[account seq] _] (sink/events received) :when (= account id)] seq))))
             (is (zero? (:conflicting (sink/stats received))) "a repeat is the same event")
             (is (until #(> (slot-position) before)) "the acknowledgements moved the slot on")))))))
 

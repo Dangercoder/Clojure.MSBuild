@@ -11,7 +11,8 @@
             [bank.audit :as audit]
             [bank.cluster :as cluster]
             [bank.events :as events]
-            [bank.sink :as sink]
+            [replication.postgres :as replication]
+            [replication.sink :as sink]
             [bank.run :as run]
             [bank.transfer :refer [transfer]]
             [orleans.actors :as actors]
@@ -194,7 +195,7 @@
    the demo's."
   [client silos]
   (try
-    (let [pid (:events/process (actors/call! client (events/events "bank") :events/status))]
+    (let [pid (:replicator/process (actors/call! client events/ledger :replicator/status))]
       (some (fn [[i {:keys [^Process process]}]] (when (= pid (.Id process)) i)) @silos))
     (catch Exception _ nil)))
 
@@ -205,11 +206,10 @@
   (future
     (loop [n 0]
       (when @consuming?
-        (let [taken (try (events/drain! client sink) (catch Exception _ 0))]
+        (let [taken (try (replication/drain! client events/ledger #(sink/keep! sink %)) (catch Exception _ 0))]
           (when (zero? (mod n 10))
-            (try (let [{:events/keys [activation process]} (actors/call! client (events/events "bank") :events/status)]
-                   (swap! seen conj [activation process]))
-                 (catch Exception _ nil)))
+            (when-let [{:replicator/keys [activation process]} (replication/status client events/ledger)]
+              (swap! seen conj [activation process])))
           (when (< taken 5000) (sleep 200))
           (recur (inc n)))))))
 
@@ -221,7 +221,7 @@
                             [id (retrying (atom 0) #(audit/journal client id))]))]
     (loop [tries 0]
       (let [missing (into {} (for [[id journal] journals
-                                   :let [m (sink/missing received id journal)]
+                                   :let [m (events/missing received id journal)]
                                    :when (seq m)]
                                [id m]))]
         (if (or (empty? missing) (= tries 300))
@@ -250,7 +250,7 @@
         stats {:started (atom 0) :retries (atom 0)}
         kills (atom 0)
         run-id (now-id)
-        received (sink/sink)
+        received (sink/sink events/key-of)
         consuming? (atom false)
         pumps (atom [])
         seen (atom #{})]
@@ -264,8 +264,7 @@
             (sleep 500) (recur (inc tries))))
         (loop [tries 0]
           (when (and (< tries 120)
-                     (not (:events/running? (try (actors/call! client (events/events "bank") :events/status)
-                                                 (catch Exception _ nil)))))
+                     (not (:replicator/running? (replication/status client events/ledger))))
             (sleep 500) (recur (inc tries))))
         (log "Cluster up: " (cluster/active-silos client) " silos, the replicator streaming. Run " run-id ": opening "
              (:accounts options) " accounts with " (:opening options) " each.")

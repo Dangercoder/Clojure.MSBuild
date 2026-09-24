@@ -225,45 +225,59 @@ would be partitioned by month, which keeps the lookup one descent.
 
 ## Streaming the ledger out of the WAL
 
-Every row the accounts add to the ledger is also an event, and the
-replicator (`src/bank/events.cljr`) streams them out of PostgreSQL itself,
-without a second write and without another process: logical replication
-(`wal_level=logical`) through a slot, `bank_events`, on the publication of
-`ledger_entries` (`sql/10-events.sql`).
+Every row the accounts add to the ledger is also an event, and a
+replicator streams them out of PostgreSQL itself, without a second write
+and without another process: logical replication (`wal_level=logical`)
+through a slot on a publication (`sql/10-events.sql`).
+
+The replicator knows nothing of the bank. `replication.postgres`
+(`src/replication/postgres.cljr`, with `glue/Replicator.cs`) streams any
+publication as changes (`#:change{:table "public.ledger_entries" :op
+:insert :row {"seq" "42" ...} :lsn … :committed-at …}`, the columns as
+PostgreSQL's text); a stream is defined with `defstream`, which says where
+and how a change becomes an event, and its replicator is an actor,
+`(replicator "<stream>")`. The bank's stream is a definition
+(`src/bank/events.cljr`):
 
 ```clojure
-#:event{:type :account/debited :account "<run>-a3" :seq 42 :transfer "<run>-t7"
-        :amount 300 :balance 9700 :at <µs since the epoch> :lsn <WAL position of its commit>}
+(defstream ledger
+  {:connection-string cluster/connection-string
+   :slot "bank_events"
+   :publication "bank_events"
+   :decode decode})          ; a ledger_entries insert -> #:event{:type :account/debited :account … :seq … :amount … :balance … :at …}
 ```
 
 - **The slot is the cursor, and PostgreSQL keeps it.** A consumer takes
-  events (`:events/take`, the oldest first, as often as it likes) and
-  acknowledges what it has kept (`:events/ack` with the last `:event/lsn`),
-  which moves the slot on. Whatever happens to the replicator, the next one
-  starts right after the last acknowledged event: an event acknowledged
-  late comes again, none is lost, and the consumer keeps each once by
-  `(account, seq)`. PostgreSQL keeps the WAL the slot has not acknowledged,
-  up to `max_slot_wal_keep_size`.
+  events (`:replicator/take`, the oldest first, as often as it likes) and
+  acknowledges what it has kept (`:replicator/ack` with the last
+  `:replication.postgres/lsn`, which the replicator adds to every event),
+  which moves the slot on; `replication.postgres/drain!` is one round of
+  that. Whatever happens to the replicator, the next one starts right after
+  the last acknowledged change: an event acknowledged late comes again,
+  none is lost, and the consumer keeps each once by a key of its own
+  (`replication.sink`, here `(account, seq)`). A change the stream's decode
+  drops is acknowledged by the replicator itself. PostgreSQL keeps the WAL
+  the slot has not acknowledged, up to `max_slot_wal_keep_size`.
 - **It does not stay dead.** A reminder wakes the actor every 5 s on
   whichever silo is alive, and a wake starts the stream when it is not
   running: after its silo was killed, after the stream failed (the
-  connection dropped, PostgreSQL restarted it, `57P01`), or after the actor
+  connection dropped, PostgreSQL killed it, `57P01`), or after the actor
   itself failed and restarted, `terminate` (new in the actor library, the
   GenServer `terminate/2`) closing the old stream first.
 - **One reader.** A slot takes one reader at a time and PostgreSQL refuses a
-  second, so two activations of the replicator cannot both read. A reader
+  second, so two activations of a replicator cannot both read. A reader
   that died lets go of the slot within `wal_sender_timeout` (5 s here).
-- **Whole transactions, from its own pump.** The C# `glue/Replicator.cs`
-  reads Npgsql's pgoutput stream on a background task (which also answers
+- **Whole transactions, from its own pump.** `glue/Replicator.cs` reads
+  Npgsql's pgoutput stream on a background task (which also answers
   PostgreSQL's keepalives) into a bounded channel, only whole transactions,
-  each row with the LSN at its transaction's end; the actor moves them into
-  its buffer every 100 ms.
+  each change with the LSN at its transaction's end; the actor decodes
+  them into its buffer every 100 ms.
 
-In the demo the sink is memory in the driver (`src/bank/sink.cljr`),
-outside the silos the monkey kills, where a broker would be; a consumer
-thread drains the replicator into it all run long. The monkey's first kill
-is the replicator's silo. At the end the driver checks the sink against
-every account's journal: every row there, once, the repeats identical.
+In the demo the sink is memory in the driver, outside the silos the monkey
+kills, where a broker would be; a consumer thread drains the replicator
+into it all run long. The monkey's first kill is the replicator's silo. At
+the end the driver checks the sink against every account's journal: every
+row there, once, the repeats identical.
 
 ## Tests
 
@@ -338,11 +352,14 @@ every account's journal: every row there, once, the repeats identical.
   and states, plus asking the actors for them.
 - `src/bank/cluster.cljr` silos and the client on PostgreSQL, silo
   processes; `src/bank/chaos.cljr` the demo; `src/bank/bench.cljr` the
-  million-entry account; `src/bank/events.cljr` the replicator,
-  `src/bank/sink.cljr` the sink; `src/bank/main.cljr` the command line.
+  million-entry account; `src/bank/events.cljr` the ledger stream;
+  `src/bank/main.cljr` the command line.
+- `src/replication/postgres.cljr` streams out of PostgreSQL's WAL, knowing
+  nothing of the bank: `defstream` and the replicator actor;
+  `src/replication/sink.cljr` a sink in memory.
 - `glue/Postgres.cs` the Orleans configuration: ADO.NET clustering, the
   `bank` grain storage, reminders, failure detection tuned for a demo;
-  `glue/Replicator.cs` the WAL reader.
+  `glue/Replicator.cs` the WAL reader, any publication.
 - `sql/` Orleans' PostgreSQL scripts (dotnet/orleans v10.3.1, `src/AdoNet`)
   and the bank's `09-ledger.sql` and `10-events.sql`, run in order by
   `docker-compose.yml`. A database created before them needs them run by
@@ -365,7 +382,7 @@ every account's journal: every row there, once, the repeats identical.
   Orleans logs a warning about it. Failure detection is tuned the same way:
   a killed silo is declared dead within seconds instead of a minute.
 - The replicator's reminder stays registered between runs, so it wakes on
-  the next run's silos and carries on from the slot; `:events/stop` stops
+  the next run's silos and carries on from the slot; `:replicator/stop` stops
   it for good, and `SELECT pg_drop_replication_slot('bank_events')` lets the
   WAL go.
 - A silo started by the demo leaves the cluster gracefully when its standard
