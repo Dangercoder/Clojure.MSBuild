@@ -9,7 +9,7 @@
             [clojure.test.check.properties :as prop]
             [clojure.test.check.clojure-test :refer [defspec]]
             [ants.model :as model]
-            [ants.test-actors :refer [counter ledger liar vault nag tally]]
+            [ants.test-actors :as test-actors :refer [counter ledger liar vault nag tally holder]]
             [ants.world :refer [world]]
             [ants.ant :refer [ant]]
             [orleans.actors :as actors]
@@ -139,6 +139,16 @@
       (local/run-reminders! system)
       (is (= 3 (actors/call! system (nag 1) :nag/count)))
       (is (empty? (local/reminders system (nag 1))) "cancelled on the third tick"))))
+
+(deftest terminate-runs-when-the-activation-ends
+  (reset! test-actors/terminated [])
+  (let [system (local/system)]
+    (actors/call! system (holder "h") :holder/add 2)
+    (is (thrown-with-msg? Exception #"boom" (actors/call! system (holder "h") :holder/fail)))
+    (is (= [["h" 2]] @test-actors/terminated) "a crash ends the activation: terminate gets the state it had")
+    (actors/call! system (holder "h") :holder/add 5)
+    (actors/call! system (holder "h") :holder/stop)
+    (is (= [["h" 2] ["h" 5]] @test-actors/terminated) "and so does a stop")))
 
 ;; ── Journals ─────────────────────────────────────────────────────
 

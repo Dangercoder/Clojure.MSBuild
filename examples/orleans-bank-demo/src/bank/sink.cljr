@@ -1,0 +1,46 @@
+(ns bank.sink
+  "Where the replicator's events end up in the demo: memory, in the driver's
+   process, outside the silos the monkey kills, the way a broker would be.
+   It keeps every event once, by (:event/account, :event/seq), counts the
+   ones that came again, and says what it has not got.")
+
+(defn sink
+  "An empty sink."
+  []
+  (atom {:events {} :received 0 :repeated 0 :conflicting []}))
+
+(defn store!
+  "Keeps a batch of events. An event that is already there is a repeat and
+   must be the same event; one that differs is a conflict."
+  [sink events]
+  (swap! sink
+         (fn [state]
+           (reduce (fn [{:keys [events] :as state} {:event/keys [account seq] :as e}]
+                     (let [k [account seq]
+                           state (update state :received inc)]
+                       (if-let [earlier (get events k)]
+                         (cond-> (update state :repeated inc)
+                           (not= earlier e) (update :conflicting conj [earlier e]))
+                         (assoc-in state [:events k] e))))
+                   state events)))
+  nil)
+
+(defn stats [sink]
+  (let [{:keys [events received repeated conflicting]} @sink]
+    {:events (count events) :received received :repeated repeated :conflicting (count conflicting)}))
+
+(def ^:private kind-of
+  {:account/deposited :deposit :account/debited :debit :account/credited :credit :account/declined :declined})
+
+(defn missing
+  "The entries of an account's journal the sink has not got, or has got
+   differently."
+  [sink account-id journal]
+  (let [events (:events @sink)]
+    (vec (for [{:entry/keys [seq key kind amount balance at] :as entry} journal
+               :let [e (get events [account-id seq])]
+               :when (not (and e
+                               (= key (:event/transfer e))
+                               (= kind (kind-of (:event/type e)))
+                               (= [amount balance at] [(:event/amount e) (:event/balance e) (:event/at e)])))]
+           entry))))

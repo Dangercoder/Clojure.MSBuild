@@ -1,0 +1,158 @@
+(ns bank.events
+  "The replicator: an actor that streams every row added to the ledger out
+   of PostgreSQL's WAL, through the logical replication slot bank_events,
+   as events:
+
+     #:event{:type :account/debited :account \"…-a3\" :seq 42 :transfer \"…-t7\"
+             :amount 300 :balance 9700 :at <µs> :lsn <WAL position>}
+
+   A consumer takes them (:events/take, the oldest first, as often as it
+   likes until it acknowledges them) and acknowledges what it has kept
+   (:events/ack with the last :event/lsn), which moves the slot on. The
+   slot is the cursor, and PostgreSQL keeps it, not the actor: whatever
+   happens to the replicator, the next one starts right after the last
+   acknowledged event. An event acknowledged late comes again; none is
+   lost. A consumer drops the repeats by (:event/account, :event/seq).
+
+   It does not stay dead. A reminder wakes it every few seconds, on
+   whichever silo is alive, and a wake starts the stream when it is not
+   running: after a crash of its silo, a failure of the stream (the
+   connection dropped, PostgreSQL restarted), or a failure of the actor
+   itself, which restarts it, and terminate closes the old stream first.
+   A slot takes one reader at a time; PostgreSQL refuses a second, so two
+   activations of the replicator cannot both read."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [bank.cluster :as cluster]
+            [orleans.actors :as actors :refer [defactor reply]])
+  (:import [Bank.Orleans LedgerRow Replicator]))
+
+(set! *warn-on-reflection* true)
+
+(def slot "bank_events")
+(def publication "bank_events")
+
+(def wake-ms
+  "How often the reminder wakes the replicator: the longest it stays down."
+  5000)
+
+(def ^:private buffer-limit
+  "How many events the replicator holds for its consumer; past that it
+   leaves them in the stream, and the slot holds them."
+  20000)
+
+(def ^:private types
+  {0 :account/deposited 1 :account/debited 2 :account/credited 3 :account/declined})
+
+(defn- micros [^System.DateTime t]
+  (quot (- (.Ticks t) 621355968000000000) 10))
+
+(defn- event [^LedgerRow row]
+  #:event{:type (types (long (.Kind row)))
+          :account (.AccountId row)
+          :seq (.Seq row)
+          :transfer (.TransferId row)
+          :amount (.Amount row)
+          :balance (.BalanceAfter row)
+          :at (micros (.BookedAt row))
+          :lsn (System.Convert/ToInt64 (.Lsn row))})
+
+(defn- close! [^Replicator replicator]
+  (t/async
+    (when replicator
+      (t/await (.CloseAsync replicator)))
+    nil))
+
+(alter-meta! #'close! assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- log [& parts]
+  (binding [*out* *err*] (println (apply str parts))))
+
+(defactor events
+  "The replicator, addressed as (events \"bank\")."
+  (init [ctx id]
+    (let [_ (t/await (actors/remind-every ctx wake-ms :events/wake))]
+      ;; not at once: an actor that fails and restarts does not spin
+      (actors/send-after ctx 200 :events/wake)
+      #:events{:replicator nil :buffer [] :pumping? false
+               :activation (str (System.Guid/NewGuid)) :process System.Environment/ProcessId}))
+
+  ;; the stream, when it is not running: after a start, a failure, a silo that died
+  (info :events/wake [ctx {:events/keys [^Replicator replicator pumping?] :as state}]
+    (if (and replicator (.Running replicator))
+      state
+      (let [_ (t/await (close! replicator))
+            [started error] (t/await (actors/outcome (t/async (t/await (Replicator/StartAsync (cluster/connection-string) slot publication 10000)))))]
+        (if error
+          (do (log "replicator: cannot start the stream yet (" (.Message ^Exception error) "), next try in " wake-ms " ms")
+              (assoc state :events/replicator nil))
+          (do (when-not pumping? (actors/send-every ctx 100 :events/pump))
+              ;; what was buffered and not acknowledged comes again from the slot
+              (assoc state :events/replicator started :events/buffer [] :events/pumping? true))))))
+
+  ;; the stream into the buffer, whole transactions at a time
+  (info :events/pump [ctx {:events/keys [^Replicator replicator buffer] :as state}]
+    (cond
+      (nil? replicator) state
+
+      (not (.Running replicator))
+      (do (log "replicator: the stream stopped (" (some-> (.Fault replicator) .Message) "), starting it again")
+          (actors/send-after ctx 1000 :events/wake)
+          (let [_ (t/await (close! replicator))]
+            (assoc state :events/replicator nil)))
+
+      (< (count buffer) buffer-limit)
+      (let [rows (.Drain replicator (int (- buffer-limit (count buffer))))]
+        (if (zero? (count rows))
+          state
+          (assoc state :events/buffer (into buffer (map event) rows))))
+
+      :else state))
+
+  (call :events/take [ctx {:events/keys [buffer] :as state} max]
+    (reply (subvec buffer 0 (min (count buffer) max)) state))
+
+  (call :events/ack [ctx {:events/keys [^Replicator replicator buffer] :as state} lsn]
+    (when replicator (.Acknowledge replicator (System.Convert/ToUInt64 (long lsn))))
+    (reply :ok (assoc state :events/buffer (into [] (drop-while #(<= (:event/lsn %) lsn)) buffer))))
+
+  (call :events/status [ctx {:events/keys [^Replicator replicator buffer activation process] :as state}]
+    (reply #:events{:running? (boolean (and replicator (.Running replicator)))
+                    :buffered (count buffer)
+                    :acknowledged (if replicator (System.Convert/ToInt64 (.Acknowledged replicator)) 0)
+                    :activation activation
+                    :process process}
+           state))
+
+  (call :events/stop [ctx state]
+    (let [_ (t/await (actors/cancel-reminder ctx :events/wake))]
+      (actors/stop ctx)
+      (reply :stopping state)))
+
+  (terminate [ctx {:events/keys [replicator]}]
+    (t/await (close! replicator))))
+
+(defn drain!
+  "One round of a consumer: takes up to max events from the replicator,
+   keeps them in the sink (bank.sink/store!), then acknowledges them.
+   Returns the number taken. Blocking; throws when the replicator cannot
+   be reached, and then nothing was acknowledged."
+  ([system sink] (drain! system sink 5000))
+  ([system sink max]
+   (let [batch (actors/call! system (events "bank") :events/take max)]
+     (when (seq batch)
+       ((requiring-resolve 'bank.sink/store!) sink batch)
+       (actors/call! system (events "bank") :events/ack (:event/lsn (peek batch))))
+     (count batch))))
+
+(defn drain!
+  "One round of a consumer: takes up to max events from the replicator,
+   keeps them in the sink (bank.sink/store!), then acknowledges them.
+   Returns the number taken. Blocking; throws when the replicator cannot
+   be reached, and then nothing was acknowledged."
+  ([system sink] (drain! system sink 5000))
+  ([system sink max]
+   (let [batch (actors/call! system (events "bank") :events/take max)]
+     (when (seq batch)
+       ((requiring-resolve 'bank.sink/store!) sink batch)
+       (actors/call! system (events "bank") :events/ack (:event/lsn (peek batch))))
+     (count batch))))

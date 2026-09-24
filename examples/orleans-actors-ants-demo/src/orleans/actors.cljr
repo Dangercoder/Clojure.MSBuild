@@ -177,6 +177,9 @@
   "Registers an actor definition for a type keyword:
      {:init     (fn [ctx id] state)
       :resume   (fn [ctx stored] state), optional, for a persisting actor
+      :terminate (fn [ctx state] _), optional: runs when the activation
+                ends (deactivation, or a restart after a failure), to let
+                go of what it holds that is not data
       :call     {msg-type (fn [ctx state payload] [reply state])}
       :cast     {msg-type (fn [ctx state payload] state)}
       :info     {msg-type (fn [ctx state payload] state)}
@@ -488,12 +491,27 @@
 
 (alter-meta! #'handle assoc :tag task-of-object)
 
+(defn deactivate
+  "For hosts. Runs the actor's terminate, if it has one, when its activation
+   ends. A terminate that fails is logged and otherwise ignored: the
+   activation ends anyway. Returns a Task."
+  [ctx state]
+  (t/async
+    (let [{:actor/keys [type id]} (:actor/self ctx)]
+      (when-let [terminate (:terminate (get @definitions type))]
+        (let [[_ error] (t/await (outcome (as-async (terminate ctx state))))]
+          (when error
+            (warn "actor " type "/" id " failed in terminate: " (.Message ^Exception error))))))
+    nil))
+
+(alter-meta! #'deactivate assoc :tag task-of-object)
+
 (defn recover
   "For hosts. Applies the actor's :on-error policy after a handler threw:
      :restart (default) the actor is re-initialised with `activate`, like a
-              supervised GenServer coming back after a crash; a persisting
-              actor resumes from its stored state, the last one that
-              conformed
+              supervised GenServer coming back after a crash; its
+              terminate runs first, then init, or resume for a persisting
+              actor, from its stored state, the last one that conformed
      :resume  the state is kept; not for a persisting actor whose write
               was refused because its record moved (a version conflict):
               it keeps the version it read, so every later write fails
@@ -508,6 +526,7 @@
       (warn "actor " type "/" id " failed: " (.Message error))
       (case (:on-error definition :restart)
         :restart (do (-clear-timers (:actor/host ctx))
+                     (t/await (as-task (deactivate ctx state)))
                      (t/await (as-task (activate ctx settings))))
         :stop (do (-stop (:actor/host ctx)) state)
         state))))
@@ -590,7 +609,8 @@
        (call :counter/add [ctx state n]
          (reply (+ state n) (+ state n)))
        (cast :counter/reset [ctx state] 0)
-       (info :counter/tick [ctx state] (inc state)))
+       (info :counter/tick [ctx state] (inc state))
+       (terminate [ctx state] ...))              ; optional: the activation ends
 
    A message type is a namespaced keyword; the spec registered under it, if
    any, is the spec of its payload, so a message is declared the way a key
@@ -628,7 +648,7 @@
         type (keyword name)
         clauses (for [[kind & clause] body]
                   (case kind
-                    (init resume) (let [[args & b] clause] [(keyword kind) nil nil (handler-fn args b 2)])
+                    (init resume terminate) (let [[args & b] clause] [(keyword kind) nil nil (handler-fn args b 2)])
                     (call cast info) (let [[msg-type & more] clause
                                            [spec more] (if (vector? (first more)) [nil more] [(first more) (rest more)])
                                            [args & b] more]
@@ -641,12 +661,14 @@
                     (throw (ex-info (str "defactor " name ": unknown clause " kind) {}))))
         init (some (fn [[k _ _ f]] (when (= k :init) f)) clauses)
         resume (some (fn [[k _ _ f]] (when (= k :resume) f)) clauses)
-        handlers (reduce (fn [m [k msg-type _ f]] (if (#{:init :resume} k) m (assoc-in m [k msg-type] f))) {} clauses)
+        terminate (some (fn [[k _ _ f]] (when (= k :terminate) f)) clauses)
+        handlers (reduce (fn [m [k msg-type _ f]] (if (#{:init :resume :terminate} k) m (assoc-in m [k msg-type] f))) {} clauses)
         replies (reduce (fn [m [_ msg-type spec _]] (if spec (assoc m msg-type spec) m)) {} clauses)]
     (when-not init
       (throw (ex-info (str "defactor " name ": an init clause is required") {})))
     `(do
-       (register-actor! ~type (merge {:init ~init :replies ~replies} (when ~resume {:resume ~resume}) ~handlers ~options))
+       (register-actor! ~type (merge {:init ~init :replies ~replies} (when ~resume {:resume ~resume})
+                                     (when ~terminate {:terminate ~terminate}) ~handlers ~options))
        (defn ~(with-meta name {:doc (or doc (str "Reference to the " name " actor with the given id."))
                                :actor/type type})
          [~'id]

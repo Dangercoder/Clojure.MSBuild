@@ -120,7 +120,7 @@
         (t/async
           (set! (.State grain) (t/await (actors/activate (context grain) settings)))
           nil))
-      (OnDeactivate [_ _grain _reason] (t/completed-task))
+      (OnDeactivate [_ grain _reason] (actors/deactivate (context grain) (.State grain)))
       (OnCall [_ grain message] (handle :call grain message))
       (OnCast [_ grain message] (handle :cast grain message))
       (OnInfo [_ grain message] (handle :info grain message))

@@ -12,6 +12,10 @@
             [bank.account :refer [account]]
             [bank.audit :as audit]
             [bank.chaos :as chaos]
+            [bank.events :as events]
+            [bank.sink :as sink]
+            [bank.events :as events]
+            [bank.sink :as sink]
             [bank.run :as run]
             [bank.cluster :as cluster]
             [orleans.actors :as actors]
@@ -120,6 +124,81 @@
                               (actors/call! s (run/run id) :run/reserve 1))
             "the stale write is refused")
         (is (= [1000 1001] (actors/call! s (run/run id) :run/reserve 1)) "restarted from what is stored")))))
+
+(defn- until
+  "Calls f every 200 ms until it returns truthy, for up to 60 s."
+  [f]
+  (loop [tries 0]
+    (or (try (f) (catch Exception _ nil))
+        (when (< tries 300) (System.Threading.Thread/Sleep 200) (recur (inc tries))))))
+
+(defn- streamed?
+  "Drains the replicator into the sink until it has every entry of the
+   account's journal."
+  [system sink account-id]
+  (until #(do (events/drain! system sink)
+              (empty? (sink/missing sink account-id (audit/journal system account-id))))))
+
+(deftest the-replicator-streams-the-ledger-and-comes-back
+  (when @reachable?
+    (let [id (unique "cdc")
+          received (sink/sink)
+          book! (fn [s tid amount] (actors/call! s (account id) :account/deposit #:transfer{:id tid :amount amount}))]
+      (with-silo [s]
+        (is (until #(:events/running? (actors/call! s (events/events "bank") :events/status))) "the stream runs")
+        (book! s "a" 10) (book! s "b" 20)
+        (is (streamed? s received id) "what the account booked came out of the WAL")
+        (testing "the connection is killed on PostgreSQL's side: the replicator starts the stream again"
+          (is (= 1 (sql "select count(pg_terminate_backend(active_pid)) from pg_replication_slots where slot_name = 'bank_events' and active" {})))
+          (book! s "c" 30)
+          (is (streamed? s received id))))
+      (testing "its silo is gone: the next one takes over from the slot"
+        (with-silo [s]
+          (book! s "d" 40)
+          (is (streamed? s received id))
+          (is (= [1 2 3 4] (sort (for [[[account seq] _] (:events @received) :when (= account id)] seq))))
+          (is (zero? (:conflicting (sink/stats received))) "a repeat is the same event")
+          (is (until #(sql "select confirmed_flush_lsn >= (select max(0)::pg_lsn from pg_replication_slots) from pg_replication_slots where slot_name = 'bank_events'" {}))
+              "the slot moved on"))))))
+
+(defn- until
+  "Calls f every 200 ms until it returns truthy, for up to 60 s."
+  [f]
+  (loop [tries 0]
+    (or (try (f) (catch Exception _ nil))
+        (when (< tries 300) (System.Threading.Thread/Sleep 200) (recur (inc tries))))))
+
+(defn- streamed?
+  "Drains the replicator into the sink until it has every entry of the
+   account's journal."
+  [system sink account-id]
+  (until #(do (events/drain! system sink)
+              (empty? (sink/missing sink account-id (audit/journal system account-id))))))
+
+(defn- slot-position []
+  (sql "select (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint from pg_replication_slots where slot_name = 'bank_events'" {}))
+
+(deftest the-replicator-streams-the-ledger-and-comes-back
+  (when @reachable?
+    (let [id (unique "cdc")
+          received (sink/sink)
+          book! (fn [s tid amount] (actors/call! s (account id) :account/deposit #:transfer{:id tid :amount amount}))]
+      (with-silo [s]
+        (is (until #(:events/running? (actors/call! s (events/events "bank") :events/status))) "the stream runs")
+        (book! s "a" 10) (book! s "b" 20)
+        (is (streamed? s received id) "what the account booked came out of the WAL")
+        (testing "the connection is killed on PostgreSQL's side: the replicator starts the stream again"
+          (is (= 1 (sql "select count(pg_terminate_backend(active_pid)) from pg_replication_slots where slot_name = 'bank_events' and active" {})))
+          (book! s "c" 30)
+          (is (streamed? s received id))))
+      (testing "its silo is gone: the next one takes over from the slot"
+        (let [before (slot-position)]
+          (with-silo [s]
+            (book! s "d" 40)
+            (is (streamed? s received id))
+            (is (= [1 2 3 4] (sort (for [[[account seq] _] (:events @received) :when (= account id)] seq))))
+            (is (zero? (:conflicting (sink/stats received))) "a repeat is the same event")
+            (is (until #(> (slot-position) before)) "the acknowledgements moved the slot on")))))))
 
 (deftest a-short-chaos-run-balances-the-books
   (when @reachable?

@@ -142,8 +142,10 @@
 (alter-meta! #'activation assoc :tag task-of-object)
 
 (defn- finish! [system ref]
-  (when (:stopping? (get @(:activations system) ref))
-    (swap! (:activations system) dissoc ref)))
+  (when-let [live (get @(:activations system) ref)]
+    (when (:stopping? live)
+      (swap! (:activations system) dissoc ref)
+      (t/result (actors/deactivate (context system ref) (:state live))))))
 
 (defn- dispatch
   "Handles one message and returns a Task of the reply, faulted with the
