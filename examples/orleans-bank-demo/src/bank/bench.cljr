@@ -13,7 +13,8 @@
    s has balance s and the balance at a moment is the number of seconds
    since then. The table's constraints are dropped for the load and built
    again after it, which is what a bulk load does. Then everything goes
-   through the account actor on a silo, the way the demo uses it."
+   through the account actor on a silo, the way the demo uses it. The rows
+   are ledger rows: the replicator (bank.events) streams them too."
   (:require [clojure.clr.async.task.alpha :as t]
             [bank.account :refer [account]]
             [bank.cluster :as cluster]

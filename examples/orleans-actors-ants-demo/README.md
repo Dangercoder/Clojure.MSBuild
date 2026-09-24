@@ -49,6 +49,7 @@ the trails.
 | a pid | `(ant 7)`, `(world "main")`: refs are data, `{:actor/type :ant :actor/id "7"}` | virtual actors: exist when addressed, activated on first message, deactivated when idle |
 | a supervisor | `{:on-error :restart}` (default), `:resume` or `:stop` on the actor | the runtime re-initialises a crashed actor; the caller still gets the error |
 | `GenServer.stop/1` | `(actors/stop ctx)` | `DeactivateOnIdle` |
+| `terminate/2` | `(terminate [ctx state] ...)`: the activation ends (a stop, an idle deactivation, a restart after a failure) | `OnDeactivateAsync` |
 | persistent state (DETS, Mnesia...) | `{:persist true}` or `{:persist :ledger}`, `(resume [ctx stored] ...)`, `(actors/forget ctx)` | the grain's own record in an Orleans grain storage (`IGrainStorage`), guarded by its ETag |
 | an event log per process (no OTP equivalent) | `{:journal :ledger}`, `(actors/append! ctx entry)`, `(actors/entry-at ctx t)` | a journal the host keeps (the bank: a PostgreSQL table); `JournaledGrain` is Orleans' own take |
 | a timer that survives a crash (no OTP equivalent) | `(actors/remind-every ctx ms :type)`, `(actors/cancel-reminder ctx :type)` | Orleans reminders, kept by the cluster's reminder service |

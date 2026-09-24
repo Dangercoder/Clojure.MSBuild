@@ -10,7 +10,9 @@ monkey kills a silo process every few seconds while thousands of transfers
 are in flight. At the end an audit reads the books back from the database:
 every transfer happened exactly once or not at all, every journal explains
 its balance entry by entry, and the books balanced at every moment of the
-run, not only at the end.
+run, not only at the end. Meanwhile a replicator, an actor too, streams
+every ledger row out of PostgreSQL's WAL to a sink in the driver's
+process; the monkey kills its silo first, and every row still arrives.
 
 ```
 docker compose up -d        # PostgreSQL 17 with Orleans' tables (sql/)
@@ -23,43 +25,50 @@ dotnet test                 # the saga, a deterministic simulation of the cluste
 
 ```
 Starting 3 silos on PostgreSQL (logs in .bank/)...
-Cluster up: 3 silos. Run 20260923-205429: opening 20 accounts with 10000 each.
+Cluster up: 3 silos, the replicator streaming. Run 20260924-060136: opening 20 accounts with 10000 each.
 Moving money for 30 s with 16 drivers; a silo is killed every 6 s.
   0s  silos ●●●  transfers      0  retried calls     0  in accounts 200000 = 200000
-  2s  silos ●●●  transfers    408  retried calls     0  in accounts 198342 + 1658 in flight
-  4s  silos ●●●  transfers    848  retried calls     0  in accounts 199818 + 182 in flight
-  ✗ kill -9 silo 0 (pid 19585)
+  2s  silos ●●●  transfers    525  retried calls     0  in accounts 197952 + 2048 in flight
+  4s  silos ●●●  transfers   1131  retried calls     0  in accounts 192453 + 7547 in flight
+  ✗ kill -9 silo 0 (pid 43668), the replicator's
   ↻ restart silo 0
- 11s  silos ●●●  transfers   2298  retried calls     9  in accounts (a silo is down, asking again)
- 13s  silos ●●●  transfers   2826  retried calls    18  in accounts 195399 + 4601 in flight
-  ✗ kill -9 silo 0 (pid 19627)
- 15s  silos ○●●  transfers   3304  retried calls    18  in accounts 195782 + 4218 in flight
- 17s  silos ○●●  transfers   3736  retried calls    18  in accounts 194351 + 5649 in flight
-  ↻ restart silo 0
- 19s  silos ●●●  transfers   4225  retried calls    18  in accounts 198998 + 1002 in flight
- 22s  silos ●●●  transfers   4679  retried calls    18  in accounts 195933 + 4067 in flight
- 24s  silos ●●●  transfers   5335  retried calls    18  in accounts 195964 + 4036 in flight
-  ✗ kill -9 silo 0 (pid 19648)
- 26s  silos ○●●  transfers   5426  retried calls    24  in accounts 200000 = 200000
-  ↻ restart silo 0
- 28s  silos ●●●  transfers   6066  retried calls    24  in accounts 195106 + 4894 in flight
+ 11s  silos ●●●  transfers   2800  retried calls     5  in accounts (a silo is down, asking again)
+ 13s  silos ●●●  transfers   3269  retried calls    13  in accounts 195513 + 4487 in flight
+  ✗ kill -9 silo 2 (pid 43670)
+ 15s  silos ●●○  transfers   3846  retried calls    13  in accounts (a silo is down, asking again)
+ 17s  silos ●●○  transfers   4144  retried calls    17  in accounts 188994 + 11006 in flight
+  ↻ restart silo 2
+ 19s  silos ●●●  transfers   4605  retried calls    17  in accounts 187271 + 12729 in flight
+ 21s  silos ●●●  transfers   4983  retried calls    27  in accounts 193142 + 6858 in flight
+ 23s  silos ●●●  transfers   5591  retried calls    27  in accounts 198861 + 1139 in flight
+  ✗ kill -9 silo 1 (pid 43669)
+ 25s  silos ●○●  transfers   5853  retried calls    28  in accounts 197805 + 2195 in flight
+  ↻ restart silo 1
+ 27s  silos ●●●  transfers   6132  retried calls    28  in accounts 195212 + 4788 in flight
+ 29s  silos ●●●  transfers   6428  retried calls    41  in accounts 196328 + 3672 in flight
 Time. Stopping the drivers and the monkey (3 silos killed).
- 33s  silos ●●●  transfers   6920  retried calls    24  in accounts 200000 = 200000
+ 33s  silos ●●●  transfers   7130  retried calls    41  in accounts 200000 = 200000
   every transfer is finished
 
 The books at moments of the run, each account asked for its balance then:
-  20:54:39.861759  accounts 197518 + on its way 2482 = 200000  ✓
-  20:54:48.407037  accounts 191166 + on its way 8834 = 200000  ✓
-  20:54:55.961890  accounts 193245 + on its way 6755 = 200000  ✓
-  20:55:03.109078  accounts 199373 + on its way 627 = 200000  ✓
-  20:55:10.014700  accounts 196904 + on its way 3096 = 200000  ✓
+  06:01:45.938307  accounts 198713 + on its way 1287 = 200000  ✓
+  06:01:53.171722  accounts 192619 + on its way 7381 = 200000  ✓
+  06:02:00.069552  accounts 194671 + on its way 5329 = 200000  ✓
+  06:02:08.503910  accounts 189419 + on its way 10581 = 200000  ✓
+  06:02:17.765755  accounts 198013 + on its way 1987 = 200000  ✓
 
-Audit of run 20260923-205429, from PostgreSQL:
-  transfers done 6137, declined for lack of funds 783, never started 0, pending 0
-  10 transfers were cut off by a crash and finished later by their reminder
+Audit of run 20260924-060136, from PostgreSQL:
+  transfers done 6469, declined for lack of funds 661, never started 20, pending 0
+  31 transfers were cut off by a crash and finished later by their reminder
   money in the accounts 200000, opened with 200000
-  every journal explains its balance, entry by entry; the books balanced at each of the 13040 moments something was booked
+  every journal explains its balance, entry by entry; the books balanced at each of the 13566 moments something was booked
   ✓ every transfer happened exactly once, or not at all; not one öre appeared or vanished
+
+The ledger streamed out of the WAL by the replicator, into the sink in this process:
+  13619 rows booked by the run's accounts; 13619 of them in the sink, as events
+  837 events came more than once (after a restart, acknowledged late) and were kept once
+  the replicator ran in 3 activations, on 3 processes
+  ✓ every row of the ledger reached the sink, whatever was killed
 ```
 
 The silos are separate processes (`dotnet run -- silo <i>`) and the driver
@@ -214,6 +223,48 @@ a time, or to be split into sub-accounts. A ledger with years of history
 would be partitioned by month, which keeps the lookup one descent.
 
 
+## Streaming the ledger out of the WAL
+
+Every row the accounts add to the ledger is also an event, and the
+replicator (`src/bank/events.cljr`) streams them out of PostgreSQL itself,
+without a second write and without another process: logical replication
+(`wal_level=logical`) through a slot, `bank_events`, on the publication of
+`ledger_entries` (`sql/10-events.sql`).
+
+```clojure
+#:event{:type :account/debited :account "<run>-a3" :seq 42 :transfer "<run>-t7"
+        :amount 300 :balance 9700 :at <µs since the epoch> :lsn <WAL position of its commit>}
+```
+
+- **The slot is the cursor, and PostgreSQL keeps it.** A consumer takes
+  events (`:events/take`, the oldest first, as often as it likes) and
+  acknowledges what it has kept (`:events/ack` with the last `:event/lsn`),
+  which moves the slot on. Whatever happens to the replicator, the next one
+  starts right after the last acknowledged event: an event acknowledged
+  late comes again, none is lost, and the consumer keeps each once by
+  `(account, seq)`. PostgreSQL keeps the WAL the slot has not acknowledged,
+  up to `max_slot_wal_keep_size`.
+- **It does not stay dead.** A reminder wakes the actor every 5 s on
+  whichever silo is alive, and a wake starts the stream when it is not
+  running: after its silo was killed, after the stream failed (the
+  connection dropped, PostgreSQL restarted it, `57P01`), or after the actor
+  itself failed and restarted, `terminate` (new in the actor library, the
+  GenServer `terminate/2`) closing the old stream first.
+- **One reader.** A slot takes one reader at a time and PostgreSQL refuses a
+  second, so two activations of the replicator cannot both read. A reader
+  that died lets go of the slot within `wal_sender_timeout` (5 s here).
+- **Whole transactions, from its own pump.** The C# `glue/Replicator.cs`
+  reads Npgsql's pgoutput stream on a background task (which also answers
+  PostgreSQL's keepalives) into a bounded channel, only whole transactions,
+  each row with the LSN at its transaction's end; the actor moves them into
+  its buffer every 100 ms.
+
+In the demo the sink is memory in the driver (`src/bank/sink.cljr`),
+outside the silos the monkey kills, where a broker would be; a consumer
+thread drains the replicator into it all run long. The monkey's first kill
+is the replicator's silo. At the end the driver checks the sink against
+every account's journal: every row there, once, the repeats identical.
+
 ## Tests
 
 `dotnet test`:
@@ -270,8 +321,11 @@ would be partitioned by month, which keeps the lookup one descent.
   activation's back makes its next append fail on the seq, and the account
   restarts from the table. A transfer's or run's state is its row in grain
   storage, in EDN, and a row written behind its back makes the next write
-  fail on the ETag. A short chaos run with processes killed balances the
-  books.
+  fail on the ETag. The replicator streams an account's rows, starts its
+  stream again when PostgreSQL kills the connection, and hands over from
+  the slot to the replicator of the next silo, nothing missing. A short
+  chaos run with processes killed balances the books and streams every
+  row.
 
 ## Layout
 
@@ -284,13 +338,16 @@ would be partitioned by month, which keeps the lookup one descent.
   and states, plus asking the actors for them.
 - `src/bank/cluster.cljr` silos and the client on PostgreSQL, silo
   processes; `src/bank/chaos.cljr` the demo; `src/bank/bench.cljr` the
-  million-entry account; `src/bank/main.cljr` the command line.
+  million-entry account; `src/bank/events.cljr` the replicator,
+  `src/bank/sink.cljr` the sink; `src/bank/main.cljr` the command line.
 - `glue/Postgres.cs` the Orleans configuration: ADO.NET clustering, the
-  `bank` grain storage, reminders, failure detection tuned for a demo.
+  `bank` grain storage, reminders, failure detection tuned for a demo;
+  `glue/Replicator.cs` the WAL reader.
 - `sql/` Orleans' PostgreSQL scripts (dotnet/orleans v10.3.1, `src/AdoNet`)
-  and the bank's `09-ledger.sql`, run in order by `docker-compose.yml`. A
-  database created before the ledger existed needs `09-ledger.sql` run by
-  hand, or `docker compose down -v` and up again.
+  and the bank's `09-ledger.sql` and `10-events.sql`, run in order by
+  `docker-compose.yml`. A database created before them needs them run by
+  hand (and `docker compose up -d` for the new PostgreSQL settings), or
+  `docker compose down -v` and up again.
 - The actor library, `orleans.actors`, and its C# glue are the ants
   example's (`../orleans-actors-ants-demo`), through
   `ClojureExtraSourceDirs` and a project reference.
@@ -307,6 +364,10 @@ would be partitioned by month, which keeps the lookup one descent.
   otherwise. The demo allows one a second (a transfer retries every 5 s), and
   Orleans logs a warning about it. Failure detection is tuned the same way:
   a killed silo is declared dead within seconds instead of a minute.
+- The replicator's reminder stays registered between runs, so it wakes on
+  the next run's silos and carries on from the slot; `:events/stop` stops
+  it for good, and `SELECT pg_drop_replication_slot('bank_events')` lets the
+  WAL go.
 - A silo started by the demo leaves the cluster gracefully when its standard
   input says `stop` or closes, so ending the demo, or killing the driver,
   leaves no silo behind. Silo logs are in `.bank/`.
@@ -314,6 +375,7 @@ would be partitioned by month, which keeps the lookup one descent.
   storage provider, for the same idea. The actor library keeps one grain
   class for every actor type, so its journal is a host capability instead.
 - `bench` drops the table's constraints while it loads and builds them
-  again after: run it when nothing else uses the database. Its account
+  again after: run it when nothing else uses the database. Its rows are
+  ledger rows, so the replicator streams them too, the next time it runs. Its account
   stays in the table; `DELETE FROM ledger_entries WHERE account_id LIKE
   'bench-%'` removes it.
