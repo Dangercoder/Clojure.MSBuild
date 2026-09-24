@@ -2,35 +2,27 @@
   "Runs the actors for real: an Orleans silo in the test process. The tests
    share the silo and the world, so each one uses its own ants. What the
    actors do is tested on the local system in ants.actors-test; here it is
-   Orleans: activation, timers, the wire, persistence on files and a second
-   silo."
+   Orleans: activation, timers and reminders, the wire, persistence in
+   Orleans grain storage (the silo's in-memory default) and a second silo."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.clr.async.task.alpha :as t]
             [clojure.string :as str]
-            [ants.test-actors :refer [counter ledger]]
+            [ants.test-actors :refer [counter ledger vault nag]]
             [ants.world :refer [world]]
             [ants.ant :refer [ant]]
             [orleans.actors :as actors]
-            [orleans.actors.silo :as silo]
-            [orleans.actors.storage :as storage]
-            [orleans.actors.storage.edn-files :as edn-files]))
+            [orleans.actors.silo :as silo]))
 
-(def ^:private storage-dir
-  (System.IO.Path/Combine (System.IO.Path/GetTempPath) (str "ants-actors-" (System.Guid/NewGuid))))
-
-(def ^:private store (edn-files/storage storage-dir))
 (def ^:private system (atom nil))
 
 (use-fixtures :once
   (fn [f]
-    (reset! system (silo/start! {:silo-port 11211 :gateway-port 30100 :storage store}))
+    (reset! system (silo/start! {:silo-port 11211 :gateway-port 30100}))
     (try
       (actors/call! @system (world "main") :world/configure #:world{:size 20 :seed 3 :food-places 10 :home-size 8})
       (f)
       (finally
-        (silo/shutdown! @system)
-        (when (System.IO.Directory/Exists storage-dir)
-          (System.IO.Directory/Delete storage-dir true))))))
+        (silo/shutdown! @system)))))
 
 (defn- call! [ref type & [payload]]
   (actors/call! @system ref type payload))
@@ -113,12 +105,21 @@
   (testing "a crash restarts from the last stored state, which is the last one that conformed"
     (is (thrown-with-msg? Exception #"does not conform" (call! (ledger 1) :ledger/add -100)))
     (is (= 8 (call! (ledger 1) :ledger/get))))
-  (testing "the state is an EDN file, what would be on the wire"
-    (is (= 8 (read-string (slurp (System.IO.Path/Combine storage-dir "ledger" "1.edn")))))
-    (is (= 8 (storage/read-state store :ledger "1"))))
-  (testing "any id is a file inside the storage directory"
+  (testing "any id is a key of its own"
     (is (= 1 (call! (ledger "../../escape") :ledger/add 1)))
-    (is (System.IO.File/Exists (System.IO.Path/Combine storage-dir "ledger" "%2E%2E%2F%2E%2E%2Fescape.edn")))))
+    (is (= 1 (call! (ledger "../../escape") :ledger/get)))
+    (is (= 8 (call! (ledger 1) :ledger/get))))
+  (testing "a named grain storage the silo does not have is an error, not a silent default"
+    (is (thrown-with-msg? Exception #"No grain storage named \"vaults\"" (call! (vault 1) :vault/put "gold")))))
+
+(deftest reminders-wake-the-actor
+  ;; Orleans reminders are for minutes: the default minimum period is one
+  ;; minute and the first tick comes after the due time. What a reminder
+  ;; delivers is tested on the local system; here, that the silo takes the
+  ;; registration and the cancellation.
+  (is (= :started (call! (nag "r") :nag/start)))
+  (is (= 0 (call! (nag "r") :nag/count)))
+  (is (= :stopping (call! (nag "r") :nag/stop))))
 
 ;; ── A second silo ────────────────────────────────────────────────
 
@@ -134,7 +135,7 @@
                (.set_RedirectStandardError true))]
     (doseq [a [app "--clj-mode" "script" "test/ants/second_silo.cljr"]] (.Add (.ArgumentList info) a))
     (doseq [[k v] {"SILO_PORT" "11212" "GATEWAY_PORT" "30101" "PRIMARY_PORT" "11211"
-                   "ACTORS_DIR" storage-dir "CLOJURE_LOAD_PATH" "test"}]
+                   "CLOJURE_LOAD_PATH" "test"}]
       (.set_Item (.Environment info) k v))
     (let [process (System.Diagnostics.Process/Start info)
           output (.ReadToEndAsync (.StandardOutput process))
@@ -162,16 +163,16 @@
 
 (deftest a-second-silo-reaches-the-same-actors
   ;; The world is activated on this silo before the second one joins; the
-  ;; script asserts that what it sees is this world (size 20). Its effects are
-  ;; checked through a persisting actor: when a silo leaves, the others take
-  ;; over its share of the grain directory, and an actor whose registration
-  ;; was there is activated afresh, so an actor that does not persist can
-  ;; lose its state on a cluster change. The world does not persist; the
-  ;; ledger does.
+  ;; script asserts that what it sees is this world (size 20). When a silo
+  ;; leaves, the others take over its share of the grain directory, and an
+  ;; actor whose registration was there is activated afresh, so an actor
+  ;; that does not persist can lose its state on a cluster change. The
+  ;; in-memory grain storage is itself grains, spread over the silos, so a
+  ;; silo that leaves takes its share of the stored states with it: across
+  ;; cluster changes a real grain storage is needed, which the bank example
+  ;; tests with PostgreSQL.
   (call! (world "main") :world/look #:ant{:x 0 :y 0 :dir 0})
   (let [{:keys [exit output]} (run-second-silo)]
     (is (zero? exit) output)
     (is (str/includes? output "second silo: ok") output)
-    (is (cluster-recovered?) "the cluster noticed the second silo leaving")
-    (is (= 5 (call! (ledger "shared") :ledger/get))
-        "what the other silo wrote to a persisting actor is there after it left")))
+    (is (cluster-recovered?) "the cluster noticed the second silo leaving")))

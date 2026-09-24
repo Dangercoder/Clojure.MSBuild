@@ -1,0 +1,80 @@
+(ns bank.account
+  "An account: a balance, and a journal that explains it, one entry per
+   transfer id, each carrying the balance after it. Nothing but the account
+   touches either; money moves by sending it messages, and every message
+   names the transfer it belongs to, so the account books each transfer
+   once however often it hears about it.
+
+   The journal is the ledger (bank.ledger, PostgreSQL on a silo) and the
+   account appends to it before it replies: a caller that got an entry
+   knows it is committed. The account's state is only where its journal
+   ends (seq, balance, time), so a hundred million entries cost nothing to
+   activate: resume reads the last one. Its balance at any moment is the
+   entry booked last before it, one index lookup."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [bank.model :as model]
+            [orleans.actors :as actors :refer [defactor reply]]))
+
+(def ^:private task-of-object (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- after
+  "The account's state after an entry of its journal."
+  [state {:entry/keys [seq balance at]}]
+  (assoc state :account/seq seq :account/balance balance :account/at at))
+
+(defn- book!
+  "Books what happened for a transfer id: appends the entry that follows the
+   account's journal, unless the journal has one for that id already.
+   Returns a Task of [the entry for the id, the state after it]; for an id
+   the account had booked before, that is the earlier entry and the state
+   as it was."
+  [ctx state key kind amount balance caused-at]
+  (t/async
+    (let [entry #:entry{:seq (inc (:account/seq state)) :key key :kind kind :amount amount :balance balance
+                        :at (actors/next-at ctx (:account/at state) caused-at)}
+          {:keys [appended? existing]} (t/await (actors/append! ctx entry))]
+      (if appended?
+        [entry (after state entry)]
+        [existing state]))))
+
+(alter-meta! #'book! assoc :tag task-of-object)
+
+(defactor account
+  "An account, addressed as (account id)."
+  {:state ::model/account :journal :ledger}
+
+  (init [ctx id]
+    #:account{:id id :balance 0 :seq 0 :at 0})
+
+  (resume [ctx last-entry]
+    (after #:account{:id (:actor/id (:actor/self ctx))} last-entry))
+
+  (call :account/deposit ::model/entry [ctx state {:transfer/keys [id amount]}]
+    (let [[entry state] (t/await (book! ctx state id :deposit amount (+ (:account/balance state) amount) nil))]
+      (reply entry state)))
+
+  (call :account/debit ::model/entry [ctx {:account/keys [balance] :as state} {:transfer/keys [id amount]}]
+    (let [funded? (<= amount balance)
+          [entry state] (t/await (book! ctx state id (if funded? :debit :declined) amount
+                                        (if funded? (- balance amount) balance) nil))]
+      (reply entry state)))
+
+  (call :account/credit ::model/entry [ctx state {:transfer/keys [id amount debited-at]}]
+    (let [[entry state] (t/await (book! ctx state id :credit amount (+ (:account/balance state) amount) debited-at))]
+      (reply entry state)))
+
+  (call :account/get-balance :account/balance [ctx state]
+    (reply (:account/balance state) state))
+
+  (call :account/summary ::model/account [ctx state]
+    (reply state state))
+
+  (call :account/balance-at :account/balance [ctx state at]
+    (let [entry (t/await (actors/entry-at ctx at))]
+      (reply (if entry (:entry/balance entry) 0) state)))
+
+  (call :account/entry [ctx state transfer-id]
+    (reply (t/await (actors/entry-by-key ctx transfer-id)) state))
+
+  (call :account/entries [ctx state {:page/keys [after limit]}]
+    (reply (t/await (actors/entries ctx after limit)) state)))

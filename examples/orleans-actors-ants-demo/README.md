@@ -49,22 +49,26 @@ the trails.
 | a pid | `(ant 7)`, `(world "main")`: refs are data, `{:actor/type :ant :actor/id "7"}` | virtual actors: exist when addressed, activated on first message, deactivated when idle |
 | a supervisor | `{:on-error :restart}` (default), `:resume` or `:stop` on the actor | the runtime re-initialises a crashed actor; the caller still gets the error |
 | `GenServer.stop/1` | `(actors/stop ctx)` | `DeactivateOnIdle` |
-| persistent state (Mnesia, ETS...) | `{:persist true}`, `(resume [ctx stored] ...)`, `(actors/forget ctx)` | the storage protocol, called by the runtime |
+| `terminate/2` | `(terminate [ctx state] ...)`: the activation ends (a stop, an idle deactivation, a restart after a failure) | `OnDeactivateAsync` |
+| persistent state (DETS, Mnesia...) | `{:persist true}` or `{:persist :ledger}`, `(resume [ctx stored] ...)`, `(actors/forget ctx)` | the grain's own record in an Orleans grain storage (`IGrainStorage`), guarded by its ETag |
+| an event log per process (no OTP equivalent) | `{:journal :ledger}`, `(actors/append! ctx entry)`, `(actors/entry-at ctx t)` | a journal the host keeps (the bank: a PostgreSQL table); `JournaledGrain` is Orleans' own take |
+| a timer that survives a crash (no OTP equivalent) | `(actors/remind-every ctx ms :type)`, `(actors/cancel-reminder ctx :type)` | Orleans reminders, kept by the cluster's reminder service |
 | a typespec / struct | `{:state ::spec}` on the actor; `(s/def :world/move ...)` for a message's payload; `(call :world/move ::moved? ...)` for its reply | state and reply checked after every message, payload on every incoming one |
 
 **The context.** The first argument of every handler is the actor's context,
 a map with namespaced keys, and everything an actor does besides computing
 its next state goes through it: sending (`call`, `cast`) through
-`:actor/system`, timers to itself (`send-after`, `send-every`) and `stop`
-through `:actor/host`, its own ref as `:actor/self`, and the system's
-`:actor/storage`, so an actor that wants to keep something of its own writes
-`(storage/write-state (:actor/storage ctx) ...)`. The context comes from
-whatever hosts the actor, so nothing is global: on a silo the system reaches
-the cluster through the grain, in a test it is an in-process system. `call`
-and `cast` take a running system just as well as a context, so a driver, a
-test and an actor use one API. `:actor/system` and `:actor/host` are two
-protocols in `orleans.actors`, `Messaging` (call, cast) and `Host` (timers,
-stop); a host is an implementation of them plus a state slot.
+`:actor/system`, timers and reminders to itself (`send-after`, `send-every`,
+`remind-every`) and `stop` through `:actor/host`, and its own ref as
+`:actor/self`. There is no storage in it: an actor's state is its own, and
+another actor learns about it by sending a message, never by reading where
+it is kept. The context comes from whatever hosts the actor, so nothing is
+global: on a silo the system reaches the cluster through the grain, in a
+test it is an in-process system. `call` and `cast` take a running system
+just as well as a context, so a driver, a test and an actor use one API.
+`:actor/system` and `:actor/host` are two protocols in `orleans.actors`,
+`Messaging` (call, cast) and `Host` (timers, reminders, the actor's stored
+record, stop); a host is an implementation of them plus a state slot.
 
 Handler bodies run in an async context, so they can `t/await` calls to other
 actors. Messages are Clojure values. Inside a silo they are passed by
@@ -94,6 +98,18 @@ Both hosts call the same three runtime functions (`activate`, `handle`,
 what a test proves on the local system holds on the silo. Two things differ
 because they are Orleans: an actor calling itself works locally and
 deadlocks on a silo, and nothing crosses the wire locally.
+`local/restart` gives a system that kept only what a durable host keeps
+(the stored states and the reminders), as after every silo went down, and
+`local/fork` a second system on the same storage and journals, so an actor
+can be active twice with the state each read, as it can be for a moment on
+a cluster, optionally with a clock that is off by a skew. The clock is
+logical, so nothing depends on the time of day. The
+stored records have versions that play the ETag: a write from an activation
+that is out of date throws. A `:crash` function makes writes fail before or
+after they are stored. Everything happens on the caller's thread in the
+order it says, so a test that generates the messages, the crashes and the
+splits is a deterministic simulation of the cluster, and test.check shrinks
+a failure to the smallest schedule that breaks (the bank example does this).
 `test/ants/actors_test.cljr` tests the actors on the local system, 130
 generated cases included, in about a second; `test/ants/colony_test.cljr`
 runs them on a real silo. A local tick of 30 ants takes about 3 ms against
@@ -143,30 +159,61 @@ fresh world and the whole grid is checked after every message:
 Its first run found a real bug: configure a one-cell nest, spawn two ants,
 and the world threw "the nest is full".
 
-**Persistence, behind a protocol.** `{:persist true}` on an actor stores its
-state after `init` and after every message that changed it, and an actor
-that is activated again, after `stop`, an idle deactivation, a crash or a
-silo restart, gets it back: `(resume [ctx stored] state)` runs instead of
-`init` (by default the stored state is kept as it is). A crash restarts a
-persisting actor from its stored state, which is the last one that conformed
-to the spec. Where the state goes is `orleans.actors.storage/Storage`, three
-functions (`read-state`, `write-state`, `clear-state`), given to the system
-at start and reached by an actor as `:actor/storage`. Three implementations
-come with the example:
+**Persistence: the actor's own record, in Orleans grain storage.**
+`{:persist true}` on an actor stores its state after `init` and after every
+message that changed it, before the reply leaves, and an actor that is
+activated again, after `stop`, an idle deactivation, a crash or a silo
+restart, gets it back: `(resume [ctx stored] state)` runs instead of `init`
+(by default the stored state is kept as it is). A crash restarts a
+persisting actor from its stored state, which is the last one that
+conformed to the spec. On a silo the state is the grain's own record in an
+Orleans grain storage: the grain reads it through `IGrainStorage` with its
+ETag, and writes it back with that ETag, so if a second activation of the
+same actor wrote in between (Orleans can briefly have two while the
+cluster changes) the write fails with `InconsistentStateException` instead
+of losing an update, and the actor restarts from what is stored. The
+record is only ever touched by its actor: there is no shared table to lock
+and no way for one actor to write another's state.
 
-- `orleans.actors.storage.edn-files`: one EDN file per actor, what would be on
-  the wire, under `.actors/` in the working directory by default; ids are
-  encoded into file names, so any id stays inside the directory. Silos of a
-  cluster share it.
-- `orleans.actors.storage.sqlite`: one table, `actors(type, id, state)`, in a
-  SQLite file (`Microsoft.Data.Sqlite`). Postgres or FoundationDB are the
-  same three functions against a server.
-- `orleans.actors.storage.memory`: an atom, for tests.
+`{:persist true}` uses the silo's grain storage named `"Default"`;
+`{:persist :ledger}` names another one, the way
+`[PersistentState("state", "ledger")]` does on a C# grain, and a silo
+without that storage refuses to activate the actor rather than keeping it
+somewhere else. Which storages a silo has is Orleans configuration: an
+`Action<ISiloBuilder>` given to `silo/start` as `:configure` sets up the
+clustering, the grain storages and the reminder service (Memory, ADO.NET,
+Azure, Redis, Cosmos... any Orleans provider). Without one a silo keeps
+states and reminders in memory, which is what this example uses. States
+are written by an `IGrainStorageSerializer` that writes EDN, so a row in a
+database reads as the Clojure value it holds. The bank example
+(`../orleans-bank-demo`) runs the same library on PostgreSQL.
 
-```clojure
-(silo/start! {:storage (sqlite/storage "colony.db")})
-(local/system {:storage (memory/storage)})
-```
+**Journals.** An actor whose history matters more than its latest state is
+journaled: `{:journal :ledger}` instead of `:persist`. It appends entries to
+its own journal (`actors/append!`), each naming the seq it takes (the one
+after the last it knows of) and, optionally, an idempotency key; an append
+whose key is already there appends nothing and returns the entry recorded
+under it, and an append of a seq that is taken throws, which is the fence
+against a second activation of the same actor. On a fresh activation
+`resume` gets the last entry, so an entry carries what the state is rebuilt
+from (a running balance, say), and a long history costs nothing to
+activate. `actors/entry-at` gives the entry as of any moment,
+`entry-by-key` and `entries` the rest, and `actors/next-at` stamps an entry
+after the previous one and after its cause, whatever the silo's clock says.
+Where the entries go is an `orleans.actors.journal/Journal`, given to a
+silo by name (`:journals`); the actor never sees it, only its own journal
+through its host. The local system keeps journals in memory. The bank
+example keeps its accounts' journals in a PostgreSQL table, one row per
+entry.
+
+**Reminders.** A timer (`send-after`, `send-every`) belongs to the
+activation and ends with it. `(actors/remind-every ctx ms :type)` registers
+an Orleans reminder instead: kept by the cluster's reminder service, it
+outlives the activation and the silo, and when it is due Orleans activates
+the actor, on whichever silo is alive, and delivers the message to its
+`info` handler. It is how an actor makes sure it finishes something after a
+crash. Orleans refuses reminders more frequent than
+`ReminderOptions.MinimumReminderPeriod`, one minute by default.
 
 **More than one silo.** `(silo/start {:primary-port 11111 :silo-port 11112
 :gateway-port 30001})` joins the cluster whose primary silo listens on that
@@ -181,7 +228,11 @@ over its share of the grain directory; messages routed through it fail until
 then, which is what `silo/active-silos` is for. An actor whose directory
 registration was on the silo that left is activated afresh on its next
 message, so an actor that does not persist can lose its state on a cluster
-change. That is Orleans, not the DSL: persist what matters.
+change. That is Orleans, not the DSL: persist what matters, in a grain
+storage that outlives the silos. The in-memory one does not: it is itself
+grains spread over the silos, so a silo that leaves takes its share of the
+stored states with it. `silo/connect` joins a cluster as a client, a process
+that sends to the actors without hosting any.
 
 There is no supervisor tree to define: Orleans is the supervisor. Every actor
 is always "running" as far as its callers are concerned; if it crashes it is
@@ -200,14 +251,21 @@ class library (`glue/`) holds:
   copied (it is not: it is immutable).
 - `IActorGrain`: `Call` and `Cast`. Every Clojure actor type is hosted by the
   same grain interface; the grain key is `"type/id"`.
-- `ActorGrain`: the one grain class. It owns the state slot and the timers and
-  hands every event (`OnActivate`, `OnCall`, `OnCast`, `OnInfo`, `OnError`) to
-  an `IActorHost`, which `orleans.actors.silo` implements with `reify`. The
-  host and the wire are services the silo is started with; grains and the
-  codec get them injected, nothing is static.
-- `Actors.StartSiloAsync` and `StopSiloAsync`: an in-process silo with localhost
-  clustering. `silo/start` and `silo/shutdown` await them; `start!` and
-  `shutdown!` block, for `-main`, tests and the REPL.
+- `ActorGrain`: the one grain class. It owns the state slot, the timers and
+  the reminders (`IRemindable`), and its record in a grain storage
+  (`ReadStored`, `WriteStored`, `ClearStored`, through the keyed
+  `IGrainStorage` the actor names, with a `GrainState<ClojureState>` that
+  keeps the ETag). It hands every event (`OnActivate`, `OnCall`, `OnCast`,
+  `OnInfo`, `OnError`) to an `IActorHost`, which `orleans.actors.silo`
+  implements with `reify`. The host and the wire are services the silo is
+  started with; grains and the codec get them injected, nothing is static.
+- `EdnGrainStorageSerializer`: how grain storage writes a `ClojureState`, as
+  EDN text through `IClojureWire`.
+- `Actors.StartSiloAsync` and `StopSiloAsync`: an in-process silo, with
+  localhost clustering and in-memory storage and reminders unless it is
+  given an `Action<ISiloBuilder>`; `StartClientAsync` a client. `silo/start`
+  and `silo/shutdown` await them; `start!` and `shutdown!` block, for
+  `-main`, tests and the REPL.
 
 Everything else, including the dispatch on actor type, the state handling,
 persistence and the error policy, is Clojure.
@@ -216,9 +274,8 @@ persistence and the error policy, is Clojure.
 
 - `src/orleans/actors.cljr` the DSL, the context protocols and the runtime.
 - `src/orleans/actors/silo.cljr` the Orleans host; `local.cljr` the in-process
-  host for tests; `wire.cljr` values as EDN.
-- `src/orleans/actors/storage.cljr` the storage protocol; `storage/edn_files.cljr`,
-  `storage/sqlite.cljr`, `storage/memory.cljr` its implementations.
+  host for tests; `journal.cljr` the journal protocol and its in-memory
+  implementation; `wire.cljr` values as EDN.
 - `src/ants/model.cljr` the colony as specs: actor states, messages and
   replies, what an ant sees.
 - `src/ants/logic.cljr` the colony rules as pure functions (ranking, weighted
@@ -230,14 +287,14 @@ persistence and the error policy, is Clojure.
 - `src/ants/render.cljr` terminal drawing, `src/ants/main.cljr` the driver.
 - `test/ants/logic_test.cljr` the rules, plus property-based tests generated
   from the specs; `test/ants/actors_test.cljr` the actors on the local system,
-  including the storages and every valid message; `test/ants/colony_test.cljr`
+  including persistence, reminders and every valid message; `test/ants/colony_test.cljr`
   the colony on a real silo (own ports, so it can run next to `dotnet run`),
-  persistence on files and a second silo; `test/ants/test_actors.cljr` the
+  persistence in grain storage, reminders and a second silo; `test/ants/test_actors.cljr` the
   small actors both use.
 
 ## Notes
 
-- `IHost`, `LogLevel` and `Microsoft.Data.Sqlite` live in assemblies that
+- `IHost` and `LogLevel` live in assemblies that
   ClojureCLR cannot find by name until they are loaded; the namespaces that
   use them load them with `assembly-load` before their `ns` form.
 - The simulation is driven tick by tick from `-main` so that it can be drawn;

@@ -1,0 +1,83 @@
+(ns orleans.actors.journal
+  "Where journaled actors ({:journal :ledger}) keep their history: an
+   append-only sequence of entries per actor. This is not a storage the
+   actors share: an actor never sees this protocol, it appends to and reads
+   its own journal through its host (orleans.actors/append! and friends),
+   and the host passes the actor's own ref. A silo is given its journals by
+   name (:journals in orleans.actors.silo/start); the local system keeps
+   them in memory.
+
+   An entry is a map with at least
+     :entry/seq  1, 2, 3 ... per actor, without gaps
+     :entry/key  nil, or an idempotency key unique per actor
+     :entry/at   when it was recorded, in microseconds since the epoch,
+                 increasing per actor
+   and whatever else the actor records. An implementation may store the
+   other keys as columns of its own (orleans-bank-demo's ledger does).
+
+   The sequence number is the fence: an append names the seq it takes, and
+   an append of a seq that is already taken throws, so a second activation
+   of the same actor, which read an older end of the journal, cannot write
+   past the first. An append whose key is already in the journal appends
+   nothing and returns the entry recorded under it.
+
+   Every function may return a Task<object> of its result instead.")
+
+(defprotocol Journal
+  (-append [journal ref entry]
+    "Appends entry. Returns {:appended? true :entry entry}, or {:appended?
+     false :existing entry} when an entry with the same :entry/key is in
+     the actor's journal. Throws when :entry/seq is not the next one.")
+  (-last-entry [journal ref] "The actor's last entry, or nil.")
+  (-entry-at [journal ref at]
+    "The actor's last entry recorded at or before `at` (microseconds), or nil.")
+  (-entry-by-key [journal ref key] "The actor's entry with that key, or nil.")
+  (-entries [journal ref after-seq limit]
+    "Up to limit of the actor's entries after after-seq, in order."))
+
+(defn- entry-at [entries at]
+  ;; entries are in :entry/at order: the last one at or before `at`, by bisection
+  (loop [lo 0 hi (count entries)]
+    (if (< lo hi)
+      (let [mid (quot (+ lo hi) 2)]
+        (if (<= (:entry/at (nth entries mid)) at)
+          (recur (inc mid) hi)
+          (recur lo mid)))
+      (when (pos? lo) (nth entries (dec lo))))))
+
+(defrecord MemoryJournal [journals]
+  Journal
+  (-append [_ ref {:entry/keys [seq key] :as entry}]
+    (let [result (volatile! nil)]
+      (swap! journals
+             (fn [all]
+               (let [{:keys [entries by-key] :or {entries [] by-key {}}} (get all ref)]
+                 (cond
+                   (and key (contains? by-key key))
+                   (do (vreset! result {:appended? false :existing (nth entries (get by-key key))}) all)
+
+                   (not= seq (inc (count entries)))
+                   (do (vreset! result {:conflict (count entries)}) all)
+
+                   :else
+                   (do (vreset! result {:appended? true :entry entry})
+                       (assoc all ref {:entries (conj entries entry)
+                                       :by-key (cond-> by-key key (assoc key (count entries)))}))))))
+      (if-let [last-seq (:conflict @result)]
+        (throw (ex-info (str "Journal conflict: " (:actor/type ref) "/" (:actor/id ref) " appended seq " seq
+                             ", the journal ends at " last-seq)
+                        {:actor ref :seq seq :last last-seq}))
+        @result)))
+  (-last-entry [_ ref] (peek (get-in @journals [ref :entries])))
+  (-entry-at [_ ref at] (entry-at (get-in @journals [ref :entries] []) at))
+  (-entry-by-key [_ ref key]
+    (let [{:keys [entries by-key]} (get @journals ref)]
+      (some->> (get by-key key) (nth entries))))
+  (-entries [_ ref after-seq limit]
+    (let [entries (get-in @journals [ref :entries] [])]
+      (subvec entries (min after-seq (count entries)) (min (+ after-seq limit) (count entries))))))
+
+(defn memory
+  "A journal in memory, for tests and the local system."
+  []
+  (->MemoryJournal (atom {})))

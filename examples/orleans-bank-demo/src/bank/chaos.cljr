@@ -1,0 +1,309 @@
+(ns bank.chaos
+  "The demo: a cluster of silo processes, money moving between accounts as
+   fast as the drivers can start transfers, and a monkey that kills a silo
+   (Process.Kill: no shutdown, no warning) every few seconds and brings it
+   back a little later. When the time is up the monkey stops, the
+   reminders finish whatever the crashes interrupted, and the audit
+   checks the books from what is in PostgreSQL."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [clojure.string :as str]
+            [bank.account :refer [account]]
+            [bank.audit :as audit]
+            [bank.cluster :as cluster]
+            [bank.events :as events]
+            [replication.postgres :as replication]
+            [replication.sink :as sink]
+            [bank.run :as run]
+            [bank.transfer :refer [transfer]]
+            [orleans.actors :as actors]
+            [orleans.actors.silo :as silo])
+  (:import [System.Diagnostics Process Stopwatch]
+           [System.IO Directory Path]))
+
+(set! *warn-on-reflection* true)
+
+(def defaults
+  {:silos 3 :accounts 20 :opening 10000 :seconds 30 :kill-every 6 :down 3 :workers 16})
+
+(defn- log [& parts]
+  (locking *out*
+    (println (apply str parts))
+    (flush)))
+
+(defn- now-id []
+  (.ToString (System.DateTime/UtcNow) "yyyyMMdd-HHmmss"))
+
+(defn- sleep [ms] (System.Threading.Thread/Sleep (int ms)))
+
+(defn- retrying
+  "Calls f until it returns without throwing; counts the failures in the
+   atom. A driver cannot tell whether a call that failed took effect, which
+   is why every call it retries is idempotent."
+  [retries f]
+  (loop []
+    (let [[ok value] (try [true (f)] (catch Exception _ [false nil]))]
+      (if ok
+        value
+        (do (swap! retries inc) (sleep 200) (recur))))))
+
+;; ── The silos ────────────────────────────────────────────────────
+
+(defn- start-silo! [silos i]
+  (let [log-file (Path/Combine ".bank" (str "silo-" i ".log"))]
+    (swap! silos assoc i {:process (cluster/spawn-silo i log-file) :up? true})))
+
+(defn- revive-crashed!
+  "Restarts a silo whose process ended without being killed by the monkey,
+   the way a process supervisor (systemd, Kubernetes) would."
+  [silos]
+  (doseq [[i {:keys [^Process process up?]}] @silos
+          :when (and up? (.HasExited process))]
+    (log "  ↻ silo " i " exited on its own (code " (.ExitCode process) "), restarting it")
+    (start-silo! silos i)))
+
+(defn- dots [silos n]
+  (apply str (for [i (range n)] (if (get-in @silos [i :up?]) "●" "○"))))
+
+(defn- monkey
+  "Kills a random live silo every kill-every seconds, as long as the others
+   are all up, and restarts it down seconds later. The first one it kills
+   is the silo the replicator runs on, when it can tell which that is
+   (first-target gives its index)."
+  [silos running? {:keys [kill-every down] :as options} events first-target]
+  (let [n (:silos options)]
+    (future
+      (loop []
+        (sleep (* 1000 kill-every))
+        (when @running?
+          (let [up (vec (for [[i s] @silos :when (:up? s)] i))]
+            (when (= n (count up))
+              (let [target (when (zero? @events) (first-target))
+                    i (if (some #{target} up) target (rand-nth up))
+                    ^Process p (get-in @silos [i :process])]
+                (log "  ✗ kill -9 silo " i " (pid " (.Id p) ")" (when (= i target) ", the replicator's"))
+                (swap! events inc)
+                (cluster/kill! p)
+                (swap! silos assoc-in [i :up?] false)
+                (sleep (* 1000 down))
+                (log "  ↻ restart silo " i)
+                (start-silo! silos i))))
+          (recur))))))
+
+;; ── The drivers ──────────────────────────────────────────────────
+
+(defn- driver
+  "Starts transfers until running? turns false: reserves a block of ids
+   from the run, and starts each transfer, retrying until the cluster
+   takes it. Starting a transfer twice starts it once."
+  [client run-id {:keys [accounts opening]} running? stats]
+  (future
+    (let [rng (System.Random.)]
+      (loop []
+        (when @running?
+          (let [[from until] (retrying (:retries stats) #(actors/call! client (run/run run-id) :run/reserve 10))]
+            (doseq [n (range from until)]
+              (let [a (.Next rng (int accounts))
+                    b (mod (+ a 1 (.Next rng (int (dec accounts)))) accounts)
+                    order #:transfer{:from (run/account-id run-id a)
+                                     :to (run/account-id run-id b)
+                                     :amount (inc (.Next rng (int (quot opening 4))))}]
+                (retrying (:retries stats) #(actors/call! client (transfer (run/transfer-id run-id n)) :transfer/start order))
+                (swap! (:started stats) inc))))
+          (recur))))))
+
+(defn- money-in-accounts
+  "What the accounts hold right now, or nil while some cannot answer."
+  [client run-id accounts]
+  (try
+    (reduce + (mapv #(t/result %)
+                    (mapv #(actors/call client (account (run/account-id run-id %)) :account/get-balance) (range accounts))))
+    (catch Exception _ nil)))
+
+(defn- status-line [client run-id {:keys [accounts opening silos]} silos-atom stats ^Stopwatch clock]
+  (let [money (money-in-accounts client run-id accounts)
+        expected (* accounts opening)]
+    (log (format "%3ds  silos %s  transfers %6d  retried calls %5d  in accounts %s"
+                 (long (/ (.ElapsedMilliseconds clock) 1000))
+                 (dots silos-atom silos)
+                 @(:started stats) @(:retries stats)
+                 (cond (nil? money) "(a silo is down, asking again)"
+                       (= money expected) (str money " = " expected)
+                       :else (str money " + " (- expected money) " in flight"))))))
+
+;; ── The run ──────────────────────────────────────────────────────
+
+(defn- open-accounts! [client run-id {:keys [accounts opening]}]
+  (actors/call! client (run/run run-id) :run/open #:run{:accounts accounts :opening opening})
+  (doseq [i (range accounts)
+          :let [id (run/account-id run-id i)]]
+    (actors/call! client (account id) :account/deposit #:transfer{:id (audit/opening-id id) :amount opening})))
+
+(defn- wait-for-reminders!
+  "Waits until no transfer of the run is pending, which only reminders can
+   bring about: nobody sends the transfers anything any more."
+  [client run-id]
+  (let [{:run/keys [reserved]} (retrying (atom 0) #(actors/call! client (run/run run-id) :run/show))
+        ids (mapv #(run/transfer-id run-id %) (range reserved))]
+    (loop [ids ids tries 0 first-count nil]
+      (let [left (try (audit/pending client ids) (catch Exception _ ids))]
+        (cond
+          (empty? left)
+          (log "  every transfer is finished" (when first-count (str "; " first-count " were finished by their reminders")))
+
+          (= tries 120)
+          (log "  " (count left) " transfers are still pending after two minutes")
+
+          :else
+          (do (log "  " (count left) " transfers interrupted by the crashes, waiting for their reminders...")
+              (sleep 2000)
+              (recur left (inc tries) (or first-count (count left)))))))))
+
+(defn report [run-id {:keys [ok? total expected counts recovered moments problems]}]
+  (log "")
+  (log "Audit of run " run-id ", from PostgreSQL:")
+  (log "  transfers done " (:done counts 0) ", declined for lack of funds " (:declined counts 0)
+       ", never started " (:blank counts 0) ", pending " (:pending counts 0))
+  (log "  " recovered " transfers were cut off by a crash and finished later by their reminder")
+  (log "  money in the accounts " total ", opened with " expected)
+  (log "  every journal explains its balance, entry by entry; the books balanced at each of the "
+       moments " moments something was booked")
+  (if ok?
+    (log "  ✓ every transfer happened exactly once, or not at all; not one öre appeared or vanished")
+    (do (log "  ✗ " (count problems) " problems:")
+        (doseq [p (take 20 problems)] (log "    " p)))))
+
+(defn- instant [micros]
+  (.ToString (.AddTicks (System.DateTime. 1970 1 1 0 0 0 System.DateTimeKind/Utc) (* 10 (long micros))) "HH:mm:ss.ffffff"))
+
+(defn- history
+  "The bank at a few moments of the run, from the accounts' balances at
+   those moments (one lookup in each journal) and the transfers on their way."
+  [client run-id {:keys [accounts opening]}]
+  (let [{:run/keys [reserved]} (actors/call! client (run/run run-id) :run/show)
+        transfers (mapv #(actors/call! client (transfer (run/transfer-id run-id %)) :transfer/show) (range reserved))
+        times (sort (keep :transfer/debited-at transfers))]
+    (when (seq times)
+      (log "")
+      (log "The books at moments of the run, each account asked for its balance then:")
+      (doseq [at (map #(nth times (quot (* % (dec (count times))) 4)) (range 5))
+              :let [{:keys [held in-flight]} (audit/books-at client run-id at transfers)]]
+        (log "  " (instant at) "  accounts " held " + on its way " in-flight " = " (+ held in-flight)
+             (if (= (+ held in-flight) (* accounts opening)) "  ✓" "  ✗"))))))
+
+(defn- replicator-silo
+  "The index of the silo the replicator runs on, nil when it is not one of
+   the demo's."
+  [client silos]
+  (try
+    (let [pid (:replicator/process (actors/call! client events/ledger :replicator/status))]
+      (some (fn [[i {:keys [^Process process]}]] (when (= pid (.Id process)) i)) @silos))
+    (catch Exception _ nil)))
+
+(defn- consumer
+  "Drains the replicator into the sink until consuming? turns false, and
+   notes every activation of the replicator it meets."
+  [client sink consuming? seen]
+  (future
+    (loop [n 0]
+      (when @consuming?
+        (let [taken (try (replication/drain! client events/ledger #(sink/keep! sink %)) (catch Exception _ 0))]
+          (when (zero? (mod n 10))
+            (when-let [{:replicator/keys [activation process]} (replication/status client events/ledger)]
+              (swap! seen conj [activation process])))
+          (when (< taken 5000) (sleep 200))
+          (recur (inc n)))))))
+
+(defn- streamed
+  "Waits until the sink has every entry of every account of the run, or a
+   minute went by. Returns what is missing, by account."
+  [client run-id received {:keys [accounts]}]
+  (let [journals (into {} (for [i (range accounts) :let [id (run/account-id run-id i)]]
+                            [id (retrying (atom 0) #(audit/journal client id))]))]
+    (loop [tries 0]
+      (let [missing (into {} (for [[id journal] journals
+                                   :let [m (events/missing received id journal)]
+                                   :when (seq m)]
+                               [id m]))]
+        (if (or (empty? missing) (= tries 300))
+          {:rows (reduce + (map count (vals journals))) :missing missing}
+          (do (sleep 200) (recur (inc tries))))))))
+
+(defn- report-stream [{:keys [rows missing]} received seen]
+  (let [{:keys [repeated conflicting]} (sink/stats received)]
+    (log "")
+    (log "The ledger streamed out of the WAL by the replicator, into the sink in this process:")
+    (log "  " rows " rows booked by the run's accounts; " (- rows (reduce + 0 (map count (vals missing))))
+         " of them in the sink, as events")
+    (log "  " repeated " events came more than once (after a restart, acknowledged late) and were kept once"
+         (when (pos? conflicting) (str "; " conflicting " repeats DIFFERED")))
+    (log "  the replicator ran in " (count seen) " activations, on " (count (set (map second seen))) " processes")
+    (if (and (empty? missing) (zero? conflicting))
+      (log "  ✓ every row of the ledger reached the sink, whatever was killed")
+      (log "  ✗ missing: " (pr-str (into {} (map (fn [[k v]] [k (map :entry/seq v)])) missing))))))
+
+(defn demo!
+  "Runs the demo; returns the audit."
+  [options]
+  (let [{:keys [silos seconds workers] :as options} (merge defaults options)
+        silos-atom (atom (sorted-map))
+        running? (atom true)
+        stats {:started (atom 0) :retries (atom 0)}
+        kills (atom 0)
+        run-id (now-id)
+        received (sink/sink events/key-of)
+        consuming? (atom false)
+        pumps (atom [])
+        seen (atom #{})]
+    (Directory/CreateDirectory ".bank")
+    (log "Starting " silos " silos on PostgreSQL (logs in .bank/)...")
+    (doseq [i (range silos)] (start-silo! silos-atom i))
+    (let [client (cluster/connect!)]
+      (try
+        (loop [tries 0]
+          (when (and (< tries 120) (not= silos (cluster/active-silos client)))
+            (sleep 500) (recur (inc tries))))
+        (loop [tries 0]
+          (when (and (< tries 120)
+                     (not (:replicator/running? (replication/status client events/ledger))))
+            (sleep 500) (recur (inc tries))))
+        (log "Cluster up: " (cluster/active-silos client) " silos, the replicator streaming. Run " run-id ": opening "
+             (:accounts options) " accounts with " (:opening options) " each.")
+        (reset! consuming? true)
+        (swap! pumps conj (consumer client received consuming? seen))
+        (open-accounts! client run-id options)
+        (log "Moving money for " seconds " s with " workers " drivers; a silo is killed every "
+             (:kill-every options) " s.")
+        (let [clock (Stopwatch/StartNew)
+              drivers (doall (for [_ (range workers)] (driver client run-id options running? stats)))
+              chaos (monkey silos-atom running? options kills #(replicator-silo client silos-atom))]
+          (while (< (.ElapsedMilliseconds clock) (* 1000 seconds))
+            (status-line client run-id options silos-atom stats clock)
+            (revive-crashed! silos-atom)
+            (sleep 2000))
+          (reset! running? false)
+          (log "Time. Stopping the drivers and the monkey (" @kills " silos killed).")
+          (run! deref drivers)
+          @chaos
+          (loop [tries 0]
+            (when (and (< tries 120) (not= silos (cluster/active-silos client)))
+              (sleep 500) (recur (inc tries))))
+          (status-line client run-id options silos-atom stats clock))
+        (wait-for-reminders! client run-id)
+        (let [result (retrying (atom 0) #(audit/audit client run-id))
+              stream (streamed client run-id received options)]
+          (retrying (atom 0) #(history client run-id options))
+          (report run-id result)
+          (report-stream stream received @seen)
+          (log "")
+          (log "Audit it again later, from nothing but the database: dotnet run -- audit " run-id)
+          (assoc result
+                 :ok? (and (:ok? result) (empty? (:missing stream)) (zero? (:conflicting (sink/stats received))))
+                 :stream (merge (sink/stats received) {:rows (:rows stream) :missing (count (:missing stream))
+                                                       :activations (count @seen)})))
+        (finally
+          (reset! running? false)
+          (reset! consuming? false)
+          (run! deref @pumps)
+          (try (silo/shutdown! client) (catch Exception _ nil))
+          (log "Stopping the silos.")
+          (run! deref (doall (for [[_ {:keys [process]}] @silos-atom] (future (cluster/stop! process))))))))))

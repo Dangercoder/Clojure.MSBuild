@@ -1,0 +1,35 @@
+(ns replication.sink
+  "A sink in memory for the events of a stream: it keeps every event once,
+   by a key of the event, counts the ones that came again (a stream
+   delivers at least once) and the repeats that differed, which a stream
+   should never deliver.")
+
+(defn sink
+  "An empty sink that tells events apart by (key event)."
+  [key]
+  (atom {:key key :events {} :received 0 :repeated 0 :conflicting []}))
+
+(defn keep!
+  "Keeps a batch of events: an event whose key is there already is a
+   repeat, and must be the same event."
+  [sink events]
+  (swap! sink
+         (fn [{:keys [key] :as state}]
+           (reduce (fn [state e]
+                     (let [k (key e)
+                           state (update state :received inc)]
+                       (if-let [earlier (get-in state [:events k])]
+                         (cond-> (update state :repeated inc)
+                           (not= earlier e) (update :conflicting conj [earlier e]))
+                         (assoc-in state [:events k] e))))
+                   state events)))
+  nil)
+
+(defn events
+  "What the sink kept, by key."
+  [sink]
+  (:events @sink))
+
+(defn stats [sink]
+  (let [{:keys [events received repeated conflicting]} @sink]
+    {:events (count events) :received received :repeated repeated :conflicting (count conflicting)}))

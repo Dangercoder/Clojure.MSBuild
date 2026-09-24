@@ -2,8 +2,7 @@
   "Small actors for the tests, hosted by both the local system and a silo."
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.spec.alpha :as s]
-            [orleans.actors :as actors :refer [defactor reply]]
-            [orleans.actors.storage :as storage]))
+            [orleans.actors :as actors :refer [defactor reply]]))
 
 ;; A counter: its state must stay a natural number.
 (s/def ::count nat-int?)
@@ -28,15 +27,60 @@
   (call :ledger/forget [ctx n] (t/await (actors/forget ctx)) (actors/stop ctx) (reply :forgotten n))
   (call :ledger/stop [ctx n] (actors/stop ctx) (reply :stopping n)))
 
-;; Keeps a note of every message in its own storage, outside its state.
-(s/def :diary/note string?)
+;; Persists in a storage of its own, "vaults".
+(s/def :vault/put string?)
 
-(defactor diary
-  (init [ctx id] [])
-  (call :diary/note [ctx entries text]
-    (let [entries (conj entries text)]
-      (t/await (actors/as-async (storage/write-state (:actor/storage ctx) :notes (:actor/id (:actor/self ctx)) entries)))
-      (reply (count entries) entries))))
+(defactor vault
+  {:persist :vaults}
+  (init [ctx id] #{})
+  (call :vault/put [ctx items item] (reply :ok (conj items item))))
+
+;; Counts the ticks of a reminder, which it cancels on the third, and
+;; persists the count: a reminder can wake it up on a fresh activation.
+(defactor nag
+  {:state ::count :persist true}
+  (init [ctx id] 0)
+  (call :nag/start [ctx n]
+    (t/await (actors/remind-every ctx 60000 :nag/tick))
+    (reply :started n))
+  (call :nag/count ::count [ctx n] (reply n n))
+  (call :nag/stop [ctx n] (actors/stop ctx) (reply :stopping n))
+  (info :nag/tick [ctx n]
+    (when (= 2 n) (t/await (actors/cancel-reminder ctx :nag/tick)))
+    (inc n)))
+
+;; Journaled: every addition is an entry with the total after it, keyed by
+;; the id it comes with, so an addition that is repeated counts once.
+(s/def :tally/add (s/keys :req [:tally/id :tally/n]))
+(s/def :tally/id string?)
+(s/def :tally/n pos-int?)
+
+(defactor tally
+  {:journal :tallies}
+  (init [ctx id] {:total 0 :seq 0 :at 0})
+  (resume [ctx {:entry/keys [total seq at]}] {:total total :seq seq :at at})
+  (call :tally/add [ctx {:keys [total seq at] :as state} {:tally/keys [id n]}]
+    (let [entry #:entry{:seq (inc seq) :key id :total (+ total n) :at (actors/next-at ctx at)}
+          {:keys [appended? existing]} (t/await (actors/append! ctx entry))]
+      (if appended?
+        (reply (:entry/total entry) {:total (:entry/total entry) :seq (:entry/seq entry) :at (:entry/at entry)})
+        (reply (:entry/total existing) state))))
+  (call :tally/total-at [ctx state at]
+    (reply (:entry/total (t/await (actors/entry-at ctx at))) state))
+  (call :tally/entries [ctx state]
+    (reply (t/await (actors/entries ctx 0 100)) state)))
+
+;; Lets go of what it holds when its activation ends: records it here.
+(defonce terminated (atom []))
+(s/def :holder/add pos-int?)
+
+(defactor holder
+  {:state ::count}
+  (init [ctx id] 0)
+  (call :holder/add [ctx n k] (reply (+ n k) (+ n k)))
+  (call :holder/fail [ctx n] (throw (ex-info "boom" {})))
+  (call :holder/stop [ctx n] (actors/stop ctx) (reply :stopping n))
+  (terminate [ctx n] (swap! terminated conj [(:actor/id (:actor/self ctx)) n])))
 
 ;; Promises a natural number and answers with something else.
 (defactor liar

@@ -3,8 +3,10 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net11.0</TargetFramework>
-    <AssemblyName>AntsDemo</AssemblyName>
-    <ClojureMainNamespace>ants.main</ClojureMainNamespace>
+    <AssemblyName>BankDemo</AssemblyName>
+    <ClojureMainNamespace>bank.main</ClojureMainNamespace>
+    <!-- The actor library (orleans.actors) is the ants example's: one runtime, two examples -->
+    <ClojureExtraSourceDirs>../orleans-actors-ants-demo/src</ClojureExtraSourceDirs>
     <EnablePreviewFeatures>true</EnablePreviewFeatures>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
@@ -19,12 +21,13 @@
     <PackageReference Include="Clojure" Version="1.12.6" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.0" />
     <PackageReference Include="Microsoft.Orleans.Server" Version="10.3.1" />
-    <ProjectReference Include="glue/Clojure.Orleans.csproj" />
+    <ProjectReference Include="glue/Bank.Orleans.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <Content Include="src/**/*.cljr" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="test/**/*.cljr" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../orleans-actors-ants-demo/src/orleans/**/*.cljr" Link="src/orleans/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

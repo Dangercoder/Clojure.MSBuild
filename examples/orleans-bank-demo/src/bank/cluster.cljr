@@ -1,0 +1,107 @@
+(ns bank.cluster
+  "The bank's cluster on PostgreSQL: silos in this process or in processes
+   of their own, and the client the drivers send through. Membership, the
+   \"bank\" grain storage (transfers, runs) and reminders are Orleans'
+   ADO.NET providers (glue/Postgres.cs); the accounts' journal is the
+   ledger_entries table (bank.ledger). The database is the one
+   docker-compose.yml starts, or BANK_POSTGRES."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [clojure.string :as str]
+            [bank.ledger :as ledger]
+            [orleans.actors.silo :as silo])
+  (:import [Bank.Orleans Postgres]
+           [Microsoft.Extensions.Logging LogLevel]
+           [System TimeSpan]
+           [System.Diagnostics DataReceivedEventHandler Process ProcessStartInfo]
+           [System.IO File Path StreamWriter]))
+
+(set! *warn-on-reflection* true)
+
+(defn connection-string ^String []
+  (or (System.Environment/GetEnvironmentVariable "BANK_POSTGRES")
+      ;; every silo has a pool of its own, and Postgres a limit on connections
+      "Host=localhost;Port=5433;Username=orleans;Password=orleans;Database=bank;Maximum Pool Size=16"))
+
+(def minimum-reminder-period
+  "Orleans refuses reminders more frequent than one a minute unless told
+   otherwise; the bank retries its transfers every few seconds."
+  (TimeSpan/FromSeconds 1.0))
+
+(defn silo-ports
+  "The silo and gateway port of the i-th silo on this machine."
+  [i]
+  {:silo-port (+ 11311 i) :gateway-port (+ 30300 i)})
+
+(defn start-silo
+  "Starts silo i of the bank's cluster in this process. Returns a Task of
+   the silo, a system for actors/call."
+  [i]
+  (silo/start (merge (silo-ports i)
+                     {:configure (Postgres/Silo (connection-string) minimum-reminder-period)
+                      :journals {:ledger (ledger/ledger (connection-string))}})))
+
+(defn connect!
+  "Connects to the cluster as a client, retrying while no silo is up yet.
+   Blocking; returns the client."
+  []
+  (loop [tries 0]
+    (let [client (try (t/result (silo/connect (Postgres/Client (connection-string)) LogLevel/Error))
+                      (catch Exception e
+                        (when (= tries 60) (throw e))
+                        nil))]
+      (or client
+          (do (System.Threading.Thread/Sleep 1000) (recur (inc tries)))))))
+
+;; ── Silos in processes of their own ──────────────────────────────
+
+(defn- command
+  "How to start this application again: the apphost, or dotnet and the dll."
+  []
+  (let [path System.Environment/ProcessPath
+        app (.Location (System.Reflection.Assembly/GetEntryAssembly))]
+    (if (str/starts-with? (Path/GetFileNameWithoutExtension path) "dotnet")
+      [path app]
+      [path])))
+
+(defn spawn-silo
+  "Starts silo i as a process of its own (this application, `silo i`),
+   its output going to the log file. Returns the Process."
+  ^Process [i ^String log]
+  (let [[exe & args] (command)
+        info (doto (ProcessStartInfo. ^String exe)
+               (.set_UseShellExecute false)
+               (.set_RedirectStandardInput true)
+               (.set_RedirectStandardOutput true)
+               (.set_RedirectStandardError true))
+        _ (doseq [^String a (concat args ["silo" (str i)])] (.Add (.ArgumentList info) a))
+        writer (doto (StreamWriter. log true) (.set_AutoFlush true))
+        write (gen-delegate DataReceivedEventHandler [_ e]
+                (when-let [line (.Data ^System.Diagnostics.DataReceivedEventArgs e)]
+                  (locking writer (.WriteLine writer ^String line))))
+        process (Process/Start info)]
+    (.add_OutputDataReceived process write)
+    (.add_ErrorDataReceived process write)
+    (.BeginOutputReadLine process)
+    (.BeginErrorReadLine process)
+    process))
+
+(defn stop!
+  "Asks the silo process to leave the cluster and waits for it to exit;
+   kills it when it does not within ten seconds."
+  [^Process process]
+  (try (.WriteLine (.StandardInput process) "stop") (.Flush (.StandardInput process)) (catch Exception _ nil))
+  (when-not (.WaitForExit process 10000)
+    (try (.Kill process true) (catch Exception _ nil))))
+
+(defn kill!
+  "Kills the process at once, as a crash would: no shutdown, no goodbye to
+   the cluster."
+  [^Process process]
+  (try (.Kill process true) (catch Exception _ nil))
+  (.WaitForExit process 10000))
+
+(defn active-silos
+  "The number of silos the cluster considers active, nil when it cannot
+   tell right now."
+  [client]
+  (try (t/result (silo/active-silos client)) (catch Exception _ nil)))

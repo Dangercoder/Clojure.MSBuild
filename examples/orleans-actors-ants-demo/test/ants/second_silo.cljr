@@ -3,7 +3,6 @@
 ;; on the first silo, so every message crosses the wire.
 (require '[orleans.actors :as actors]
          '[orleans.actors.silo :as silo]
-         '[orleans.actors.storage.edn-files :as edn-files]
          '[ants.world :refer [world]]
          '[ants.test-actors :refer [ledger]]      ; the persisting actor type the test uses
          '[clojure.string :as str])
@@ -16,8 +15,7 @@
 
 (let [system (silo/start! {:silo-port (port "SILO_PORT")
                            :gateway-port (port "GATEWAY_PORT")
-                           :primary-port (port "PRIMARY_PORT")
-                           :storage (edn-files/storage (System.Environment/GetEnvironmentVariable "ACTORS_DIR"))})]
+                           :primary-port (port "PRIMARY_PORT")})]
   (try
     (let [view (actors/call! system (world "main") :world/look #:ant{:x 1 :y 1 :dir 0})]
       (assert (= 20 (:world/size view)) (str "the world configured by the first silo has size 20, saw " (:world/size view)))
@@ -27,6 +25,7 @@
       (let [unknown (message-of #(actors/call! system (world "main") :world/fly))]
         (assert (and unknown (str/includes? unknown "rejected")) "an unknown message is rejected on the other silo too"))
       (assert (= 5 (actors/call! system (ledger "shared") :ledger/add 5)) "a persisting actor, written from this silo")
+      (assert (= 5 (actors/call! system (ledger "shared") :ledger/get)) "and read back")
       (println "second silo: ok"))
     (finally
       (silo/shutdown! system))))

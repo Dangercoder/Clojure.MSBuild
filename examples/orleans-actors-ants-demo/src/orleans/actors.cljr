@@ -10,9 +10,17 @@
    Every handler gets a context as its first argument, a map with
    namespaced keys, and everything an actor does besides computing its next
    state goes through it: sending to other actors (`call`, `cast`, through
-   :actor/system), timers to itself (`send-after`, `send-every`) and `stop`
-   (through :actor/host), and the :actor/storage its state persists in;
-   :actor/self is its own ref. The context comes from whatever hosts the
+   :actor/system), timers and reminders to itself (`send-after`,
+   `send-every`, `remind-every`) and `stop` (through :actor/host);
+   :actor/self is its own ref.
+
+   An actor's state is its own. There is no storage to share: an actor that
+   persists ({:persist true}) has its state kept by its host, in a record
+   that belongs to it alone, and other actors learn about it by sending
+   messages. On Orleans that record is the grain's, in an Orleans grain
+   storage (memory, ADO.NET, ...); the grain is the only writer, and the
+   storage's ETag stops a second activation of the same actor from
+   overwriting it. The context comes from whatever hosts the
    actor, so nothing here is global: on Orleans (orleans.actors.silo) the
    system reaches the cluster; in a test (orleans.actors.local) it is an
    in-process system that runs actors synchronously. `call` and `cast` take
@@ -20,13 +28,12 @@
    use one API.
 
    This namespace is the runtime both hosts share: dispatch on the actor
-   type, payload and state specs, persistence through the
-   orleans.actors.storage protocol and the :on-error policy. A host adds a
-   state slot, timers and deactivation (see `context`, `activate`, `handle`
-   and `recover`).
+   type, payload and state specs, persistence and the :on-error policy. A
+   host adds a state slot, the stored record, timers, reminders and
+   deactivation (see `context`, `activate`, `handle` and `recover`).
 
    Messages and states are Clojure values. Inside a silo they are passed by
-   reference (they are immutable); between silos, and in a file storage,
+   reference (they are immutable); between silos, and in grain storage,
    they are EDN (orleans.actors.wire), so they have to be data.
 
    A message type is a namespaced keyword, :world/look, and when a spec is
@@ -40,8 +47,7 @@
   (:refer-clojure :exclude [cast])
   (:require [clojure.clr.async.task.alpha :as t]
             [clojure.spec.alpha :as s]
-            [clojure.spec.gen.alpha :as gen]
-            [orleans.actors.storage :as storage]))
+            [clojure.spec.gen.alpha :as gen]))
 
 (set! *warn-on-reflection* true)
 
@@ -94,13 +100,39 @@
      completes once it is sent."))
 
 (defprotocol Host
-  "What hosts one activation of an actor: its timers and its deactivation.
-   The :actor/host of a context implements it."
+  "What hosts one activation of an actor: its timers and reminders, its
+   stored record and its deactivation. The :actor/host of a context
+   implements it."
   (-timer [host type payload due-ms period-ms]
     "Delivers the message to the actor's info handler after due-ms, then
-     every period-ms (nil: once). Returns an IDisposable that cancels it.")
+     every period-ms (nil: once). Returns an IDisposable that cancels it.
+     A timer belongs to the activation and ends with it.")
   (-clear-timers [host] "Cancels the actor's timers.")
+  (-remind [host type due-ms period-ms]
+    "Delivers a message of the given type, without payload, to the actor's
+     info handler after due-ms, then every period-ms, until cancelled. A
+     reminder outlives the activation: it activates the actor again when it
+     is due. Returns a Task.")
+  (-unremind [host type] "Cancels the reminder of that type. Returns a Task.")
+  (-read-state [host provider]
+    "The actor's stored state in the named storage, or `none`; a Task.")
+  (-write-state [host provider state] "Stores the actor's state; a Task.")
+  (-clear-state [host provider] "Removes the actor's stored state; a Task.")
+  (-append [host journal entry]
+    "Appends an entry to the actor's journal (see orleans.actors.journal);
+     a Task of {:appended? true :entry e} or {:appended? false :existing e}.")
+  (-last-entry [host journal] "The actor's last journal entry, or nil; a Task.")
+  (-entry-at [host journal at] "The actor's journal entry as of `at`, or nil; a Task.")
+  (-entry-by-key [host journal key] "The actor's journal entry with that key, or nil; a Task.")
+  (-entries [host journal after-seq limit] "A page of the actor's journal; a Task.")
+  (-now [host] "The host's clock, in microseconds since the epoch.")
   (-stop [host] "Deactivates the actor after the current message."))
+
+(def none
+  "What a host's -read-state gives when nothing is stored: nil is a state too."
+  ::none)
+
+(defn none? [x] (= none x))
 
 ;; ── References ───────────────────────────────────────────────────
 
@@ -118,20 +150,17 @@
 
 (s/def :actor/self ::ref)
 (s/def :actor/system #(satisfies? Messaging %))
-(s/def :actor/storage #(satisfies? storage/Storage %))
 (s/def :actor/host #(satisfies? Host %))
-(s/def ::context (s/keys :req [:actor/self :actor/system :actor/storage :actor/host]))
+(s/def ::context (s/keys :req [:actor/self :actor/system :actor/host]))
 
 (defn context
   "For hosts: the context of an actor, what every handler gets first.
      :actor/self     the actor's own ref, to pass to others
      :actor/system   the system it sends through (Messaging)
-     :actor/storage  the system's orleans.actors.storage/Storage; a
-                     persisting actor's state goes through it on its own,
-                     it is there for anything else an actor wants to keep
-     :actor/host     what hosts this activation (Host)"
-  [ref system storage host]
-  {:actor/self ref :actor/system system :actor/storage storage :actor/host host})
+     :actor/host     what hosts this activation (Host): timers, reminders,
+                     the actor's stored record, stop"
+  [ref system host]
+  {:actor/self ref :actor/system system :actor/host host})
 
 (defn- system-of
   "The system to send through: the one in a context, or x itself."
@@ -148,6 +177,9 @@
   "Registers an actor definition for a type keyword:
      {:init     (fn [ctx id] state)
       :resume   (fn [ctx stored] state), optional, for a persisting actor
+      :terminate (fn [ctx state] _), optional: runs when the activation
+                ends (deactivation, or a restart after a failure), to let
+                go of what it holds that is not data
       :call     {msg-type (fn [ctx state payload] [reply state])}
       :cast     {msg-type (fn [ctx state payload] state)}
       :info     {msg-type (fn [ctx state payload] state)}
@@ -155,17 +187,41 @@
       :replies  {msg-type reply-spec} for call messages, optional
    Message types are namespaced keywords; the spec registered under one,
    if any, is the spec of its payload.
-      :persist  true to store the state, optional
+      :journal  the name of the journal a journaled actor records its
+                history in (see `append!`), instead of :persist; its
+                resume gets its last entry
+      :persist  true to have the host store the state (in the grain
+                storage named \"Default\" on a silo), or the name of the
+                grain storage to use, optional
       :on-error :restart | :resume | :stop}
    Handlers may return a Task<object> (t/async) instead of a value.
    `defactor` is the convenient way to build this map."
   [type definition]
+  (when (and (:persist definition) (:journal definition))
+    (throw (ex-info (str "Actor " type ": :persist or :journal, not both") {:actor type})))
+  (when (and (:journal definition) (not (:resume definition)))
+    (throw (ex-info (str "Actor " type ": a journaled actor needs a resume clause, which rebuilds its state from its last entry")
+                    {:actor type})))
   (swap! definitions assoc type definition)
   type)
 
 (defn- definition-of [type]
   (or (get @definitions type)
       (throw (ex-info (str "No actor defined for type " type) {:actor type}))))
+
+(defn- provider
+  "The name of the storage a persisting actor's state is kept in."
+  ^String [definition]
+  (let [persist (:persist definition)]
+    (if (true? persist) "Default" (name persist))))
+
+(defn- journal-of
+  "The name of the journal of a journaled actor."
+  ^String [ctx]
+  (let [definition (definition-of (:actor/type (:actor/self ctx)))]
+    (or (some-> (:journal definition) name)
+        (throw (ex-info (str "Actor " (:actor/type (:actor/self ctx)) " has no journal: {:journal :name} in its options")
+                        {:actor (:actor/self ctx)})))))
 
 ;; ── Sending ──────────────────────────────────────────────────────
 
@@ -218,6 +274,83 @@
   ([ctx ms type] (send-every ctx ms type nil))
   ([ctx ms type payload] (-timer (:actor/host ctx) type payload ms ms)))
 
+(defn remind-every
+  "Delivers a message of the given type (no payload) to the actor's own
+   info handler every ms milliseconds, the first after ms (or due-ms),
+   until `cancel-reminder`. A reminder is durable where the host's
+   reminders are (on a silo, in the cluster's reminder service): it
+   outlives the activation and the silo, and activates the actor again,
+   wherever it lives by then, when it is due. Registering the same type
+   again replaces it. Returns a Task. Orleans reminders are for minutes,
+   not milliseconds: a silo refuses a period below its
+   ReminderOptions.MinimumReminderPeriod (one minute by default)."
+  ([ctx ms type] (remind-every ctx ms ms type))
+  ([ctx due-ms period-ms type] (as-async (-remind (:actor/host ctx) type due-ms period-ms))))
+
+(alter-meta! #'remind-every assoc :tag task-of-object)
+
+(defn cancel-reminder
+  "Cancels the actor's reminder of the given type, if it has one. Returns a Task."
+  [ctx type]
+  (as-async (-unremind (:actor/host ctx) type)))
+
+(alter-meta! #'cancel-reminder assoc :tag task-of-object)
+
+(defn append!
+  "Appends an entry to the actor's own journal, and returns a Task of
+   {:appended? true :entry entry}, or of {:appended? false :existing e}
+   when the journal already has an entry with the same :entry/key (then
+   nothing was appended: the key says it happened already, and e is what
+   happened). The entry names the :entry/seq it takes, the one after the
+   last the actor knows of; when that seq is taken, because another
+   activation of the same actor appended in between, it throws, and the
+   actor restarts from its journal. :entry/at is when it happened, in
+   microseconds, increasing per actor (see `next-at`).
+
+   A journaled actor's state is what its journal says: a handler appends
+   before it replies, and returns the state the entry leads to. On a fresh
+   activation, resume gets the last entry and rebuilds the state from it,
+   so an entry should carry what that takes (a running balance, say)."
+  [ctx entry]
+  (as-async (-append (:actor/host ctx) (journal-of ctx) entry)))
+
+(alter-meta! #'append! assoc :tag task-of-object)
+
+(defn entry-at
+  "A Task of the actor's last journal entry recorded at or before `at`
+   (microseconds since the epoch), nil when there is none: its state at
+   that moment, as its entries record it."
+  [ctx at]
+  (as-async (-entry-at (:actor/host ctx) (journal-of ctx) at)))
+
+(alter-meta! #'entry-at assoc :tag task-of-object)
+
+(defn entry-by-key
+  "A Task of the actor's journal entry with that :entry/key, or nil."
+  [ctx key]
+  (as-async (-entry-by-key (:actor/host ctx) (journal-of ctx) key)))
+
+(alter-meta! #'entry-by-key assoc :tag task-of-object)
+
+(defn entries
+  "A Task of up to limit of the actor's journal entries after after-seq,
+   in order."
+  [ctx after-seq limit]
+  (as-async (-entries (:actor/host ctx) (journal-of ctx) after-seq limit)))
+
+(alter-meta! #'entries assoc :tag task-of-object)
+
+(defn next-at
+  "When an entry happens: the host's clock, but always after the actor's
+   previous entry (last-at) and after any moment it has heard of (after,
+   the time of the entry that caused this one, from another actor). Clocks
+   of different silos disagree; this makes an actor's entries increase and
+   an effect never come before its cause, so the entries of all actors up
+   to any moment are a consistent cut."
+  ([ctx last-at] (next-at ctx last-at nil))
+  ([ctx last-at after]
+   (max (-now (:actor/host ctx)) (inc (or last-at 0)) (or after 0))))
+
 (defn stop
   "Deactivates the actor after the current message. The next message sent
    to it creates a fresh one: init runs again, or resume when the actor
@@ -229,8 +362,8 @@
   "Discards the stored state of a persisting actor. Returns a Task; the
    next activation runs init again."
   [ctx]
-  (let [{:actor/keys [type id]} (:actor/self ctx)]
-    (as-async (storage/clear-state (:actor/storage ctx) type id))))
+  (let [definition (definition-of (:actor/type (:actor/self ctx)))]
+    (as-async (-clear-state (:actor/host ctx) (provider definition)))))
 
 (alter-meta! #'forget assoc :tag task-of-object)
 
@@ -285,8 +418,7 @@
   [ctx definition state previous]
   (t/async
     (when (and (:persist definition) (not (identical? state previous)))
-      (let [{:actor/keys [type id]} (:actor/self ctx)]
-        (t/await (as-async (storage/write-state (:actor/storage ctx) type id state)))))
+      (t/await (as-async (-write-state (:actor/host ctx) (provider definition) state))))
     nil))
 
 (alter-meta! #'store! assoc :tag task-of-object)
@@ -299,14 +431,19 @@
   (t/async
     (let [{:actor/keys [type id]} (:actor/self ctx)
           definition (definition-of type)
-          stored (if (:persist definition)
-                   (t/await (as-async (storage/read-state (:actor/storage ctx) type id)))
-                   storage/none)
-          state (if (storage/none? stored)
+          stored (cond (:persist definition)
+                       (t/await (as-async (-read-state (:actor/host ctx) (provider definition))))
+
+                       (:journal definition)
+                       (or (t/await (as-async (-last-entry (:actor/host ctx) (name (:journal definition))))) none)
+
+                       :else none)
+          state (if (none? stored)
                   (t/await (as-async ((:init definition) ctx id)))
                   (t/await (as-async ((:resume definition (fn [_ stored] stored)) ctx stored))))]
       (conform-state! definition (:state-check settings) type nil state ::none)
-      (t/await (store! ctx definition state ::none))
+      ;; a resumed state that is the stored one is not written back
+      (t/await (store! ctx definition state stored))
       state)))
 
 (alter-meta! #'activate assoc :tag task-of-object)
@@ -354,13 +491,31 @@
 
 (alter-meta! #'handle assoc :tag task-of-object)
 
+(defn deactivate
+  "For hosts. Runs the actor's terminate, if it has one, when its activation
+   ends. A terminate that fails is logged and otherwise ignored: the
+   activation ends anyway. Returns a Task."
+  [ctx state]
+  (t/async
+    (let [{:actor/keys [type id]} (:actor/self ctx)]
+      (when-let [terminate (:terminate (get @definitions type))]
+        (let [[_ error] (t/await (outcome (as-async (terminate ctx state))))]
+          (when error
+            (warn "actor " type "/" id " failed in terminate: " (.Message ^Exception error))))))
+    nil))
+
+(alter-meta! #'deactivate assoc :tag task-of-object)
+
 (defn recover
   "For hosts. Applies the actor's :on-error policy after a handler threw:
      :restart (default) the actor is re-initialised with `activate`, like a
-              supervised GenServer coming back after a crash; a persisting
-              actor resumes from its stored state, the last one that
-              conformed
-     :resume  the state is kept
+              supervised GenServer coming back after a crash; its
+              terminate runs first, then init, or resume for a persisting
+              actor, from its stored state, the last one that conformed
+     :resume  the state is kept; not for a persisting actor whose write
+              was refused because its record moved (a version conflict):
+              it keeps the version it read, so every later write fails
+              too, where :restart reads the record again
      :stop    the actor is deactivated
    Returns a Task of the state to continue with. The exception itself
    still reaches the caller."
@@ -371,6 +526,7 @@
       (warn "actor " type "/" id " failed: " (.Message error))
       (case (:on-error definition :restart)
         :restart (do (-clear-timers (:actor/host ctx))
+                     (t/await (as-task (deactivate ctx state)))
                      (t/await (as-task (activate ctx settings))))
         :stop (do (-stop (:actor/host ctx)) state)
         state))))
@@ -394,6 +550,8 @@
     {:type type
      :state (some-> (:state definition) s/describe)
      :persist (boolean (:persist definition))
+     :journal (some-> (:journal definition) name)
+     :storage (when (:persist definition) (provider definition))
      :on-error (:on-error definition :restart)
      :call (messages :call)
      :cast (messages :cast)
@@ -451,7 +609,8 @@
        (call :counter/add [ctx state n]
          (reply (+ state n) (+ state n)))
        (cast :counter/reset [ctx state] 0)
-       (info :counter/tick [ctx state] (inc state)))
+       (info :counter/tick [ctx state] (inc state))
+       (terminate [ctx state] ...))              ; optional: the activation ends
 
    A message type is a namespaced keyword; the spec registered under it, if
    any, is the spec of its payload, so a message is declared the way a key
@@ -460,8 +619,8 @@
 
    The first argument of every handler is the actor's context (see
    `context`): what it sends through (`call`, `cast`), its timers
-   (`send-after`, `send-every`), `stop`, its own ref as :actor/self and the
-   system's :actor/storage. Handler bodies run in an async context, so they
+   (`send-after`, `send-every`), reminders (`remind-every`,
+   `cancel-reminder`), `stop` and its own ref as :actor/self. Handler bodies run in an async context, so they
    can t/await calls to other actors. Call handlers return [reply new-state]
    (see `reply`); cast and info handlers return the new state.
 
@@ -475,14 +634,21 @@
    message that changed it, and an actor that is activated again (after
    stop, an idle deactivation, a crash or a silo restart) gets it back:
    (resume [ctx stored] state) runs instead of init, by default keeping
-   the stored state as it is. The state has to be data (see the wire)."
+   the stored state as it is. The state has to be data (see the wire).
+   {:persist :ledger} keeps it in the grain storage named \"ledger\"
+   instead of the default one. The stored state is the actor's alone: no
+   other actor reads or writes it.
+
+   With {:journal :ledger} the actor keeps an append-only journal of what
+   happened to it instead of a stored state (see `append!`): its history
+   stays, and what it was at any moment can be read back (`entry-at`)."
   [name & body]
   (let [[doc body] (if (string? (first body)) [(first body) (rest body)] [nil body])
         [options body] (if (map? (first body)) [(first body) (rest body)] [{} body])
         type (keyword name)
         clauses (for [[kind & clause] body]
                   (case kind
-                    (init resume) (let [[args & b] clause] [(keyword kind) nil nil (handler-fn args b 2)])
+                    (init resume terminate) (let [[args & b] clause] [(keyword kind) nil nil (handler-fn args b 2)])
                     (call cast info) (let [[msg-type & more] clause
                                            [spec more] (if (vector? (first more)) [nil more] [(first more) (rest more)])
                                            [args & b] more]
@@ -495,12 +661,14 @@
                     (throw (ex-info (str "defactor " name ": unknown clause " kind) {}))))
         init (some (fn [[k _ _ f]] (when (= k :init) f)) clauses)
         resume (some (fn [[k _ _ f]] (when (= k :resume) f)) clauses)
-        handlers (reduce (fn [m [k msg-type _ f]] (if (#{:init :resume} k) m (assoc-in m [k msg-type] f))) {} clauses)
+        terminate (some (fn [[k _ _ f]] (when (= k :terminate) f)) clauses)
+        handlers (reduce (fn [m [k msg-type _ f]] (if (#{:init :resume :terminate} k) m (assoc-in m [k msg-type] f))) {} clauses)
         replies (reduce (fn [m [_ msg-type spec _]] (if spec (assoc m msg-type spec) m)) {} clauses)]
     (when-not init
       (throw (ex-info (str "defactor " name ": an init clause is required") {})))
     `(do
-       (register-actor! ~type (merge {:init ~init :replies ~replies} (when ~resume {:resume ~resume}) ~handlers ~options))
+       (register-actor! ~type (merge {:init ~init :replies ~replies} (when ~resume {:resume ~resume})
+                                     (when ~terminate {:terminate ~terminate}) ~handlers ~options))
        (defn ~(with-meta name {:doc (or doc (str "Reference to the " name " actor with the given id."))
                                :actor/type type})
          [~'id]

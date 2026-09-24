@@ -1,0 +1,30 @@
+# PostgreSQL for the bank: cluster membership, grain storage and reminders.
+# The scripts in sql/ are Orleans' own (dotnet/orleans v10.3.1, src/AdoNet), run in order on
+# the first start; the data lives in a named volume, so it survives `docker compose down`.
+services:
+  postgres:
+    image: postgres:17-alpine
+    # wal_level=logical: the replicator (bank.events) streams the ledger out of the WAL.
+    # wal_sender_timeout: a reader that died (its silo killed) lets go of the slot
+    # within seconds, so the next one can take over. max_slot_wal_keep_size: a
+    # reader that stays away cannot fill the disk; past it the slot is dropped.
+    command: ["postgres", "-c", "max_connections=200", "-c", "wal_level=logical",
+              "-c", "wal_sender_timeout=5s", "-c", "max_slot_wal_keep_size=1GB"]
+    container_name: orleans-bank-postgres
+    environment:
+      POSTGRES_USER: orleans
+      POSTGRES_PASSWORD: orleans
+      POSTGRES_DB: bank
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "orleans", "-d", "bank"]
+      interval: 2s
+      retries: 30
+
+volumes:
+  pgdata:
+    name: orleans-bank-pgdata

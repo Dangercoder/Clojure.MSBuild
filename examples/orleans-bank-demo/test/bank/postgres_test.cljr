@@ -1,0 +1,210 @@
+;; Npgsql and System.Data.Common are not loaded until something uses them;
+;; ClojureCLR resolves type names against loaded assemblies, so load them first.
+(assembly-load "System.Data.Common")
+(assembly-load "Npgsql")
+
+(ns bank.postgres-test
+  "The bank on silos backed by PostgreSQL: what Orleans' grain storage
+   does with an actor's state. Needs the database from docker-compose.yml
+   (or BANK_POSTGRES); without it these tests say so and pass."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.clr.async.task.alpha :as t]
+            [bank.account :refer [account]]
+            [bank.audit :as audit]
+            [bank.chaos :as chaos]
+            [bank.events :as events]
+            [replication.postgres :as replication]
+            [replication.sink :as sink]
+            [bank.events :as events]
+            [replication.postgres :as replication]
+            [replication.sink :as sink]
+            [bank.run :as run]
+            [bank.cluster :as cluster]
+            [orleans.actors :as actors]
+            [orleans.actors.silo :as silo])
+  (:import [Npgsql NpgsqlConnection NpgsqlCommand]))
+
+(defn- sql
+  "Runs a query with named parameters; returns the first column of the first
+   row, or the number of rows it changed."
+  [query params]
+  (with-open [connection (NpgsqlConnection. (cluster/connection-string))]
+    (.Open connection)
+    (with-open [command (NpgsqlCommand. ^String query connection)]
+      (doseq [[k v] params] (.AddWithValue (.Parameters command) ^String k v))
+      (if (re-find #"(?i)^\s*select" query)
+        (.ExecuteScalar command)
+        (.ExecuteNonQuery command)))))
+
+(def ^:private reachable?
+  (delay (try (sql "select 1" {}) true
+              (catch Exception e
+                (println "PostgreSQL is not reachable, skipping bank.postgres-test:" (.Message e))
+                false))))
+
+(defn- row
+  "The stored row of an actor in grain storage, as the text in the database."
+  [key]
+  (sql "select convert_from(payloadbinary, 'UTF8') from orleansstorage where grainidextensionstring = @key and serviceid = 'clojure-bank'"
+       {"key" key}))
+
+(defn- unique [prefix] (str prefix "-" (System.Guid/NewGuid)))
+
+(defmacro ^:private with-silo [[name] & body]
+  `(let [~name (t/result (cluster/start-silo 7))]
+     (try ~@body (finally (silo/shutdown! ~name)))))
+
+(defn- journal-rows [account-id]
+  (with-open [connection (NpgsqlConnection. (cluster/connection-string))]
+    (.Open connection)
+    (with-open [command (NpgsqlCommand. "select seq, transfer_id, kind, amount, balance_after from ledger_entries where account_id = @a order by seq" connection)]
+      (.AddWithValue (.Parameters command) "a" account-id)
+      (with-open [reader (.ExecuteReader command)]
+        (loop [rows []]
+          (if (.Read reader)
+            (recur (conj rows [(.GetInt64 reader 0) (.GetString reader 1) (.GetInt16 reader 2) (.GetInt64 reader 3) (.GetInt64 reader 4)]))
+            rows))))))
+
+(deftest an-account-is-rows-in-the-ledger
+  (when @reachable?
+    (let [id (unique "pg")]
+      (with-silo [s]
+        (actors/call! s (account id) :account/deposit #:transfer{:id "open" :amount 500})
+        (actors/call! s (account id) :account/debit #:transfer{:id "t1" :amount 120})
+        (actors/call! s (account id) :account/debit #:transfer{:id "t2" :amount 900}))
+      (is (= [[1 "open" 0 500 500] [2 "t1" 1 120 380] [3 "t2" 3 900 380]] (journal-rows id))
+          "one row per entry, each with the balance after it")
+      (testing "a new silo resumes the account from its last row"
+        (with-silo [s]
+          (is (= #:account{:id id :balance 380 :seq 3} (dissoc (actors/call! s (account id) :account/summary) :account/at)))
+          (is (= :debit (:entry/kind (actors/call! s (account id) :account/debit #:transfer{:id "t1" :amount 120})))
+              "and still knows the debit it made")
+          (is (= 380 (actors/call! s (account id) :account/get-balance)))
+          (let [[e1 e2] (audit/journal s id)]
+            (is (= 500 (actors/call! s (account id) :account/balance-at (:entry/at e1))))
+            (is (= 500 (actors/call! s (account id) :account/balance-at (dec (:entry/at e2)))))
+            (is (= 380 (actors/call! s (account id) :account/balance-at (:entry/at e2))))))))))
+
+(deftest the-seq-fences-a-second-writer
+  ;; Someone else appends to the account's journal behind the activation's
+  ;; back, as a second activation of the same account would during a
+  ;; cluster change. The activation's next append takes the same seq: the
+  ;; primary key refuses it, the account restarts from the table, and the
+  ;; row wins.
+  (when @reachable?
+    (let [id (unique "fence")]
+      (with-silo [s]
+        (actors/call! s (account id) :account/deposit #:transfer{:id "open" :amount 100})
+        (is (= 1 (sql "insert into ledger_entries values (@a, 2, 'elsewhere', 2, 7, 107, now())" {"a" id})))
+        (is (thrown-with-msg? Exception #"Journal conflict"
+                              (actors/call! s (account id) :account/deposit #:transfer{:id "more" :amount 1}))
+            "the append of seq 2 is refused")
+        (is (= 107 (actors/call! s (account id) :account/get-balance)) "restarted from the journal")
+        (is (= 108 (:entry/balance (actors/call! s (account id) :account/deposit #:transfer{:id "more" :amount 1}))))
+        (is (= [1 2 3] (map first (journal-rows id))))))))
+
+(deftest a-state-in-grain-storage-is-its-row-in-edn
+  (when @reachable?
+    (let [id (unique "run")]
+      (with-silo [s]
+        (actors/call! s (run/run id) :run/open #:run{:accounts 3 :opening 50})
+        (actors/call! s (run/run id) :run/reserve 10))
+      (is (= #:run{:id id :reserved 10 :accounts 3 :opening 50} (read-string (row (str "run/" id))))
+          "the row is the state, readable as EDN"))))
+
+(deftest the-etag-refuses-a-second-writer
+  ;; The same fence for an actor in Orleans grain storage: its row is
+  ;; written behind its back, and the ETag refuses the activation's next write.
+  (when @reachable?
+    (let [id (unique "etag")
+          key (str "run/" id)]
+      (with-silo [s]
+        (actors/call! s (run/run id) :run/reserve 1)
+        (is (= 1 (sql "update orleansstorage set payloadbinary = convert_to(@edn, 'UTF8'), version = version + 1 where grainidextensionstring = @key"
+                      {"key" key "edn" (pr-str #:run{:id id :reserved 1000})})))
+        (is (thrown-with-msg? Exception #"(?i)version conflict|etag|inconsistent"
+                              (actors/call! s (run/run id) :run/reserve 1))
+            "the stale write is refused")
+        (is (= [1000 1001] (actors/call! s (run/run id) :run/reserve 1)) "restarted from what is stored")))))
+
+(defn- until
+  "Calls f every 200 ms until it returns truthy, for up to 60 s."
+  [f]
+  (loop [tries 0]
+    (or (try (f) (catch Exception _ nil))
+        (when (< tries 300) (System.Threading.Thread/Sleep 200) (recur (inc tries))))))
+
+(defn- streamed?
+  "Drains the replicator into the sink until it has every entry of the
+   account's journal."
+  [system sink account-id]
+  (until #(do (replication/drain! system events/ledger (fn [batch] (sink/keep! sink batch)))
+              (empty? (events/missing sink account-id (audit/journal system account-id))))))
+
+(deftest the-replicator-streams-the-ledger-and-comes-back
+  (when @reachable?
+    (let [id (unique "cdc")
+          received (sink/sink events/key-of)
+          book! (fn [s tid amount] (actors/call! s (account id) :account/deposit #:transfer{:id tid :amount amount}))]
+      (with-silo [s]
+        (is (until #(:replicator/running? (replication/status s events/ledger))) "the stream runs")
+        (book! s "a" 10) (book! s "b" 20)
+        (is (streamed? s received id) "what the account booked came out of the WAL")
+        (testing "the connection is killed on PostgreSQL's side: the replicator starts the stream again"
+          (is (= 1 (sql "select count(pg_terminate_backend(active_pid)) from pg_replication_slots where slot_name = 'bank_events' and active" {})))
+          (book! s "c" 30)
+          (is (streamed? s received id))))
+      (testing "its silo is gone: the next one takes over from the slot"
+        (with-silo [s]
+          (book! s "d" 40)
+          (is (streamed? s received id))
+          (is (= [1 2 3 4] (sort (for [[[account seq] _] (sink/events received) :when (= account id)] seq))))
+          (is (zero? (:conflicting (sink/stats received))) "a repeat is the same event")
+          (is (until #(sql "select confirmed_flush_lsn >= (select max(0)::pg_lsn from pg_replication_slots) from pg_replication_slots where slot_name = 'bank_events'" {}))
+              "the slot moved on"))))))
+
+(defn- until
+  "Calls f every 200 ms until it returns truthy, for up to 60 s."
+  [f]
+  (loop [tries 0]
+    (or (try (f) (catch Exception _ nil))
+        (when (< tries 300) (System.Threading.Thread/Sleep 200) (recur (inc tries))))))
+
+(defn- streamed?
+  "Drains the replicator into the sink until it has every entry of the
+   account's journal."
+  [system sink account-id]
+  (until #(do (replication/drain! system events/ledger (fn [batch] (sink/keep! sink batch)))
+              (empty? (events/missing sink account-id (audit/journal system account-id))))))
+
+(defn- slot-position []
+  (sql "select (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint from pg_replication_slots where slot_name = 'bank_events'" {}))
+
+(deftest the-replicator-streams-the-ledger-and-comes-back
+  (when @reachable?
+    (let [id (unique "cdc")
+          received (sink/sink events/key-of)
+          book! (fn [s tid amount] (actors/call! s (account id) :account/deposit #:transfer{:id tid :amount amount}))]
+      (with-silo [s]
+        (is (until #(:replicator/running? (replication/status s events/ledger))) "the stream runs")
+        (book! s "a" 10) (book! s "b" 20)
+        (is (streamed? s received id) "what the account booked came out of the WAL")
+        (testing "the connection is killed on PostgreSQL's side: the replicator starts the stream again"
+          (is (= 1 (sql "select count(pg_terminate_backend(active_pid)) from pg_replication_slots where slot_name = 'bank_events' and active" {})))
+          (book! s "c" 30)
+          (is (streamed? s received id))))
+      (testing "its silo is gone: the next one takes over from the slot"
+        (let [before (slot-position)]
+          (with-silo [s]
+            (book! s "d" 40)
+            (is (streamed? s received id))
+            (is (= [1 2 3 4] (sort (for [[[account seq] _] (sink/events received) :when (= account id)] seq))))
+            (is (zero? (:conflicting (sink/stats received))) "a repeat is the same event")
+            (is (until #(> (slot-position) before)) "the acknowledgements moved the slot on")))))))
+
+(deftest a-short-chaos-run-balances-the-books
+  (when @reachable?
+    (let [{:keys [ok? counts problems]} (chaos/demo! {:silos 2 :seconds 12 :kill-every 5 :down 2 :accounts 6 :workers 4})]
+      (is ok? (pr-str problems))
+      (is (pos? (:done counts 0)))
+      (is (zero? (:pending counts 0))))))

@@ -1,0 +1,55 @@
+(ns bank.events
+  "The bank's stream: every row added to the ledger, out of PostgreSQL's
+   WAL, as an event. The streaming is replication.postgres, which knows
+   nothing of the bank; this namespace says which slot and publication
+   (sql/10-events.sql) and what a ledger row means:
+
+     #:event{:type :account/debited :account \"…-a3\" :seq 42 :transfer \"…-t7\"
+             :amount 300 :balance 9700 :at <µs>}
+
+   (and :replication.postgres/lsn, which the replicator adds)."
+  (:require [bank.cluster :as cluster]
+            [replication.postgres :as replication :refer [defstream]]
+            [replication.sink :as sink]))
+
+(def ^:private types
+  {"0" :account/deposited "1" :account/debited "2" :account/credited "3" :account/declined})
+
+(defn decode
+  "The event for a change to the ledger; nil for any other change."
+  [{:change/keys [table op row]}]
+  (when (and (= "public.ledger_entries" table) (= :insert op))
+    #:event{:type (types (get row "kind"))
+            :account (get row "account_id")
+            :seq (parse-long (get row "seq"))
+            :transfer (get row "transfer_id")
+            :amount (parse-long (get row "amount"))
+            :balance (parse-long (get row "balance_after"))
+            :at (replication/parse-timestamp (get row "booked_at"))}))
+
+(defstream ledger
+  {:connection-string cluster/connection-string
+   :slot "bank_events"
+   :publication "bank_events"
+   :decode decode})
+
+(defn key-of
+  "What tells two events of the ledger apart: the account and the seq."
+  [{:event/keys [account seq]}]
+  [account seq])
+
+(def ^:private kind-of
+  {:account/deposited :deposit :account/debited :debit :account/credited :credit :account/declined :declined})
+
+(defn missing
+  "The entries of an account's journal a sink of the ledger stream has not
+   got, or has got differently."
+  [received account-id journal]
+  (let [events (sink/events received)]
+    (vec (for [{:entry/keys [seq key kind amount balance at] :as entry} journal
+               :let [e (get events [account-id seq])]
+               :when (not (and e
+                               (= key (:event/transfer e))
+                               (= kind (kind-of (:event/type e)))
+                               (= [amount balance at] [(:event/amount e) (:event/balance e) (:event/at e)])))]
+           entry))))

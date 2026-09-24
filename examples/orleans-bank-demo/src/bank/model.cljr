@@ -1,0 +1,83 @@
+(ns bank.model
+  "The bank as specs: what an account and a transfer are, and the messages
+   they take. Money is whole numbers (öre, cents); a balance is never
+   negative.
+
+   Every movement of money carries the id of the transfer it belongs to,
+   and an account records what it did for each id (its entries). That is
+   what makes a message safe to deliver twice: a debit the account already
+   made is answered from its entries instead of being made again, so a
+   transfer that crashed halfway can simply run again."
+  (:require [clojure.spec.alpha :as s]))
+
+(s/def ::amount (s/int-in 1 1000000))
+
+(s/def :account/id (s/and string? seq))
+(s/def :account/balance nat-int?)
+(s/def :transfer/id (s/and string? seq))
+(s/def :transfer/amount ::amount)
+
+;; ── Accounts ─────────────────────────────────────────────────────
+;; An account's state is small: its balance and where its journal ends. What
+;; happened to it is its journal, one entry per transfer id, each with the
+;; balance after it (bank.ledger stores them as rows).
+
+(s/def :account/seq nat-int?)                          ; its last entry
+(s/def :account/at nat-int?)                           ; when that was, µs since the epoch
+(s/def ::account (s/keys :req [:account/id :account/balance :account/seq :account/at]))
+
+;; What an account did for a transfer. :declined is a debit it refused for
+;; lack of funds, remembered so that it refuses it again.
+(s/def :entry/seq pos-int?)
+(s/def :entry/key :transfer/id)
+(s/def :entry/kind #{:deposit :debit :credit :declined})
+(s/def :entry/amount ::amount)
+(s/def :entry/balance nat-int?)
+(s/def :entry/at nat-int?)
+(s/def ::entry (s/keys :req [:entry/seq :entry/key :entry/kind :entry/amount :entry/balance :entry/at]))
+
+(s/def :transfer/debited-at :entry/at)                 ; a credit is booked after its debit
+(s/def ::movement (s/keys :req [:transfer/id :transfer/amount]))
+(s/def :account/deposit ::movement)
+(s/def :account/debit ::movement)
+(s/def :account/credit (s/keys :req [:transfer/id :transfer/amount] :opt [:transfer/debited-at]))
+
+(s/def :account/balance-at :entry/at)                  ; the balance at that moment
+(s/def :account/entry :transfer/id)                    ; what the account did for that transfer
+(s/def :page/after nat-int?)
+(s/def :page/limit (s/int-in 1 10001))
+(s/def :account/entries (s/keys :req [:page/after :page/limit]))
+
+;; ── Transfers ────────────────────────────────────────────────────
+
+(s/def :transfer/from :account/id)
+(s/def :transfer/to :account/id)
+
+;; :blank a transfer nobody started; :pending started, money on its way;
+;; :done and :declined are final.
+(s/def :transfer/status #{:blank :pending :done :declined})
+
+(s/def :transfer/recovered? boolean?)          ; finished by its reminder, after a crash
+(s/def :transfer/credited-at :entry/at)
+
+(s/def :transfer/start
+  (s/and (s/keys :req [:transfer/from :transfer/to :transfer/amount])
+         #(not= (:transfer/from %) (:transfer/to %))))
+
+(s/def ::transfer
+  (s/and (s/keys :req [:transfer/id :transfer/status]
+                 :opt [:transfer/from :transfer/to :transfer/amount :transfer/recovered?
+                        :transfer/debited-at :transfer/credited-at])
+         (fn [{:transfer/keys [status amount]}]
+           (or (= :blank status) (some? amount)))))
+
+;; ── A run of the demo ────────────────────────────────────────────
+
+(s/def :run/id (s/and string? seq))
+(s/def :run/accounts pos-int?)
+(s/def :run/opening ::amount)
+(s/def :run/reserved nat-int?)
+(s/def ::run (s/keys :req [:run/id :run/reserved] :opt [:run/accounts :run/opening]))
+
+(s/def :run/open (s/keys :req [:run/accounts :run/opening]))
+(s/def :run/reserve pos-int?)

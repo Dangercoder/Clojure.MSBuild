@@ -284,6 +284,7 @@ Note: `(t/await (f ...))` on a call to a Clojure `^:async` function needs the ca
 - [`examples/minimal-api`](examples/minimal-api) — smaller ASP.NET web API with HoneySQL, async ADO.NET, integration tests
 - [`examples/csharp-interop`](examples/csharp-interop) — Bidirectional C#/Clojure interop in one project (`ClojureEntryPoint=csharp`)
 - [`examples/orleans-actors-ants-demo`](examples/orleans-actors-ants-demo) — Microsoft Orleans actors from Clojure with a GenServer-style `defactor` DSL: the ant colony simulation
+- [`examples/orleans-bank-demo`](examples/orleans-bank-demo) — a bank on Orleans and PostgreSQL that survives `kill -9` of its silos: accounts as append-only journals with the balance at any moment in one index lookup, transfers as sagas driven by reminders, and a deterministic simulation of the cluster as a property test
 
 ## Releasing
 

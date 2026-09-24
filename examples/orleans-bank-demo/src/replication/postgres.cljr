@@ -1,0 +1,203 @@
+(ns replication.postgres
+  "Streams out of PostgreSQL's WAL, as actors that do not stay dead.
+
+   A stream is defined with `defstream`: which database, which logical
+   replication slot, which publication, and how a change becomes an event.
+   Its replicator is an actor, addressed as (replicator \"<stream>\"), that
+   reads the slot and holds the events for a consumer, which takes them
+   (:replicator/take, the oldest first, as often as it likes until it
+   acknowledges them) and acknowledges what it has kept
+   (:replicator/ack with the last ::lsn), which moves the slot on. Nothing
+   here knows what the tables mean.
+
+   The slot is the cursor, and PostgreSQL keeps it, not the actor: whatever
+   happens to the replicator, the next one starts right after the last
+   acknowledged change. An event acknowledged late comes again; none is
+   lost. A consumer drops the repeats by a key of its events (see
+   replication.sink).
+
+   A replicator does not stay dead. A reminder wakes it every few seconds,
+   on whichever silo is alive, and a wake starts the stream when it is not
+   running: after a crash of its silo, a failure of the stream (the
+   connection dropped, PostgreSQL restarted), or a failure of the actor
+   itself, which restarts it, its terminate closing the old stream first.
+   A slot takes one reader at a time; PostgreSQL refuses a second, so two
+   activations of a replicator cannot both read.
+
+   A change is
+     #:change{:table \"public.ledger_entries\" :op :insert
+              :row {\"seq\" \"42\" ...}      ; the columns, as PostgreSQL's text
+              :lsn 36018024                 ; the end of its transaction
+              :committed-at <µs since the epoch>}
+   and the stream's :decode turns it into an event, or nil for a change the
+   stream does not publish. The replicator adds ::lsn to every event."
+  (:require [clojure.clr.async.task.alpha :as t]
+            [orleans.actors :as actors :refer [defactor reply]])
+  (:import [Replication.Postgres Change Replicator]))
+
+(set! *warn-on-reflection* true)
+
+;; ── Streams ──────────────────────────────────────────────────────
+;; Definitions are code, like actor types: every silo loads the namespaces
+;; that define them.
+
+(defonce ^:private streams (atom {}))
+
+(defn register-stream!
+  "Registers a stream under a name:
+     {:connection-string  a string, or a function of no arguments giving one
+      :slot               the logical replication slot, created on first use
+      :publication        the publication the slot streams
+      :decode             (fn [change] event-or-nil)
+      :wake-ms            how often the reminder wakes the replicator, 5000
+      :buffer             how many events it holds for its consumer, 20000}"
+  [name definition]
+  (swap! streams assoc (clojure.core/name name) (merge {:wake-ms 5000 :buffer 20000} definition))
+  name)
+
+(defn- stream-of [id]
+  (or (get @streams id)
+      (throw (ex-info (str "No stream named " id) {:stream id}))))
+
+(defmacro defstream
+  "Defines a stream and a var holding its replicator's ref:
+     (defstream ledger {:slot ... :publication ... :decode ...})
+   defines `ledger`, the ref (replicator \"ledger\")."
+  [name definition]
+  `(do (register-stream! '~name ~definition)
+       (def ~name (replicator ~(clojure.core/name name)))))
+
+;; ── Changes ──────────────────────────────────────────────────────
+
+(defn- micros [^System.DateTime t]
+  (quot (- (.Ticks t) 621355968000000000) 10))
+
+(defn- change [^Change c]
+  #:change{:table (.Table c)
+           :op (keyword (.Operation c))
+           :row (persistent! (reduce (fn [row ^|System.Collections.Generic.KeyValuePair`2[System.String,System.String]| e]
+                                       (assoc! row (.Key e) (.Value e)))
+                                     (transient {}) (.Row c)))
+           :lsn (System.Convert/ToInt64 (.Lsn c))
+           :committed-at (micros (.CommittedAt c))})
+
+(defn parse-timestamp
+  "Microseconds since the epoch, from PostgreSQL's text for a timestamptz."
+  [^String text]
+  (micros (.UtcDateTime (System.DateTimeOffset/Parse text System.Globalization.CultureInfo/InvariantCulture))))
+
+;; ── The replicator ───────────────────────────────────────────────
+
+(defn- log [& parts]
+  (binding [*out* *err*] (println (apply str parts))))
+
+(defn- close! [^Replicator replicator]
+  (t/async
+    (when replicator
+      (t/await (.CloseAsync replicator)))
+    nil))
+
+(alter-meta! #'close! assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- start [{:keys [connection-string slot publication]}]
+  (t/async
+    (t/await (Replicator/StartAsync (if (fn? connection-string) (connection-string) connection-string)
+                                    slot publication (int 10000)))))
+
+(alter-meta! #'start assoc :tag (symbol "System.Threading.Tasks.Task`1[System.Object]"))
+
+(defn- self-stream [ctx] (stream-of (:actor/id (:actor/self ctx))))
+
+(defactor replicator
+  "The replicator of a stream, addressed as (replicator \"<stream>\")."
+  (init [ctx id]
+    (let [{:keys [wake-ms]} (stream-of id)
+          _ (t/await (actors/remind-every ctx wake-ms :replicator/wake))]
+      ;; not at once: an actor that fails and restarts does not spin
+      (actors/send-after ctx 200 :replicator/wake)
+      #:replicator{:stream id :replicator nil :buffer [] :pumping? false :skipped 0
+                   :activation (str (System.Guid/NewGuid)) :process System.Environment/ProcessId}))
+
+  ;; the stream, when it is not running: after a start, a failure, a silo that died
+  (info :replicator/wake [ctx {:replicator/keys [^Replicator replicator pumping? stream] :as state}]
+    (if (and replicator (.Running replicator))
+      state
+      (let [definition (self-stream ctx)
+            _ (t/await (close! replicator))
+            [started error] (t/await (actors/outcome (start definition)))]
+        (if error
+          (do (log "replicator " stream ": cannot start the stream yet (" (.Message ^Exception error) "), next try in "
+                   (:wake-ms definition) " ms")
+              (assoc state :replicator/replicator nil))
+          (do (when-not pumping? (actors/send-every ctx 100 :replicator/pump))
+              ;; what was buffered and not acknowledged comes again from the slot
+              (assoc state :replicator/replicator started :replicator/buffer [] :replicator/pumping? true))))))
+
+  ;; the stream into the buffer, whole transactions at a time
+  (info :replicator/pump [ctx {:replicator/keys [^Replicator replicator buffer skipped stream] :as state}]
+    (let [{:keys [decode] limit :buffer} (self-stream ctx)]
+      (cond
+        (nil? replicator) state
+
+        (not (.Running replicator))
+        (do (log "replicator " stream ": the stream stopped (" (some-> (.Fault replicator) .Message) "), starting it again")
+            (actors/send-after ctx 1000 :replicator/wake)
+            (let [_ (t/await (close! replicator))]
+              (assoc state :replicator/replicator nil)))
+
+        (< (count buffer) limit)
+        (let [changes (map change (.Drain replicator (int (- limit (count buffer)))))
+              events (into [] (keep (fn [c] (some-> (decode c) (assoc ::lsn (:change/lsn c))))) changes)
+              ;; a change the stream does not publish needs no consumer: once nothing is
+              ;; waiting before it, it is acknowledged here
+              skipped (reduce max skipped (map :change/lsn changes))
+              buffer (into buffer events)]
+          (when (and (empty? buffer) (pos? skipped))
+            (.Acknowledge replicator (System.Convert/ToUInt64 (long skipped))))
+          (assoc state :replicator/buffer buffer :replicator/skipped skipped))
+
+        :else state)))
+
+  (call :replicator/take [ctx {:replicator/keys [buffer] :as state} max]
+    (reply (subvec buffer 0 (min (count buffer) max)) state))
+
+  (call :replicator/ack [ctx {:replicator/keys [^Replicator replicator buffer] :as state} lsn]
+    (when replicator (.Acknowledge replicator (System.Convert/ToUInt64 (long lsn))))
+    (reply :ok (assoc state :replicator/buffer (into [] (drop-while #(<= (::lsn %) lsn)) buffer))))
+
+  (call :replicator/status [ctx {:replicator/keys [^Replicator replicator buffer activation process] :as state}]
+    (reply #:replicator{:running? (boolean (and replicator (.Running replicator)))
+                        :buffered (count buffer)
+                        :acknowledged (if replicator (System.Convert/ToInt64 (.Acknowledged replicator)) 0)
+                        :activation activation
+                        :process process}
+           state))
+
+  (call :replicator/stop [ctx state]
+    (let [_ (t/await (actors/cancel-reminder ctx :replicator/wake))]
+      (actors/stop ctx)
+      (reply :stopping state)))
+
+  (terminate [ctx {:replicator/keys [replicator]}]
+    (t/await (close! replicator))))
+
+;; ── Consuming ────────────────────────────────────────────────────
+
+(defn drain!
+  "One round of a consumer: takes up to max events from a stream's
+   replicator, gives them to keep! (a function of the batch that returns
+   once they are kept), then acknowledges them. Returns the number taken.
+   Blocking; throws when the replicator cannot be reached, and then
+   nothing was acknowledged."
+  ([system stream keep!] (drain! system stream keep! 5000))
+  ([system stream keep! max]
+   (let [batch (actors/call! system stream :replicator/take max)]
+     (when (seq batch)
+       (keep! batch)
+       (actors/call! system stream :replicator/ack (::lsn (peek batch))))
+     (count batch))))
+
+(defn status
+  "The replicator's status, nil when it cannot be reached right now."
+  [system stream]
+  (try (actors/call! system stream :replicator/status) (catch Exception _ nil)))
