@@ -45,9 +45,9 @@
 
   <!-- Pack: include props + AOT DLLs from bin output -->
   <ItemGroup>
-    <None Include="Clojure.MSBuild.TestAdapter.props" Pack="true" PackagePath="build\" />
-    <None Include="$(OutputPath)Clojure.MSBuild.TestAdapter.ClojureTestAdapter.dll" Pack="true" PackagePath="build\net11.0\" />
-    <None Include="$(OutputPath)clojure.msbuild.test_adapter.cljr.dll" Pack="true" PackagePath="build\net11.0\" />
+    <None Include="Clojure.MSBuild.TestAdapter.props" Pack="true" PackagePath="build/" />
+    <None Include="$(OutputPath)Clojure.MSBuild.TestAdapter.ClojureTestAdapter.dll" Pack="true" PackagePath="build/net11.0/" />
+    <None Include="$(OutputPath)clojure.msbuild.test_adapter.cljr.dll" Pack="true" PackagePath="build/net11.0/" />
   </ItemGroup>
 
 </Project>
