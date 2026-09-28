@@ -1,0 +1,118 @@
+(assembly-load "System.Reflection.Metadata")
+
+(ns clojure.msbuild.ready-to-run
+  "ReadyToRun (crossgen2) compilation of the library layer.
+
+   ClojureCLR's compiler emits IL, which the runtime JIT-compiles at every
+   process start: loading clojure.core alone JIT-compiles about 5000 methods
+   (1.4 s). ReadyToRun images carry native code next to the IL, so the
+   precompiled runtime, the standard library and the dependencies start
+   without JIT. The images still contain the IL: on another platform, or if
+   the runtime rejects the native code, they are JIT-compiled as before.
+
+   Each assembly is compiled by its own crossgen2 process and replaced only
+   when that succeeds, so an assembly crossgen2 cannot handle stays IL."
+  (:require [clojure.string :as str])
+  (:import [System AppContext Environment]
+           [System.Diagnostics Process ProcessStartInfo]
+           [System.IO Directory File FileStream FileMode FileAccess FileShare Path]
+           [System.Reflection.PortableExecutable PEReader CorFlags]))
+
+(defn ready-to-run?
+  "Is file already a ReadyToRun image? (crossgen2 refuses those as input.)"
+  [^String file]
+  (try
+    (with-open [stream (FileStream. file FileMode/Open FileAccess/Read FileShare/Read)
+                reader (PEReader. stream)]
+      (let [cor (.CorHeader (.PEHeaders reader))]
+        (boolean (and cor (.HasFlag (.Flags cor) CorFlags/ILLibrary)))))
+    (catch Exception _ false)))
+
+(defn- trusted-platform-assemblies
+  "The assemblies the host resolved for this process: the shared frameworks
+   the application runs on and the application's own dependencies."
+  []
+  (let [tpa (str (AppContext/GetData "TRUSTED_PLATFORM_ASSEMBLIES"))]
+    (remove str/blank? (.Split tpa (char-array [Path/PathSeparator])))))
+
+(defn- references
+  "Reference assemblies for compiling input, by simple file name (first one
+   wins): the given directories, then the trusted platform assemblies."
+  [dirs]
+  (->> (concat (mapcat #(when (Directory/Exists %) (Directory/GetFiles % "*.dll")) dirs)
+               (trusted-platform-assemblies))
+       (reduce (fn [m ^String f]
+                 (let [k (str/lower-case (Path/GetFileName f))]
+                   (if (contains? m k) m (assoc m k f))))
+               {})))
+
+(defn- rsp-arg [^String s]
+  (if (re-find #"\s" s) (str "\"" s "\"") s))
+
+(defn- run-process
+  "Runs exe with args; returns {:exit :output}. Killed after timeout-ms."
+  [^String exe args timeout-ms]
+  (let [dll? (.EndsWith exe ".dll")
+        psi (doto (ProcessStartInfo. (if dll? (or (Environment/GetEnvironmentVariable "DOTNET_HOST_PATH") "dotnet") exe))
+              (-> .-UseShellExecute (set! false))
+              (-> .-RedirectStandardOutput (set! true))
+              (-> .-RedirectStandardError (set! true))
+              (-> .-CreateNoWindow (set! true)))
+        _ (doseq [a (if dll? (cons exe args) args)] (.Add (.ArgumentList psi) a))
+        proc (Process/Start psi)
+        out (.ReadToEndAsync (.StandardOutput proc))
+        err (.ReadToEndAsync (.StandardError proc))]
+    (if (.WaitForExit proc (int timeout-ms))
+      (do (.WaitForExit proc)
+          {:exit (.ExitCode proc) :output (str (.Result out) (.Result err))})
+      (do (try (.Kill proc true) (catch Exception _))
+          {:exit -1 :output "timed out"}))))
+
+(defn- compile-file!
+  "Compiles the IL assembly input to output (which may be the same path).
+   Returns nil on success, else a short reason. input is never modified
+   unless compilation succeeded."
+  [crossgen ^String input ^String output refs]
+  (let [tmp (str output ".r2r.tmp")
+        rsp (str output ".r2r.rsp")
+        own (str/lower-case (Path/GetFileName input))
+        lines (concat [(rsp-arg input) (str "-o:" (rsp-arg tmp)) "-O" "--parallelism:2"]
+                      (for [[name ref] refs :when (not= name own)]
+                        (str "-r:" (rsp-arg ref))))]
+    (try
+      (Directory/CreateDirectory (Path/GetDirectoryName output))
+      (File/WriteAllLines rsp (into-array String lines))
+      (let [{:keys [exit] log :output} (run-process crossgen [(str "@" rsp)] 300000)]
+        (if (and (zero? exit) (File/Exists tmp))
+          (do (File/Move tmp output true)
+              nil)
+          (str "crossgen2 exited with " exit
+               (when-let [line (->> (str/split-lines (or log ""))
+                                    (filter #(re-find #"(?i)error" %))
+                                    first)]
+                 (str ": " (str/trim line))))))
+      (catch Exception e (.Message e))
+      (finally
+        (when (File/Exists tmp) (File/Delete tmp))
+        (when (File/Exists rsp) (File/Delete rsp))))))
+
+(defn compile!
+  "Compiles jobs ([input output] pairs of IL assemblies) with crossgen2, a
+   few processes at a time. Reference directories are searched for the
+   assemblies they depend on. Returns {:compiled [output ...]
+   :failed {output reason}}; failed outputs are left as they were."
+  [crossgen jobs reference-dirs]
+  (let [refs (references reference-dirs)
+        queue (atom (seq jobs))
+        next-job! (fn [] (first (first (swap-vals! queue next))))
+        workers (max 1 (quot (Environment/ProcessorCount) 2))
+        results (->> (repeatedly workers
+                                 #(future
+                                    (loop [done []]
+                                      (if-let [[input output] (next-job!)]
+                                        (recur (conj done [output (compile-file! crossgen input output refs)]))
+                                        done))))
+                     doall
+                     (mapcat deref))]
+    {:compiled (vec (for [[output reason] results :when (nil? reason)] output))
+     :failed (into {} (for [[output reason] results :when reason] [output reason]))}))

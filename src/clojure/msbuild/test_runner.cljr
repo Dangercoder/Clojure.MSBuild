@@ -1,0 +1,349 @@
+(ns clojure.msbuild.test-runner
+  "Runs clojure.test tests: for `dotnet test` (through
+   Clojure.MSBuild.TestAdapter), for the clj-test target, and in watch mode,
+   which keeps one process running and, whenever a file is saved, reloads the
+   namespaces that changed and the ones that depend on them and runs the
+   affected tests again.
+
+   While tests run, one line per test var is written to stdout for the test
+   adapter. With CLOJURE_MSBUILD_TEST_FORMAT=edn (set by the adapter) it is
+   CLJTEST-EDN<tab>{edn map}: every failure, errors with their stack trace,
+   the test's own output and its source location. Otherwise it is the
+   original CLJTEST<tab>ns/name<tab>pass|fail<tab>ms<tab>first failure."
+  (:require [clojure.string :as str]
+            [clojure.test :as t]
+            [clojure.msbuild.incremental :as incremental])
+  (:import [System Environment DateTime GC]
+           [System.Threading ManualResetEventSlim Thread]
+           [System.IO Directory Path File FileInfo StringWriter FileSystemWatcher
+            FileSystemEventHandler RenamedEventHandler NotifyFilters]
+           [clojure.lang RT]))
+
+;; ── Test namespaces ──────────────────────────────────────────────
+
+(defn test-dir [] (Path/Combine (Environment/CurrentDirectory) "test"))
+
+(defn add-test-dir-to-load-path! []
+  (let [dir (test-dir)
+        current (or (Environment/GetEnvironmentVariable "CLOJURE_LOAD_PATH") "")]
+    (when (and (Directory/Exists dir)
+               (not (some #{dir} (.Split current (char-array [Path/PathSeparator])))))
+      (Environment/SetEnvironmentVariable
+        "CLOJURE_LOAD_PATH"
+        (if (seq current) (str current Path/PathSeparator dir) dir)))))
+
+(defn- test-file? [^String file]
+  (boolean (re-find #"_test\.clj[rc]?$" (Path/GetFileName file))))
+
+(defn test-namespaces
+  "Entries (see clojure.msbuild.incremental/project-namespaces) for the
+   *_test.cljr/.cljc/.clj files in the test directory."
+  []
+  (let [dir (test-dir)]
+    (when (Directory/Exists dir)
+      (filter (comp test-file? :file) (incremental/project-namespaces [dir])))))
+
+;; ── Reporting ────────────────────────────────────────────────────
+
+(def legacy-prefix "CLJTEST")
+(def edn-prefix "CLJTEST-EDN")
+
+(defn result-format
+  "The result lines to print: :edn when the test adapter asks for them,
+   :none for people (clj-test, watch mode), else :legacy (older adapters)."
+  []
+  (case (Environment/GetEnvironmentVariable "CLOJURE_MSBUILD_TEST_FORMAT")
+    "edn" :edn
+    "none" :none
+    :legacy))
+
+(defn- exception-text [^Exception e]
+  (str (.FullName (.GetType e)) ": " (.Message e)))
+
+(defn- exception-trace
+  "An exception, its data and stack frames, then those of its causes.
+   (ExceptionInfo's ToString leaves out the stack trace.)"
+  [^Exception e]
+  (str/join "\n ---> "
+            (for [^Exception e (take-while some? (iterate #(.InnerException ^Exception %) e))]
+              (str (exception-text e)
+                   (when-let [data (ex-data e)] (str " " (pr-str data)))
+                   (when-let [trace (.StackTrace e)] (str "\n" trace))))))
+
+(defn- failure [m]
+  (let [ex (:actual m)
+        error? (and (= :error (:type m)) (instance? Exception ex))]
+    {:type (:type m)
+     :message (:message m)
+     :contexts (t/testing-contexts-str)
+     :expected (pr-str (:expected m))
+     :actual (if error? (exception-text ex) (pr-str (:actual m)))
+     :stack (when error? (exception-trace ex))
+     :file (:file m)
+     :line (:line m)}))
+
+(defn- failure-text [test-name {:keys [type message contexts expected actual file line]}]
+  (str (if (= type :error) "ERROR" "FAIL") " in (" test-name ")"
+       (when (and file line (pos? line)) (str " (" file ":" line ")"))
+       (when-not (str/blank? contexts) (str "\n" contexts))
+       (when message (str "\n" message))
+       "\nexpected: " expected
+       "\n  actual: " actual))
+
+(defn- source-path
+  "Absolute path of a test var's :file, if it can be found."
+  [file]
+  (when file
+    (cond
+      (and (Path/IsPathRooted file) (File/Exists file)) file
+      :else (or (some-> (RT/FindFile file) (.FullName))
+                (let [f (Path/Combine (test-dir) file)] (when (File/Exists f) f))))))
+
+(defn- result [v start failures output]
+  (let [{:keys [ns name file line]} (meta v)
+        full-name (str (ns-name ns) "/" name)
+        path (source-path file)
+        location (str "   at " full-name (when path (str " in " path ":line " (or line 0))))]
+    {:test full-name
+     :outcome (if (empty? failures) "pass" "fail")
+     :ms (long (.TotalMilliseconds (.Subtract (DateTime/UtcNow) ^DateTime start)))
+     :file path
+     :line line
+     :message (when (seq failures)
+                (str/join "\n\n" (map (partial failure-text name) failures)))
+     :stack (when (seq failures)
+              (str/join "\n" (concat (keep :stack failures) [location])))
+     :output (when-not (str/blank? output) output)}))
+
+(defn- relative-path [^String path]
+  (let [rel (Path/GetRelativePath (Environment/CurrentDirectory) path)]
+    (if (.StartsWith rel "..") path rel)))
+
+(defn- print-failure
+  "clojure.test's FAIL/ERROR report, with the location of the test var
+   (ClojureCLR's clojure.test does not know the line of the assertion)."
+  [m]
+  (let [v (first t/*testing-vars*)
+        {:keys [name file line]} (meta v)
+        path (source-path file)
+        f (failure m)]
+    (t/with-test-out
+      (println)
+      (println (failure-text (or name "?")
+                             (assoc f :file (some-> path relative-path) :line (or line 0))))
+      (when-let [trace (:stack f)]
+        (println (str/join "\n" (take 12 (str/split-lines trace))))))))
+
+(defn- single-line [s]
+  (str/replace (or s "") #"[\r\n\t]+" " "))
+
+(defn- print-result [format r failures]
+  (case format
+    :edn (println (str edn-prefix "\t" (binding [*print-length* nil *print-level* nil] (pr-str r))))
+    :legacy (println (str legacy-prefix "\t" (:test r) "\t" (:outcome r) "\t" (:ms r) "\t"
+                          (single-line (some->> (first failures) (failure-text (name (symbol (:test r))))))))
+    nil))
+
+(defn with-reporting
+  "Calls f with clojure.test/report wrapped so that, in addition to the
+   normal output, one result line per test var is printed in format (see
+   result-format). In the edn format the output of each test is captured
+   for its result (and then printed as usual)."
+  [format f]
+  (let [capture? (= :edn format)
+        original t/report
+        current (atom nil)]
+    (binding [t/report
+              (fn [m]
+                (case (:type m)
+                  :begin-test-var
+                  (let [out (when capture? (StringWriter.))]
+                    (reset! current {:var (:var m) :start (DateTime/UtcNow) :failures [] :out out :real-out *out*})
+                    (when out (push-thread-bindings {#'*out* out})))
+                  (:fail :error) (swap! current update :failures conj (failure m))
+                  nil)
+                (if (and (= :none format) (#{:fail :error} (:type m)))
+                  (do (t/inc-report-counter (:type m))
+                      (print-failure m))
+                  (original m))
+                (when (= :end-test-var (:type m))
+                  (let [{:keys [var start failures out real-out]} @current]
+                    (when out
+                      (pop-thread-bindings)
+                      (binding [*out* real-out] (print (str out)) (flush)))
+                    (print-result format (result var start failures (str out)) failures))))]
+      (f))))
+
+;; ── Loading ──────────────────────────────────────────────────────
+
+(defn error-text
+  "An exception with its causes, e.g. a compile error with its location."
+  [^Exception e]
+  (let [chain (take-while some? (iterate #(.InnerException ^Exception %) e))]
+    (str/join "\n  caused by " (distinct (map exception-text chain)))))
+
+(defn- load-test-namespaces
+  "Requires the given namespaces; returns [loaded errors]. In the edn format
+   a load error is also reported for the adapter, which fails the
+   namespace's tests with it."
+  [format ns-syms]
+  (reduce (fn [[loaded errors] ns-sym]
+            (try (require ns-sym)
+                 [(conj loaded ns-sym) errors]
+                 (catch Exception e
+                   (let [text (error-text e)]
+                     (binding [*out* *err*]
+                       (println (str "Error loading " ns-sym ": " text)))
+                     (when (= :edn format)
+                       (println (str edn-prefix "\t" (pr-str {:load-error (str ns-sym) :message text})))))
+                   [loaded (conj errors ns-sym)])))
+          [[] []]
+          ns-syms))
+
+(defn- selection
+  "Arguments: namespace names (all tests in them) and ns/name (one test)."
+  [args]
+  (let [syms (map symbol (remove str/blank? args))]
+    {:namespaces (remove namespace syms)
+     :vars (filter namespace syms)}))
+
+;; ── Running ──────────────────────────────────────────────────────
+
+(defn run
+  "Runs the tests selected by args (namespaces and ns/name vars; all test
+   namespaces when empty), printing results in format. Returns the
+   clojure.test summary with :load-errors."
+  [format args]
+  (add-test-dir-to-load-path!)
+  (let [{:keys [namespaces vars]} (selection args)
+        all? (and (empty? namespaces) (empty? vars))
+        nses (if all?
+               (map :ns (test-namespaces))
+               (distinct (concat namespaces (map (comp symbol namespace) vars))))
+        _ (println (str "Running tests in " (count nses) " namespace(s)"))
+        [loaded errors] (load-test-namespaces format nses)
+        loaded? (set loaded)
+        selected-vars (keep (fn [v]
+                              (when (loaded? (symbol (namespace v)))
+                                (or (resolve v)
+                                    (binding [*out* *err*] (println (str "Error: test " v " not found"))))))
+                            vars)
+        summary (with-reporting format
+                  (fn []
+                    (let [whole (filter (set loaded) (if all? loaded namespaces))
+                          summary (if (seq whole)
+                                    (apply t/run-tests whole)
+                                    {:test 0 :pass 0 :fail 0 :error 0})]
+                      (if (seq selected-vars)
+                        (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                          (t/test-vars selected-vars)
+                          (t/do-report (assoc @t/*report-counters* :type :summary))
+                          (merge-with + (dissoc summary :type) @t/*report-counters*))
+                        summary))))]
+    (assoc summary :load-errors errors)))
+
+(defn exit-code [{:keys [fail error load-errors]}]
+  (if (or (pos? (or fail 0)) (pos? (or error 0)) (seq load-errors)) 1 0))
+
+;; ── Watch mode ───────────────────────────────────────────────────
+
+(defn- source-file? [^String f]
+  (let [name (Path/GetFileName f)]
+    (boolean (and (re-find #"\.clj[rc]?$" name)
+                  (not (.StartsWith name "."))
+                  (not (.StartsWith name "#"))))))
+
+(defn- topological
+  "The namespaces in affected, each after the ones it requires."
+  [entries affected]
+  (let [by-ns (into {} (map (juxt :ns identity)) entries)]
+    (loop [order [] done #{} todo (vec (sort affected))]
+      (if (empty? todo)
+        order
+        (let [ready (filter #(every? (fn [d] (or (done d) (not (affected d)))) (:deps (by-ns %))) todo)
+              ready (if (seq ready) ready [(first todo)])]
+          (recur (into order ready) (into done ready) (vec (remove (set ready) todo))))))))
+
+(defn- reload!
+  "Loads the files of the given entries from source, in order. A test
+   namespace is removed first, so deleted tests disappear. Returns nil or
+   the error text."
+  [entries]
+  (reduce (fn [_ {:keys [ns file]}]
+            (try
+              (when (test-file? file) (remove-ns ns))
+              (load-file file)
+              (dosync (commute @#'clojure.core/*loaded-libs* conj ns))
+              nil
+              (catch Exception e
+                (reduced (str "Error loading " ns ": " (error-text e))))))
+          nil
+          entries))
+
+(defn- print-summary [{:keys [test pass fail error]} started]
+  (let [ms (long (.TotalMilliseconds (.Subtract DateTime/UtcNow ^DateTime started)))]
+    (println (str (if (zero? (+ fail error)) "PASS" "FAIL") ": " test " tests, "
+                  (+ pass fail error) " assertions, " fail " failures, " error " errors (" ms " ms)"))))
+
+(defn- watch-dirs [dirs]
+  (let [cwd (Environment/CurrentDirectory)]
+    (->> (concat dirs [(test-dir)])
+         (map #(Path/GetFullPath (Path/Combine cwd %)))
+         (filter #(Directory/Exists %))
+         distinct)))
+
+(defn watch
+  "Runs all tests, then waits for changes to Clojure files in dirs (and the
+   test directory). On each change it reloads the changed namespaces and
+   everything loaded that depends on them, and runs the tests in the
+   affected test namespaces. Runs until the process is stopped."
+  [dirs]
+  (add-test-dir-to-load-path!)
+  (let [dirs (watch-dirs dirs)
+        changes (atom #{})
+        signal (ManualResetEventSlim. false)
+        on-change (fn [^String path]
+                    (when (source-file? path)
+                      (swap! changes conj (Path/GetFullPath path))
+                      (.Set signal)))
+        watchers (doall
+                   (for [dir dirs]
+                     (doto (FileSystemWatcher. dir)
+                       (-> .-IncludeSubdirectories (set! true))
+                       (-> .-NotifyFilter (set! (enum-or NotifyFilters/LastWrite NotifyFilters/FileName NotifyFilters/Size)))
+                       (.add_Changed (gen-delegate FileSystemEventHandler [_ e] (on-change (.FullPath e))))
+                       (.add_Created (gen-delegate FileSystemEventHandler [_ e] (on-change (.FullPath e))))
+                       (.add_Deleted (gen-delegate FileSystemEventHandler [_ e] (on-change (.FullPath e))))
+                       (.add_Renamed (gen-delegate RenamedEventHandler [_ e] (on-change (.FullPath e))))
+                       (-> .-EnableRaisingEvents (set! true)))))
+        started (DateTime/UtcNow)]
+    (println (str "Watching " (str/join ", " dirs) " (Ctrl-C to stop)"))
+    (print-summary (run :none []) started)
+    (flush)
+    (loop []
+      ;; Nothing else refers to the watchers; collected, they stop reporting.
+      (GC/KeepAlive watchers)
+      (.Wait signal)
+      ;; Editors write a file in several steps: wait until it is quiet.
+      (loop []
+        (.Reset signal)
+        (when (.Wait signal 150) (recur)))
+      (let [changed (first (reset-vals! changes #{}))
+            started (DateTime/UtcNow)
+            entries (vec (incremental/project-namespaces dirs))
+            changed-ns (set (map :ns (filter #(changed (Path/GetFullPath ^String (:file %))) entries)))
+            ;; Changed namespaces, and loaded namespaces that depend on them
+            affected (set (filter (fn [ns] (or (changed-ns ns) (find-ns ns)))
+                                  (incremental/stale-closure entries changed-ns)))
+            by-ns (into {} (map (juxt :ns identity)) entries)
+            order (keep by-ns (topological entries affected))
+            tests (filter #(test-file? (:file (by-ns %))) (map :ns order))]
+        (println)
+        (println (str "Changed: " (str/join " " (map #(Path/GetFileName ^String %) (sort changed)))))
+        (if-let [error (reload! order)]
+          (binding [*out* *err*] (println error))
+          (if (seq tests)
+            (print-summary (with-reporting :none #(apply t/run-tests tests)) started)
+            (println "No tests depend on the changed files.")))
+        (flush)
+        (recur)))))

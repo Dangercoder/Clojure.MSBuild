@@ -29,6 +29,12 @@
          and Clojure.MSBuild versions. Set ClojureLibCache=false to keep everything per project. -->
     <ClojureLibCacheDir Condition="'$(ClojureLibCacheDir)' == ''">$([System.Environment]::GetFolderPath(SpecialFolder.UserProfile))/.clojure-msbuild/lib-cache/</ClojureLibCacheDir>
 
+    <!-- Compile the precompiled Clojure runtime, standard library and dependencies to native
+         code with crossgen2 (ReadyToRun) so that the build, the tests, the REPL and the
+         application start without JIT-compiling them. crossgen2 is downloaded from NuGet the
+         first time. Set to false to keep them IL. -->
+    <ClojureReadyToRun Condition="'$(ClojureReadyToRun)' == ''">true</ClojureReadyToRun>
+
     <!-- Additional namespaces to AOT compile besides the main namespace and its
          dependencies (semicolon-separated), e.g. namespaces with gen-class. -->
     <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''"></ClojureNamespacesToCompile>

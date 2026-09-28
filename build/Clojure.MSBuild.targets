@@ -13,11 +13,26 @@
       <_ClojureLibDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'clj-lib'))</_ClojureLibDir>
       <_ClojureLibFileList>$(IntermediateOutputPath)ClojureLibs.FileList.txt</_ClojureLibFileList>
       <_ClojureLibStampFile>$(IntermediateOutputPath)ClojureLibs.stamp</_ClojureLibStampFile>
+      <_ClojureBuildStampFile>$(IntermediateOutputPath)ClojureBuild.stamp</_ClojureBuildStampFile>
+      <_ClojureSourceListFile>$(IntermediateOutputPath)ClojureSources.txt</_ClojureSourceListFile>
+      <_ClojureTestConfigFile>$(TargetDir)$(TargetName).clojure.edn</_ClojureTestConfigFile>
       <_ClojureEntryExe>$(_ClojureBuildDir)$(AssemblyName).exe</_ClojureEntryExe>
       <_ClojureGenClassMode>false</_ClojureGenClassMode>
       <_ClojureGenClassMode Condition="'$(ClojureEntryPoint)' == 'gen-class'">true</_ClojureGenClassMode>
+      <_ClojureNamespacesToBuild>clojure.msbuild.entry;$(ClojureMainNamespace);$(ClojureNamespacesToCompile)</_ClojureNamespacesToBuild>
+      <!-- Namespaces whose source lives in these directories are project code -->
+      <_ClojureProjectDirs>$(ClojureSourceDir)|$(ClojureExtraSourceDirs)|test|$(_ClojureGenDir)</_ClojureProjectDirs>
+      <_ClojureCompileOutputs>$(_ClojureBuildStampFile)</_ClojureCompileOutputs>
+      <_ClojureCompileOutputs Condition="'$(_ClojureGenClassMode)' == 'true'">$(_ClojureBuildStampFile);$(_ClojureEntryExe)</_ClojureCompileOutputs>
     </PropertyGroup>
   </Target>
+
+  <!-- The generated host (or the gen-class Main) is the entry point. Microsoft.NET.Test.Sdk
+       would add a Program with a second one (warning CS7022). Its target reads the final
+       value, so setting it here wins although its targets are imported first. -->
+  <PropertyGroup Condition="'$(ClojureMainNamespace)' != ''">
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
 
   <!-- Build a Clojure deps map from ClojureGitDep items -->
   <Target Name="_BuildClojureGitDeps">
@@ -112,24 +127,53 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
        together with git dependencies and the Clojure.MSBuild tooling, into clj-lib. It
        is rebuilt only when the dependencies (project.assets.json), the generated entry
        namespace (git deps, main namespace), deps.edn or Clojure.MSBuild itself change.
-       The build layer compiles the project's own namespaces on every build.
-       This target runs on every build: the SDK re-copies the C# host over the output on
-       each build, which is what makes the host available for compilation. -->
-  <Target Name="ClojureBuild" AfterTargets="Build" DependsOnTargets="_ClojureInit" Condition="'$(ClojureMainNamespace)' != ''">
+       The build layer (clj-out) holds the project's own namespaces. It only runs when a
+       Clojure source file, the project file or the library layer changed, and then only
+       compiles the namespaces that changed and the namespaces that depend on them.
+       The copy step runs on every build: the SDK copies the C# host over the output
+       assembly on each build, and the host is what compiles the project. -->
+  <Target Name="ClojureBuild" AfterTargets="Build" Condition="'$(ClojureMainNamespace)' != ''"
+          DependsOnTargets="_ClojureInit;_ClojureLibLayer;_ClojureCompile;_ClojureCopyOutput" />
+
+  <!-- Where the library layer lives and how it is compiled. The part of the library layer
+       that depends only on the Clojure and Clojure.MSBuild versions (clojure.core, the
+       standard library, the tooling) is shared between projects through ClojureLibCacheDir.
+       The layer is ReadyToRun compiled (native code, so processes start without JIT) with
+       the crossgen2 that matches the target framework, when the application runs on the
+       platform that builds it. -->
+  <Target Name="_ClojureResolveLayers" DependsOnTargets="_ClojureInit">
+    <PropertyGroup>
+      <_ClojureTargetFrameworkForPacks>net$(TargetFrameworkVersion.TrimStart('v'))</_ClojureTargetFrameworkForPacks>
+      <_ClojureHostRid>$(NETCoreSdkPortableRuntimeIdentifier)</_ClojureHostRid>
+      <_ClojureHostRid Condition="'$(_ClojureHostRid)' == ''">$(NETCoreSdkRuntimeIdentifier)</_ClojureHostRid>
+      <_ClojureExeSuffix Condition="$([MSBuild]::IsOSPlatform('Windows'))">.exe</_ClojureExeSuffix>
+    </PropertyGroup>
     <ItemGroup>
       <_ClojureRuntimePackage Include="@(ReferencePath)" Condition="'%(ReferencePath.NuGetPackageId)' == 'Clojure' Or '%(ReferencePath.NuGetPackageId)' == 'clojure.spec.alpha' Or '%(ReferencePath.NuGetPackageId)' == 'clojure.core.specs.alpha'" />
+      <_ClojureIlRuntime Include="@(ReferencePath)" Condition="'%(ReferencePath.NuGetPackageId)' == 'Clojure' And '%(Filename)%(Extension)' == 'Clojure.dll'" />
+      <_ClojureCrossgen2Pack Include="@(KnownCrossgen2Pack)" Condition="'%(KnownCrossgen2Pack.TargetFramework)' == '$(_ClojureTargetFrameworkForPacks)'" />
     </ItemGroup>
     <PropertyGroup>
-      <_ClojureNamespacesToBuild>clojure.msbuild.entry;$(ClojureMainNamespace);$(ClojureNamespacesToCompile)</_ClojureNamespacesToBuild>
-      <!-- Namespaces whose source lives in these directories are project code -->
-      <_ClojureProjectDirs>$(ClojureSourceDir)|$(ClojureExtraSourceDirs)|test|$(_ClojureGenDir)</_ClojureProjectDirs>
-      <!-- The part of the library layer that depends only on the Clojure and Clojure.MSBuild
-           versions (clojure.core, the standard library, the tooling) is shared between
-           projects through ClojureLibCacheDir. -->
-      <_ClojureSharedLibDir Condition="'$(ClojureLibCache)' != 'false'">$([MSBuild]::EnsureTrailingSlash('$(ClojureLibCacheDir)'))@(_ClojureRuntimePackage->'%(NuGetPackageId)-%(NuGetPackageVersion)'->Distinct(), '_')_$(TargetFramework)_$([MSBuild]::StableStringHash('$(MSBuildThisFileDirectory)|$([System.IO.File]::GetLastWriteTimeUtc('$(MSBuildThisFileFullPath)').Ticks)'))/</_ClojureSharedLibDir>
+      <_ClojureCrossgenVersion>@(_ClojureCrossgen2Pack->'%(Crossgen2PackVersion)'->Distinct())</_ClojureCrossgenVersion>
+      <_ClojureReadyToRun>false</_ClojureReadyToRun>
+      <_ClojureReadyToRun Condition="'$(ClojureReadyToRun)' != 'false' And '$(TargetFrameworkIdentifier)' == '.NETCoreApp' And '$(_ClojureCrossgenVersion)' != '' And '$(_ClojureHostRid)' != '' And ('$(RuntimeIdentifier)' == '' Or '$(RuntimeIdentifier)' == '$(_ClojureHostRid)' Or '$(RuntimeIdentifier)' == '$(NETCoreSdkRuntimeIdentifier)')">true</_ClojureReadyToRun>
+      <_ClojureCrossgenPackage>microsoft.netcore.app.crossgen2.$(_ClojureHostRid.ToLowerInvariant())</_ClojureCrossgenPackage>
+      <_ClojureCrossgenPath Condition="'$(_ClojureReadyToRun)' == 'true'">$([MSBuild]::EnsureTrailingSlash('$(NuGetPackageRoot)'))$(_ClojureCrossgenPackage)/$(_ClojureCrossgenVersion)/tools/crossgen2$(_ClojureExeSuffix)</_ClojureCrossgenPath>
+      <_ClojureLayerMode>il</_ClojureLayerMode>
+      <_ClojureLayerMode Condition="'$(_ClojureReadyToRun)' == 'true'">r2r-$(_ClojureHostRid)</_ClojureLayerMode>
+      <_ClojureSharedLibDir Condition="'$(ClojureLibCache)' != 'false'">$([MSBuild]::EnsureTrailingSlash('$(ClojureLibCacheDir)'))@(_ClojureRuntimePackage->'%(NuGetPackageId)-%(NuGetPackageVersion)'->Distinct(), '_')_$(TargetFramework)_$(_ClojureLayerMode)_$([MSBuild]::StableStringHash('$(MSBuildThisFileDirectory)|$([System.IO.File]::GetLastWriteTimeUtc('$(MSBuildThisFileFullPath)').Ticks)'))/</_ClojureSharedLibDir>
+      <!-- The ReadyToRun Clojure.dll, used instead of the package's once it exists -->
+      <_ClojureRuntimeDir>$(_ClojureLibDir)runtime/</_ClojureRuntimeDir>
+      <_ClojureRuntimeDir Condition="'$(_ClojureSharedLibDir)' != ''">$(_ClojureSharedLibDir)runtime/</_ClojureRuntimeDir>
+    </PropertyGroup>
+  </Target>
+
+  <!-- Is the library layer up to date? -->
+  <Target Name="_ClojureLibLayerState" DependsOnTargets="_ClojureResolveLayers">
+    <PropertyGroup>
       <_ClojureSharedLibReady>false</_ClojureSharedLibReady>
       <_ClojureSharedLibReady Condition="'$(_ClojureSharedLibDir)' != '' And Exists('$(_ClojureSharedLibDir)complete')">true</_ClojureSharedLibReady>
-      <_ClojureLibStamp>$(MSBuildThisFileDirectory)|$([System.IO.File]::GetLastWriteTimeUtc('$(MSBuildThisFileFullPath)').Ticks)|$([System.IO.File]::GetLastWriteTimeUtc('$(ProjectAssetsFile)').Ticks)|$([System.IO.File]::GetLastWriteTimeUtc('$(_ClojureEntryNsFile)').Ticks)|$([System.IO.File]::GetLastWriteTimeUtc('$(MSBuildProjectDirectory)/deps.edn').Ticks)|$([System.IO.File]::GetLastWriteTimeUtc('$(MSBuildProjectDirectory)/deps-clr.edn').Ticks)</_ClojureLibStamp>
+      <_ClojureLibStamp>$(MSBuildThisFileDirectory)|$([System.IO.File]::GetLastWriteTimeUtc('$(MSBuildThisFileFullPath)').Ticks)|$(_ClojureLayerMode)|$([System.IO.File]::GetLastWriteTimeUtc('$(ProjectAssetsFile)').Ticks)|$([System.IO.File]::GetLastWriteTimeUtc('$(_ClojureEntryNsFile)').Ticks)|$([System.IO.File]::GetLastWriteTimeUtc('$(MSBuildProjectDirectory)/deps.edn').Ticks)|$([System.IO.File]::GetLastWriteTimeUtc('$(MSBuildProjectDirectory)/deps-clr.edn').Ticks)</_ClojureLibStamp>
     </PropertyGroup>
     <ReadLinesFromFile File="$(_ClojureLibStampFile)" Condition="Exists('$(_ClojureLibStampFile)')">
       <Output TaskParameter="Lines" PropertyName="_ClojurePreviousLibStamp" />
@@ -138,22 +182,47 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
       <_ClojureLibsUpToDate>false</_ClojureLibsUpToDate>
       <_ClojureLibsUpToDate Condition="'$(_ClojurePreviousLibStamp)' == '$(_ClojureLibStamp)' And Exists('$(_ClojureLibDir)')">true</_ClojureLibsUpToDate>
     </PropertyGroup>
+  </Target>
 
-    <!-- Remove the build layer produced by the previous build first. The host must load
-         clojure.msbuild.entry from source: a previously compiled entry assembly refers to
-         the gen-class type, which the C# host (same assembly name) does not contain.
-         The library layer stays in the output so the host starts from precompiled code,
-         unless it is about to be rebuilt: stale library assemblies would shadow the new
-         versions of their sources. -->
-    <ReadLinesFromFile File="$(_ClojureFileList)" Condition="Exists('$(_ClojureFileList)')">
-      <Output TaskParameter="Lines" ItemName="_ClojurePreviousOutputFile" />
+  <!-- crossgen2 comes from a NuGet package that nothing references. Restore it with a
+       generated project when the library layer is about to be built and it is missing.
+       Without it (e.g. offline) the layer stays IL and this is tried again next time. -->
+  <Target Name="_ClojureAcquireCrossgen" DependsOnTargets="_ClojureLibLayerState"
+          Condition="'$(_ClojureReadyToRun)' == 'true' And '$(_ClojureLibsUpToDate)' != 'true' And !Exists('$(_ClojureCrossgenPath)')">
+    <PropertyGroup>
+      <_ClojureCrossgenProject>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'clj-crossgen'))crossgen.csproj</_ClojureCrossgenProject>
+      <_ClojureCrossgenProjectSource>
+&lt;Project Sdk="Microsoft.NET.Sdk"&gt;
+  &lt;!-- Generated by Clojure.MSBuild to download crossgen2 --&gt;
+  &lt;PropertyGroup&gt;
+    &lt;TargetFramework&gt;$(_ClojureTargetFrameworkForPacks)&lt;/TargetFramework&gt;
+    &lt;ManagePackageVersionsCentrally&gt;false&lt;/ManagePackageVersionsCentrally&gt;
+  &lt;/PropertyGroup&gt;
+  &lt;ItemGroup&gt;
+    &lt;PackageDownload Include="$(_ClojureCrossgenPackage)" Version="[$(_ClojureCrossgenVersion)]" /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Project&gt;
+      </_ClojureCrossgenProjectSource>
+    </PropertyGroup>
+    <Message Importance="high" Text="Downloading crossgen2 ($(_ClojureCrossgenPackage) $(_ClojureCrossgenVersion)) to compile the Clojure library layer to native code" />
+    <WriteLinesToFile File="$(_ClojureCrossgenProject)" Lines="$(_ClojureCrossgenProjectSource)" Overwrite="true" />
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; restore &quot;$(_ClojureCrossgenProject)&quot; -nologo -v q &quot;-p:RestorePackagesPath=$(NuGetPackageRoot.TrimEnd('/').TrimEnd('\'))&quot; -p:ImportDirectoryBuildProps=false -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryPackagesProps=false"
+          WorkingDirectory="$(MSBuildProjectDirectory)" ContinueOnError="true" />
+  </Target>
+
+  <Target Name="_ClojureLibLayer" DependsOnTargets="_ClojureInit;_ClojureResolveLayers;_ClojureLibLayerState;_ClojureAcquireCrossgen">
+    <!-- A new library layer means a new build layer: remove both from the output and from
+         obj first. Stale library assemblies would shadow the new versions of their
+         sources, and project assemblies compiled against the old libraries must not be
+         loaded by the host. -->
+    <ReadLinesFromFile File="$(_ClojureFileList)" Condition="'$(_ClojureLibsUpToDate)' != 'true' And Exists('$(_ClojureFileList)')">
+      <Output TaskParameter="Lines" ItemName="_ClojurePreviousLayerFile" />
     </ReadLinesFromFile>
-    <ReadLinesFromFile File="$(_ClojureLibFileList)" Condition="Exists('$(_ClojureLibFileList)')">
-      <Output TaskParameter="Lines" ItemName="_ClojurePreviousLibFile" />
+    <ReadLinesFromFile File="$(_ClojureLibFileList)" Condition="'$(_ClojureLibsUpToDate)' != 'true' And Exists('$(_ClojureLibFileList)')">
+      <Output TaskParameter="Lines" ItemName="_ClojurePreviousLayerFile" />
     </ReadLinesFromFile>
-    <Delete Files="@(_ClojurePreviousOutputFile)" ContinueOnError="true" />
-    <Delete Condition="'$(_ClojureLibsUpToDate)' != 'true'" Files="@(_ClojurePreviousLibFile);$(_ClojureLibStampFile)" ContinueOnError="true" />
-    <RemoveDir Condition="'$(_ClojureLibsUpToDate)' != 'true'" Directories="$(_ClojureLibDir)" />
+    <Delete Condition="'$(_ClojureLibsUpToDate)' != 'true'" Files="@(_ClojurePreviousLayerFile);$(_ClojureLibStampFile);$(_ClojureBuildStampFile)" ContinueOnError="true" />
+    <RemoveDir Condition="'$(_ClojureLibsUpToDate)' != 'true'" Directories="$(_ClojureLibDir);$(_ClojureBuildDir)" />
 
     <!-- Library layer (once per dependency change). Failures only cost startup time, so
          they do not fail the build; the stamp is written regardless so the pass is not
@@ -168,31 +237,69 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
     <Copy Condition="'$(_ClojureLibsUpToDate)' != 'true' And '$(_ClojureSharedLibReady)' == 'true'" SourceFiles="@(_ClojureSharedLibFile)" DestinationFolder="$(_ClojureLibDir)" />
     <Copy Condition="'$(_ClojureLibsUpToDate)' != 'true' And '$(_ClojureSharedLibReady)' == 'true'" SourceFiles="@(_ClojureSharedLibFile)" DestinationFolder="$(TargetDir)" />
     <Exec Condition="'$(_ClojureLibsUpToDate)' != 'true'"
-          Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode build-libs &quot;$(_ClojureLibDir)&quot; &quot;$(ClojureMainNamespace)&quot; &quot;$(_ClojureProjectDirs)&quot; &quot;$(_ClojureSharedLibDir)&quot;"
+          Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode build-libs &quot;$(_ClojureLibDir)&quot; &quot;$(ClojureMainNamespace)&quot; &quot;$(_ClojureProjectDirs)&quot; &quot;$(_ClojureSharedLibDir)&quot; &quot;$(_ClojureCrossgenPath)&quot; &quot;@(_ClojureIlRuntime)&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           ConsoleToMSBuild="false" ContinueOnError="true" />
     <WriteLinesToFile Condition="'$(_ClojureLibsUpToDate)' != 'true'" File="$(_ClojureLibStampFile)" Lines="$(_ClojureLibStamp)" Overwrite="true" />
+    <!-- The host compiling the build layer starts from the precompiled libraries -->
     <ItemGroup>
-      <_ClojureLibDll Include="$(_ClojureLibDir)*.dll" />
-      <_ClojureLibPdb Include="$(_ClojureLibDir)*.pdb" />
+      <_ClojureLibLayerFile Include="$(_ClojureLibDir)*.dll;$(_ClojureLibDir)*.pdb" />
     </ItemGroup>
-    <Copy SourceFiles="@(_ClojureLibDll);@(_ClojureLibPdb)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(_ClojureLibLayerFile)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+    <Copy Condition="'$(_ClojureReadyToRun)' == 'true' And Exists('$(_ClojureRuntimeDir)Clojure.dll')"
+          SourceFiles="$(_ClojureRuntimeDir)Clojure.dll" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
 
-    <!-- Build layer (every build) -->
-    <Message Text="Compiling Clojure: $(_ClojureNamespacesToBuild)" Importance="high" />
-    <RemoveDir Directories="$(_ClojureBuildDir)" />
+  <!-- Copy the ReadyToRun Clojure runtime instead of the package's IL assembly once it
+       exists. Swapping the copy-local item (rather than copying over it afterwards) keeps
+       the SDK from writing the file again on every build. It has to run before
+       _CopyFilesMarkedCopyLocal itself: that is a dependency of CopyFilesToOutputDirectory,
+       so it runs before that target's BeforeTargets hooks. -->
+  <Target Name="_ClojureUseReadyToRunRuntime" BeforeTargets="_CopyFilesMarkedCopyLocal"
+          DependsOnTargets="_ClojureResolveLayers" Condition="'$(ClojureMainNamespace)' != ''">
+    <ItemGroup Condition="'$(_ClojureReadyToRun)' == 'true' And Exists('$(_ClojureRuntimeDir)Clojure.dll')">
+      <_ClojureIlRuntimeCopy Include="@(ReferenceCopyLocalPaths)" Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'Clojure' And '%(ReferenceCopyLocalPaths.Filename)%(ReferenceCopyLocalPaths.Extension)' == 'Clojure.dll'" />
+      <ReferenceCopyLocalPaths Remove="@(_ClojureIlRuntimeCopy)" />
+      <ReferenceCopyLocalPaths Include="@(_ClojureIlRuntimeCopy->'$(_ClojureRuntimeDir)Clojure.dll')" />
+    </ItemGroup>
+  </Target>
+
+  <!-- The Clojure sources of the build layer; the list itself is an input too, so that
+       deleting, renaming or restoring an older copy of a file also rebuilds. -->
+  <Target Name="_ClojureCollectSources" DependsOnTargets="_ClojureInit">
+    <PropertyGroup>
+      <_ClojureSourceDirs>$(ClojureSourceDir)|$(ClojureExtraSourceDirs)</_ClojureSourceDirs>
+      <_ClojureSourceDirs>$([System.Text.RegularExpressions.Regex]::Replace('$(_ClojureSourceDirs)', '\|\s*(?=\||$)|^\s*\|', ''))</_ClojureSourceDirs>
+      <_ClojureSourceDirs>$(_ClojureSourceDirs.Trim('|'))</_ClojureSourceDirs>
+      <_ClojureSourceGlobs Condition="'$(_ClojureSourceDirs)' != ''">$(_ClojureSourceDirs.Replace('|', '/**/*.cljr;'))/**/*.cljr;$(_ClojureSourceDirs.Replace('|', '/**/*.cljc;'))/**/*.cljc;$(_ClojureSourceDirs.Replace('|', '/**/*.clj;'))/**/*.clj</_ClojureSourceGlobs>
+    </PropertyGroup>
+    <ItemGroup>
+      <_ClojureSourceFile Include="$([MSBuild]::Unescape($(_ClojureSourceGlobs)))" />
+    </ItemGroup>
+    <!-- With the timestamps: a file that gets an older one (cp -p, rsync -a) changed too -->
+    <WriteLinesToFile File="$(_ClojureSourceListFile)" Lines="@(_ClojureSourceFile->'%(FullPath)|%(ModifiedTime)')" Overwrite="true" WriteOnlyWhenDifferent="true" />
+  </Target>
+
+  <!-- Build layer: skipped when no input changed. The tool compiles only the namespaces
+       whose source changed and the namespaces that depend on them. -->
+  <Target Name="_ClojureCompile" DependsOnTargets="_ClojureInit;_ClojureCollectSources"
+          Inputs="@(_ClojureSourceFile);$(_ClojureSourceListFile);$(_ClojureEntryNsFile);$(_ClojureLibStampFile);$(MSBuildThisFileFullPath);$(MSBuildProjectFullPath)"
+          Outputs="$(_ClojureCompileOutputs)">
+    <!-- The host loads clojure.msbuild.entry from source: a compiled entry assembly refers
+         to the gen-class type, which the C# host (same assembly name) does not contain. -->
+    <Delete Files="$(TargetDir)clojure.msbuild.entry.cljr.dll;$(TargetDir)clojure.msbuild.entry.cljr.pdb" ContinueOnError="true" />
     <MakeDir Directories="$(_ClojureBuildDir)" />
     <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode build &quot;$(_ClojureNamespacesToBuild)&quot; &quot;$(_ClojureBuildDir)&quot; &quot;$(_ClojureLibDir)&quot; &quot;$(_ClojureProjectDirs)&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           ConsoleToMSBuild="false" />
-
     <Error Condition="'$(_ClojureGenClassMode)' == 'true' And !Exists('$(_ClojureEntryExe)')"
            Text="Clojure compilation did not produce the entry point assembly $(_ClojureEntryExe)." />
+    <Touch Files="$(_ClojureBuildStampFile)" AlwaysCreate="true" />
+  </Target>
 
-    <!-- The build layer may have added dependencies to the library layer, so glob it again -->
+  <!-- Copy both layers next to the host and the entry point over it (every build) -->
+  <Target Name="_ClojureCopyOutput" DependsOnTargets="_ClojureInit">
     <ItemGroup>
-      <_ClojureLibDll Remove="@(_ClojureLibDll)" />
-      <_ClojureLibPdb Remove="@(_ClojureLibPdb)" />
       <_ClojureLibDll Include="$(_ClojureLibDir)*.dll" />
       <_ClojureLibPdb Include="$(_ClojureLibDir)*.pdb" />
       <_ClojureCompiledDll Include="$(_ClojureBuildDir)*.dll" />
@@ -202,12 +309,26 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
       <_ClojureLibOutputFile Include="@(_ClojureLibDll->'$(TargetDir)%(Filename)%(Extension)')" />
       <_ClojureLibOutputFile Include="@(_ClojureLibPdb->'$(TargetDir)%(Filename)%(Extension)')" />
     </ItemGroup>
-
-    <WriteLinesToFile File="$(_ClojureFileList)" Lines="@(_ClojureOutputFile)" Overwrite="true" />
-    <WriteLinesToFile File="$(_ClojureLibFileList)" Lines="@(_ClojureLibOutputFile)" Overwrite="true" />
+    <!-- Remove what the previous build copied that neither layer contains any more -->
+    <ReadLinesFromFile File="$(_ClojureFileList)" Condition="Exists('$(_ClojureFileList)')">
+      <Output TaskParameter="Lines" ItemName="_ClojurePreviousOutputFile" />
+    </ReadLinesFromFile>
+    <ReadLinesFromFile File="$(_ClojureLibFileList)" Condition="Exists('$(_ClojureLibFileList)')">
+      <Output TaskParameter="Lines" ItemName="_ClojurePreviousOutputFile" />
+    </ReadLinesFromFile>
+    <ItemGroup>
+      <_ClojureRemovedOutputFile Include="@(_ClojurePreviousOutputFile)" Exclude="@(_ClojureOutputFile);@(_ClojureLibOutputFile)" />
+    </ItemGroup>
+    <Delete Files="@(_ClojureRemovedOutputFile)" ContinueOnError="true" />
+    <WriteLinesToFile File="$(_ClojureFileList)" Lines="@(_ClojureOutputFile)" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <WriteLinesToFile File="$(_ClojureLibFileList)" Lines="@(_ClojureLibOutputFile)" Overwrite="true" WriteOnlyWhenDifferent="true" />
     <Copy SourceFiles="@(_ClojureLibDll);@(_ClojureLibPdb);@(_ClojureCompiledDll);@(_ClojureCompiledPdb)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
     <Copy Condition="'$(_ClojureGenClassMode)' == 'true'" SourceFiles="$(_ClojureEntryExe)" DestinationFiles="$(TargetPath)" />
     <Message Condition="'$(_ClojureGenClassMode)' == 'true'" Text="Clojure entry point $(AssemblyName).Main -> $(TargetPath)" Importance="high" />
+    <!-- Tells Clojure.MSBuild.TestAdapter where the project and its tests are -->
+    <WriteLinesToFile Condition="Exists('$(MSBuildProjectDirectory)/test')" File="$(_ClojureTestConfigFile)"
+                      Lines="{:project-dir &quot;$(MSBuildProjectDirectory.Replace('\', '\\'))&quot; :test-dir &quot;test&quot;}"
+                      Overwrite="true" WriteOnlyWhenDifferent="true" />
   </Target>
 
   <Target Name="ClojureClean" AfterTargets="CoreClean" DependsOnTargets="_ClojureInit">
@@ -217,13 +338,13 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
     <ReadLinesFromFile File="$(_ClojureLibFileList)" Condition="Exists('$(_ClojureLibFileList)')">
       <Output TaskParameter="Lines" ItemName="_ClojurePreviousOutputFile" />
     </ReadLinesFromFile>
-    <Delete Files="@(_ClojurePreviousOutputFile);$(_ClojureFileList);$(_ClojureLibFileList);$(_ClojureLibStampFile)" ContinueOnError="true" />
-    <RemoveDir Directories="$(_ClojureBuildDir);$(_ClojureLibDir);$(_ClojureGenDir)" ContinueOnError="true" />
+    <Delete Files="@(_ClojurePreviousOutputFile);$(_ClojureFileList);$(_ClojureLibFileList);$(_ClojureLibStampFile);$(_ClojureBuildStampFile);$(_ClojureSourceListFile);$(_ClojureTestConfigFile)" ContinueOnError="true" />
+    <RemoveDir Directories="$(_ClojureBuildDir);$(_ClojureLibDir);$(_ClojureGenDir);$(IntermediateOutputPath)clj-crossgen" ContinueOnError="true" />
   </Target>
 
   <!-- Publish the compiled Clojure assemblies (and the gen-class entry point) instead of the C# host -->
   <Target Name="_ClojureAddPublishFiles" AfterTargets="ComputeResolvedFilesToPublishList"
-          DependsOnTargets="_ClojureInit;ClojureBuild" Condition="'$(ClojureMainNamespace)' != ''">
+          DependsOnTargets="_ClojureInit;_ClojureResolveLayers;ClojureBuild" Condition="'$(ClojureMainNamespace)' != ''">
     <ItemGroup>
       <ResolvedFileToPublish Condition="'$(_ClojureGenClassMode)' == 'true'" Remove="@(IntermediateAssembly)" />
       <ResolvedFileToPublish Condition="'$(_ClojureGenClassMode)' == 'true'" Include="$(_ClojureEntryExe)">
@@ -235,6 +356,11 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
         <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </ResolvedFileToPublish>
     </ItemGroup>
+    <ItemGroup Condition="'$(_ClojureReadyToRun)' == 'true' And Exists('$(_ClojureRuntimeDir)Clojure.dll')">
+      <_ClojurePublishedIlRuntime Include="@(ResolvedFileToPublish)" Condition="'%(ResolvedFileToPublish.RelativePath)' == 'Clojure.dll'" />
+      <ResolvedFileToPublish Remove="@(_ClojurePublishedIlRuntime)" />
+      <ResolvedFileToPublish Include="@(_ClojurePublishedIlRuntime->'$(_ClojureRuntimeDir)Clojure.dll')" />
+    </ItemGroup>
   </Target>
 
   <!-- Target to run Clojure REPL with all dependencies loaded -->
@@ -245,10 +371,11 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
           ConsoleToMSBuild="false" />
   </Target>
 
-  <!-- Target to run Clojure nREPL server -->
+  <!-- Target to run Clojure nREPL server: -p:ClojureNReplPort=7888 (0 = any free port).
+       The port is written to .nrepl-port for editors. -->
   <Target Name="clj-nrepl" DependsOnTargets="Build">
     <Message Text="Starting Clojure nREPL server..." Importance="high" />
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode nrepl"
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode nrepl $(ClojureNReplPort)"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           ConsoleToMSBuild="false" />
   </Target>
@@ -263,20 +390,27 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
           ConsoleToMSBuild="false" />
   </Target>
 
-  <!-- Hook Clojure tests into the standard test pipeline -->
-  <PropertyGroup>
-    <RunTestsDependsOn>$(RunTestsDependsOn);ClojureTest</RunTestsDependsOn>
-  </PropertyGroup>
-
-  <Target Name="ClojureTest" DependsOnTargets="Build" Condition="Exists('test')">
-    <Message Text="Running Clojure tests..." Importance="high" />
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode test"
+  <!-- Run the Clojure tests without VSTest: dotnet msbuild /t:clj-test
+       -p:ClojureTests="my.app-test my.app-test/one-test" selects namespaces and tests. -->
+  <Target Name="clj-test" DependsOnTargets="Build">
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode test $(ClojureTests)"
           WorkingDirectory="$(MSBuildProjectDirectory)"
-          ConsoleToMSBuild="false"
-          ContinueOnError="false">
-      <Output TaskParameter="ExitCode" PropertyName="ClojureTestExitCode"/>
+          EnvironmentVariables="CLOJURE_MSBUILD_TEST_FORMAT=none"
+          ConsoleToMSBuild="false" IgnoreExitCode="true">
+      <Output TaskParameter="ExitCode" PropertyName="_ClojureTestExitCode" />
     </Exec>
-    <Error Condition="'$(ClojureTestExitCode)' != '0'" Text="Clojure tests failed with exit code $(ClojureTestExitCode)" />
+    <Error Condition="'$(_ClojureTestExitCode)' != '0'" Text="Clojure tests failed" />
+  </Target>
+
+  <Target Name="ClojureTest" DependsOnTargets="clj-test" />
+
+  <!-- Run the tests, then again whenever a Clojure file changes, reloading only what
+       changed and what depends on it: dotnet msbuild /t:clj-test-watch -->
+  <Target Name="clj-test-watch" DependsOnTargets="Build">
+    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode test-watch &quot;$(ClojureSourceDir)|$(ClojureExtraSourceDirs)&quot;"
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          StandardOutputImportance="high"
+          ConsoleToMSBuild="false" />
   </Target>
 
 </Project>

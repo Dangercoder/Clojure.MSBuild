@@ -57,11 +57,21 @@
 
 ;; ── Assemblies ───────────────────────────────────────────────────
 
+(defn- compiled-namespace?
+  "Assemblies of compiled Clojure namespaces (a.b.cljr.dll, ...) are found
+   and loaded by RT.load when the namespace is required."
+  [^String file]
+  (or (.EndsWith file ".cljr.dll") (.EndsWith file ".cljc.dll") (.EndsWith file ".clj.dll")))
+
 (defn preload-assemblies!
   "Load every assembly next to the application so that `require` and
-   `import` can find NuGet-packaged Clojure libraries and .NET types."
+   `import` can find NuGet-packaged Clojure libraries and .NET types.
+   Compiled namespaces are skipped: RT.load loads them on demand, and a
+   preloaded copy of one that the build is about to compile again would
+   shadow the types it defines."
   []
-  (doseq [dll (Directory/GetFiles (base-directory) "*.dll")]
+  (doseq [dll (Directory/GetFiles (base-directory) "*.dll")
+          :when (not (compiled-namespace? dll))]
     (try (Assembly/LoadFrom dll) (catch Exception _))))
 
 ;; ── Git deps ─────────────────────────────────────────────────────

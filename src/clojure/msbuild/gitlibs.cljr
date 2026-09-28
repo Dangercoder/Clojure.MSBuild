@@ -149,11 +149,24 @@
       (File/Exists deps)     (edn/read-string (File/ReadAllText deps))
       :else nil)))
 
+(defn- existing-checkout
+  "The checkout of lib at sha (full or abbreviated, at least 7 characters)
+   if it is already in the cache, without running git."
+  [lib sha]
+  (let [sha (some-> sha str/trim str/lower-case)
+        dir (lib-path lib)]
+    (when (and sha (>= (count sha) 7) (Directory/Exists dir))
+      (let [matches (filter #(.StartsWith (str/lower-case (Path/GetFileName ^String %)) sha)
+                            (Directory/GetDirectories dir))]
+        (when (= 1 (count matches))
+          (first matches))))))
+
 (defn- resolve-coord [lib coord]
   (let [url (or (not-empty (:git/url coord)) (auto-git-url lib))
         rev (or (not-empty (:git/tag coord)) (not-empty (:git/sha coord)))]
     (when (and url rev)
-      (let [sha-dir (procure! url lib rev)
+      (let [sha-dir (or (existing-checkout lib (:git/sha coord))
+                        (procure! url lib rev))
             nested-deps (or (let [f (Path/Join sha-dir "deps-clr.edn")]
                               (when (File/Exists f) (edn/read-string (File/ReadAllText f))))
                             (let [f (Path/Join sha-dir "deps.edn")]

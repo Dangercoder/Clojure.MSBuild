@@ -1,0 +1,112 @@
+(assembly-load "System.Runtime.InteropServices")
+
+(ns clojure.msbuild.nrepl
+  "Starts the clojure.tools.nrepl server for `--clj-mode nrepl`.
+
+   clojure.tools.nrepl/start-server! binds the address its host name
+   resolves to first, which for 127.0.0.1 can be ::1 only, so clients that
+   connect to 127.0.0.1 are refused. This namespace opens the listeners
+   itself, on the IPv4 and the IPv6 loopback address with the same port, and
+   hands them to the server's accept loop. It also writes .nrepl-port, which
+   editors read to connect, removes it again when the process exits, and
+   keeps the process alive without reading stdin (which build tools and CI
+   do not provide)."
+  (:import [System Environment AppDomain EventHandler]
+           [System.IO File Path]
+           [System.Runtime.InteropServices PosixSignal PosixSignalRegistration PosixSignalContext]
+           [System.Net IPAddress IPEndPoint]
+           [System.Net.Sockets TcpListener SocketException]
+           [System.Threading ManualResetEventSlim]))
+
+(def default-port 1667)
+
+(defonce ^:private signal-registrations (atom []))
+
+(defn- listener
+  "A started TcpListener on address:port, or nil if the port is taken or
+   the address family is not available."
+  [^IPAddress address port]
+  (let [l (TcpListener. address (int port))]
+    (try (.Start l) l
+         (catch SocketException _ nil))))
+
+(defn- local-port [^TcpListener l]
+  (.Port ^IPEndPoint (.LocalEndpoint l)))
+
+(defn- open-listeners
+  "Listeners on 127.0.0.1 and ::1 with the same port. Port 0 picks a free
+   one; if the requested port is taken, a free one is used instead."
+  [port]
+  (let [v4 (or (listener IPAddress/Loopback port)
+               (when-not (zero? port)
+                 (binding [*out* *err*]
+                   (println (str "Port " port " is in use, using a free port instead.")))
+                 (listener IPAddress/Loopback 0)))]
+    (when-not v4
+      (throw (Exception. "Could not open a TCP port on 127.0.0.1 for the nREPL server")))
+    (let [v6 (listener IPAddress/IPv6Loopback (local-port v4))]
+      (remove nil? [v4 v6]))))
+
+(defn- parse-port [s]
+  (let [s (some-> s str .Trim)]
+    (if (or (nil? s) (= "" s))
+      default-port
+      (Int32/Parse s))))
+
+(defn- port-file [] (Path/Combine (Environment/CurrentDirectory) ".nrepl-port"))
+
+(defn- remove-port-file! [^String file port]
+  (try
+    (when (and (File/Exists file) (= (str port) (.Trim (File/ReadAllText file))))
+      (File/Delete file))
+    (catch Exception _)))
+
+(defn start!
+  "Starts the server. Returns {:port :listeners :stop}. Throws if
+   clojure.tools.nrepl is not available."
+  [port]
+  (require 'clojure.tools.nrepl.impl.server 'clojure.tools.nrepl.server.middleware)
+  (let [listen (resolve 'clojure.tools.nrepl.impl.server/listen)
+        xform @(resolve 'clojure.tools.nrepl.server.middleware/default-xform)
+        listeners (open-listeners port)
+        port (local-port (first listeners))
+        ctx {:sessions (atom #{})}
+        opts {:xform xform}]
+    (doseq [l listeners]
+      (future (listen ctx l opts)))
+    {:port port
+     :listeners listeners
+     :stop (fn [] (doseq [^TcpListener l listeners] (.Stop l)))}))
+
+(defn run
+  "Runs the nREPL server until the process is stopped (Ctrl-C)."
+  [port-arg]
+  (let [{:keys [port stop]}
+        (try (start! (parse-port port-arg))
+             (catch Exception e
+               (binding [*out* *err*]
+                 (if (re-find #"clojure/tools/nrepl" (str (.Message e)))
+                   (do (println "clojure.tools.nrepl is not referenced by this project. Add it with:")
+                       (println "  dotnet add package clojure.tools.nrepl --prerelease"))
+                   (println (str "Could not start the nREPL server: " (.Message e)))))
+               (Environment/Exit 1)))
+        file (port-file)
+        done (ManualResetEventSlim. false)
+        cleanup (fn [] (remove-port-file! file port))]
+    (File/WriteAllText file (str port))
+    (.add_ProcessExit (AppDomain/CurrentDomain)
+                      (gen-delegate EventHandler [_ _] (cleanup)))
+    ;; Ctrl-C, kill and a closed terminal stop the server the same way.
+    ;; The registrations must stay reachable to stay registered.
+    (let [stop! (sys-action [PosixSignalContext] [ctx]
+                  (set! (.-Cancel ctx) true)
+                  (.Set done))]
+      (reset! signal-registrations
+              (vec (for [signal [PosixSignal/SIGINT PosixSignal/SIGTERM PosixSignal/SIGHUP]]
+                     (PosixSignalRegistration/Create signal stop!)))))
+    ;; The message nREPL clients (and editors' jack-in) look for
+    (println (str "nREPL server started on port " port " on host 127.0.0.1 - nrepl://127.0.0.1:" port))
+    (.Wait done)
+    (stop)
+    (cleanup)
+    (Environment/Exit 0)))

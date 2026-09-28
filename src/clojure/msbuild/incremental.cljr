@@ -1,0 +1,225 @@
+(ns clojure.msbuild.incremental
+  "Incremental compilation of the build layer.
+
+   ClojureCLR's RT.load already loads a namespace from its compiled assembly
+   when that assembly is at least as new as the source, and compiles the
+   source otherwise. What it cannot know is that a namespace also has to be
+   compiled again when a namespace it requires changed: macros, inlined
+   functions, protocols and record types are compiled into the caller.
+   Before the build, `prepare!` finds the stale project namespaces with the
+   same rule RT.load uses, adds everything that depends on them (read from
+   the ns forms), and removes those assemblies, so that only they are
+   compiled and everything else loads precompiled."
+  (:require [clojure.string :as str])
+  (:import [System AppDomain DateTime]
+           [System.IO Directory File FileInfo Path SearchOption StringReader]
+           [clojure.lang RT]))
+
+(def ^:private source-extensions [".cljr" ".cljc" ".clj"])
+
+;; ── Reading ns forms ─────────────────────────────────────────────
+
+(defn- read-ns-decl
+  "The (ns ...) form of a source file, or nil. Forms before it (e.g.
+   assembly-load) are skipped. Nothing is evaluated."
+  [^String file]
+  (try
+    (with-open [rdr (clojure.lang.PushbackTextReader. (StringReader. (File/ReadAllText file)))]
+      (binding [*read-eval* false
+                *default-data-reader-fn* (fn [_ v] v)]
+        (loop [n 0]
+          (when (< n 20)
+            (let [form (read {:read-cond :allow :eof ::eof} rdr)]
+              (cond
+                (= ::eof form) nil
+                (and (seq? form) (= 'ns (first form))) form
+                :else (recur (inc n))))))))
+    (catch Exception _ nil)))
+
+(defn- libspec?
+  "clojure.core's rule: a symbol, or a vector whose second element (if any)
+   is a keyword. Any other list or vector is a prefix list."
+  [x]
+  (or (symbol? x)
+      (and (vector? x) (symbol? (first x))
+           (or (nil? (second x)) (keyword? (second x))))))
+
+(defn- libspec-names
+  "Namespace symbols named by one argument of :require or :use."
+  [spec]
+  (cond
+    (libspec? spec) [(if (symbol? spec) spec (first spec))]
+    (and (sequential? spec) (symbol? (first spec)))
+    (let [[prefix & libs] spec]
+      (for [lib libs, n (libspec-names lib)]
+        (symbol (str prefix "." n))))
+    :else nil))
+
+(defn ns-decl-deps
+  "Namespaces required or used by an ns form."
+  [decl]
+  (set
+    (for [clause (drop 2 decl)
+          :when (and (seq? clause) (#{:require :use} (first clause)))
+          spec (rest clause)
+          :when (not (keyword? spec))
+          lib (libspec-names spec)]
+      lib)))
+
+;; ── Project namespaces ───────────────────────────────────────────
+
+(defn- relative-stem
+  "src/acme/shop/web.cljr under src -> acme/shop/web"
+  [dir file]
+  (let [rel (Path/GetRelativePath dir file)]
+    (-> (subs rel 0 (- (count rel) (count (Path/GetExtension rel))))
+        (.Replace (char Path/DirectorySeparatorChar) \/))))
+
+(defn- stem->ns [stem]
+  (symbol (-> stem (.Replace \/ \.) (.Replace \_ \-))))
+
+(defn project-namespaces
+  "One entry per source file in the project directories:
+   {:ns sym :stem \"a/b_c\" :file path :deps #{sym} :parsed? bool}.
+   The namespace name is the one declared in the file, or derived from the
+   path when the file has no readable ns form."
+  [project-dirs]
+  (for [dir project-dirs
+        ext source-extensions
+        ^String file (Directory/GetFiles dir (str "*" ext) SearchOption/AllDirectories)
+        ;; On Windows *.clj also matches .cljr and .cljc (3-character extension rule)
+        :when (= ext (Path/GetExtension file))
+        :let [stem (relative-stem dir file)
+              decl (read-ns-decl file)
+              declared (when (symbol? (second decl)) (second decl))]]
+    {:ns (or declared (stem->ns stem))
+     :stem stem
+     :file file
+     :deps (if decl (ns-decl-deps decl) #{})
+     :parsed? (boolean decl)}))
+
+;; ── Staleness ────────────────────────────────────────────────────
+
+(defn dll-name
+  "a/b_c + .cljr -> a.b_c.cljr.dll, the name RT.load looks for."
+  [stem ext]
+  (str (.Replace ^String stem \/ \.) ext ".dll"))
+
+(defn- loaded-source
+  "The source file RT.load would read for stem, or nil."
+  ^FileInfo [stem]
+  (some #(RT/FindFile (str stem %)) source-extensions))
+
+(defn- compiled-file ^FileInfo [dir name]
+  (let [f (FileInfo. (Path/Combine dir name))]
+    (when (.Exists f) f)))
+
+;; The sources as they were compiled: file -> [last write ticks, length].
+;; A file whose timestamp or size differs was edited, also when it got an
+;; older timestamp (restored by cp -p, rsync -a, an unzip), which a
+;; newer-than check would miss.
+
+(defn- manifest-file [compile-path] (Path/Combine compile-path "clj-sources.edn"))
+
+(defn- source-state [^String file]
+  (let [f (FileInfo. file)]
+    [(.Ticks (.LastWriteTimeUtc f)) (.Length f)]))
+
+(defn read-manifest [compile-path]
+  (let [f (manifest-file compile-path)]
+    (when (File/Exists f)
+      (try (binding [*read-eval* false] (read-string (File/ReadAllText f)))
+           (catch Exception _ nil)))))
+
+(defn write-manifest!
+  "Records the state of the sources that have an assembly in compile-path."
+  [entries compile-path]
+  (File/WriteAllText
+    (manifest-file compile-path)
+    (pr-str (into {} (for [{:keys [stem file]} entries
+                           :when (File/Exists (Path/Combine compile-path (dll-name stem (Path/GetExtension ^String file))))]
+                       [file (source-state file)])))))
+
+(defn- fresh?
+  "Would RT.load use the compiled assembly for this namespace, is that
+   assembly part of the previous build layer (compile-path), and is the
+   source unchanged since it was compiled?"
+  [compile-path manifest {:keys [stem file]}]
+  (when-let [src (loaded-source stem)]
+    (let [ext (Path/GetExtension (.Name src))
+          name (dll-name stem ext)
+          built (compiled-file compile-path name)
+          found (RT/FindFile name)]
+      (boolean (and built found
+                    (>= (.Ticks (.LastWriteTimeUtc built)) (.Ticks (.LastWriteTimeUtc src)))
+                    (>= (.Ticks (.LastWriteTimeUtc found)) (.Ticks (.LastWriteTimeUtc src)))
+                    (or (nil? manifest) (= (get manifest file) (source-state file))))))))
+
+(defn stale-closure
+  "Given entries with :ns, :deps and :parsed?, and the set of stale
+   namespaces, adds every namespace that depends on a stale one, directly
+   or indirectly. A file whose ns form could not be read is treated as
+   depending on every project namespace."
+  [entries stale]
+  (let [project (set (map :ns entries))]
+    (loop [stale (set stale)]
+      (let [more (into stale
+                       (comp (remove (comp stale :ns))
+                             (filter (fn [{:keys [deps parsed?]}]
+                                       (if parsed?
+                                         (some stale deps)
+                                         (some stale project))))
+                             (map :ns))
+                       entries)]
+        (if (= more stale) stale (recur more))))))
+
+(defn- delete-compiled! [dir name]
+  (doseq [n [name (Path/ChangeExtension ^String name ".pdb")]
+          :let [f (Path/Combine dir n)]
+          :when (File/Exists f)]
+    (File/Delete f)))
+
+(defn- output-dirs [compile-path]
+  (distinct [compile-path (.BaseDirectory (AppDomain/CurrentDomain))]))
+
+(defn prepare!
+  "Removes the compiled assemblies of the project namespaces that have to be
+   compiled again (from compile-path and from the application directory the
+   host runs from). Returns {:entries .. :stale #{ns} :fresh #{ns}}."
+  [project-dirs compile-path]
+  (let [entries (vec (project-namespaces project-dirs))
+        manifest (read-manifest compile-path)
+        stale0 (set (map :ns (remove (partial fresh? compile-path manifest) entries)))
+        stale (stale-closure entries stale0)]
+    (doseq [{:keys [ns stem]} entries
+            :when (stale ns)
+            ext source-extensions
+            dir (output-dirs compile-path)]
+      (delete-compiled! dir (dll-name stem ext)))
+    {:entries entries
+     :stale stale
+     :fresh (into #{} (comp (map :ns) (remove stale)) entries)}))
+
+(defn- compiled-source-file?
+  "a.b_c.cljr.dll and friends, as opposed to e.g. a gen-class assembly."
+  [^String name]
+  (boolean (some #(.EndsWith name (str % ".dll")) source-extensions)))
+
+(defn prune!
+  "After the build, before library namespaces are moved out of compile-path:
+   removes compiled files left in compile-path by an earlier build whose
+   source file no longer exists (deleted or renamed), from compile-path and
+   the application directory. Files written by this build (started is its
+   start time) are kept: they include library namespaces that are moved to
+   the library layer next. Returns the removed file names."
+  [entries compile-path ^DateTime started]
+  (let [current (set (for [{:keys [stem file]} entries]
+                       (dll-name stem (Path/GetExtension ^String file))))]
+    (vec
+      (for [^String dll (Directory/GetFiles compile-path "*.dll")
+            :let [name (Path/GetFileName dll)]
+            :when (and (compiled-source-file? name)
+                       (not (current name))
+                       (< (.Ticks (File/GetLastWriteTimeUtc dll)) (.Ticks started)))]
+        (do (doseq [dir (output-dirs compile-path)] (delete-compiled! dir name))
+            name)))))
