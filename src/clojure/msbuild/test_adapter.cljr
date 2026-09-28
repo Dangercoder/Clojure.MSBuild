@@ -3,19 +3,25 @@
    Single gen-class implementing both ITestDiscoverer and ITestExecutor
    so everything lands in one DLL for VSTest discovery.
 
-   Discovery scans test/**/*_test.cljr for deftest and defspec forms.
+   Discovery scans test/**/*_test.cljr (.cljc, .clj) for deftest and defspec
+   forms. The build writes <assembly>.clojure.edn next to the test assembly
+   with the project directory; assemblies without it (and without a test
+   directory three levels up, the layout of older versions) are not
+   Clojure test assemblies.
+
    Execution runs the test assembly with --clj-mode test (or test-vars for a
-   filtered or selected subset) and reads the CLJTEST result lines that
-   clojure.msbuild.tool prints, one per test var, so every test is reported
-   individually with its failure message."
-  (:require [clojure.string :as str])
+   filtered or selected subset) and reads the result lines that
+   clojure.msbuild.test-runner prints, one per test var, so every test is
+   reported individually with its failures, stack trace and output."
+  (:require [clojure.string :as str]
+            [clojure.edn :as edn])
   (:import [System Uri DateTimeOffset TimeSpan Environment]
            [System.Diagnostics Process ProcessStartInfo]
            [System.IO Directory Path File SearchOption]
            [System.Text StringBuilder]
-           [System.Text.RegularExpressions Regex]
+           [System.Text.RegularExpressions Regex RegexOptions]
            [Microsoft.VisualStudio.TestPlatform.ObjectModel
-            TestCase TestResult TestOutcome
+            TestCase TestResult TestOutcome TestResultMessage
             FileExtensionAttribute DefaultExecutorUriAttribute ExtensionUriAttribute]
            [Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter
             ITestDiscoverer ITestExecutor
@@ -28,6 +34,7 @@
 (def executor-uri-string "executor://clojuretestexecutor/v1")
 (def ^Uri executor-uri (Uri. executor-uri-string))
 (def result-prefix "CLJTEST")
+(def edn-prefix "CLJTEST-EDN")
 
 ;; ── Single gen-class: both discoverer + executor ─────────────────
 
@@ -44,10 +51,26 @@
 
 ;; ── Discovery ────────────────────────────────────────────────────
 
-(defn- project-dir
-  "The test assembly lives in bin/<Configuration>/<tfm>/; the project is three up."
+(defn- project-config
+  "{:project-dir ..} from the <assembly>.clojure.edn the build writes next to
+   the test assembly, or the project three levels up (bin/<config>/<tfm>/),
+   the layout older versions assumed, or nil."
   [source]
-  (Path/GetFullPath (Path/Combine (Path/GetDirectoryName source) ".." ".." "..")))
+  (let [marker (Path/ChangeExtension ^String source ".clojure.edn")]
+    (if (File/Exists marker)
+      (try (edn/read-string (File/ReadAllText marker)) (catch Exception _ nil))
+      (let [dir (Path/GetFullPath (Path/Combine (Path/GetDirectoryName ^String source) ".." ".." ".."))]
+        (when (File/Exists (Path/Combine dir "test"))
+          {:project-dir dir})))))
+
+(defn- project-dir [source]
+  (or (:project-dir (project-config source))
+      (Path/GetDirectoryName ^String source)))
+
+(defn- test-dir [source]
+  (when-let [{:keys [project-dir test-dir]} (project-config source)]
+    (let [dir (Path/Combine ^String project-dir (or test-dir "test"))]
+      (when (Directory/Exists dir) dir))))
 
 (defn- file->ns-name [test-dir test-file]
   (let [relative (Path/GetRelativePath test-dir test-file)
@@ -56,30 +79,43 @@
         (.Replace (char Path/DirectorySeparatorChar) \.)
         (.Replace \_ \-))))
 
+(def ^:private ns-pattern
+  (Regex. "^\\s*\\(ns\\s+(?:\\^(?:\\{[^}]*\\}|\\S+)\\s+)*([^\\s()\\[\\]{}]+)" RegexOptions/Multiline))
+
+;; deftest/defspec forms that are not commented out with #_
+(def ^:private test-pattern
+  (Regex. "(?<!#_\\s*)\\((?:deftest|defspec)\\s+(?:\\^(?:\\{[^}]*\\}|\\S+)\\s+)*([^\\s()\\[\\]{}]+)"))
+
+(defn- test-files [dir]
+  (mapcat #(Directory/GetFiles dir % SearchOption/AllDirectories)
+          ["*_test.cljr" "*_test.cljc" "*_test.clj"]))
+
 (defn discover-test-cases
   "Scans the project's test directory and returns a map of
    \"ns/test-name\" -> TestCase for the given source assembly."
   [source]
-  (let [test-dir (Path/Combine (project-dir source) "test")]
-    (if-not (Directory/Exists test-dir)
-      {}
-      (into {}
-        (for [test-file (Directory/GetFiles test-dir "*_test.cljr" SearchOption/AllDirectories)
-              :let [ns-name (file->ns-name test-dir test-file)
-                    content (File/ReadAllText test-file)]
-              m (Regex/Matches content "\\((?:deftest|defspec)\\s+(?:\\^(?:\\{[^}]*\\}|\\S+)\\s+)*(\\S+)")
-              :let [test-name (str (.Value (.get_Item (.Groups m) 1)))
-                    line-num (-> (.Substring content 0 (.Index m))
-                                 (.Split (char-array "\n"))
-                                 count)
-                    full-name (str ns-name "/" test-name)
-                    test-case (TestCase. full-name executor-uri source)]]
-          (do
-            (set! (.-DisplayName test-case) test-name)
-            (set! (.-CodeFilePath test-case) test-file)
-            (set! (.-LineNumber test-case) line-num)
-            (.Add (.-Traits test-case) "Namespace" ns-name)
-            [full-name test-case]))))))
+  (if-let [dir (test-dir source)]
+    (into {}
+      (for [test-file (test-files dir)
+            :let [content (File/ReadAllText test-file)
+                  ns-match (.Match ns-pattern content)
+                  ns-name (if (.Success ns-match)
+                            (.Value (.get_Item (.Groups ns-match) 1))
+                            (file->ns-name dir test-file))]
+            m (.Matches test-pattern content)
+            :let [test-name (str (.Value (.get_Item (.Groups m) 1)))
+                  line-num (-> (.Substring content 0 (.Index m))
+                               (.Split (char-array "\n"))
+                               count)
+                  full-name (str ns-name "/" test-name)
+                  test-case (TestCase. full-name executor-uri source)]]
+        (do
+          (set! (.-DisplayName test-case) test-name)
+          (set! (.-CodeFilePath test-case) test-file)
+          (set! (.-LineNumber test-case) line-num)
+          (.Add (.-Traits test-case) "Namespace" ns-name)
+          [full-name test-case])))
+    {}))
 
 ;; ── Running the test process ─────────────────────────────────────
 
@@ -92,52 +128,73 @@
         (when (and p (.StartsWith (Path/GetFileNameWithoutExtension p) "dotnet")) p))
       "dotnet"))
 
+(defn- result-line? [^String line]
+  (.StartsWith line result-prefix))
+
 (defn- run-process
   "Runs the test assembly with the given --clj-mode arguments, streaming its
    output to the framework handle. Returns {:exit :output :errors}."
   [assembly args project-dir ^IFrameworkHandle framework-handle]
   (let [start-info (doto (ProcessStartInfo.)
                      (-> .-FileName (set! (dotnet-host)))
-                     (-> .-Arguments (set! (str "\"" assembly "\" " args)))
                      (-> .-WorkingDirectory (set! project-dir))
                      (-> .-RedirectStandardOutput (set! true))
                      (-> .-RedirectStandardError (set! true))
                      (-> .-UseShellExecute (set! false))
                      (-> .-CreateNoWindow (set! true)))
+        _ (doseq [a (concat [assembly "--clj-mode"] args)]
+            (.Add (.ArgumentList start-info) a))
+        _ (.set_Item (.Environment start-info) "CLOJURE_MSBUILD_TEST_FORMAT" "edn")
         output (StringBuilder.)
         errors (StringBuilder.)
         process (Process/Start start-info)]
     (.add_OutputDataReceived process
       (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
         (when-let [data (.-Data e)]
-          (.AppendLine output data)
-          (when-not (or (String/IsNullOrEmpty data) (.StartsWith data result-prefix))
+          (locking output (.AppendLine output data))
+          (when-not (or (String/IsNullOrEmpty data) (result-line? data))
             (.SendMessage framework-handle TestMessageLevel/Informational data)))))
     (.add_ErrorDataReceived process
       (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
         (when-let [data (.-Data e)]
-          (.AppendLine errors data)
+          (locking errors (.AppendLine errors data))
           (when-not (String/IsNullOrEmpty data)
             (.SendMessage framework-handle TestMessageLevel/Warning data)))))
     (.BeginOutputReadLine process)
     (.BeginErrorReadLine process)
     (.WaitForExit process)
     {:exit (.ExitCode process)
-     :output (.ToString output)
-     :errors (.ToString errors)}))
+     :output (locking output (.ToString output))
+     :errors (locking errors (.ToString errors))}))
 
 (defn- parse-results
-  "Parses the CLJTEST lines into a map of \"ns/name\" -> {:outcome :ms :message}."
+  "Parses the result lines into {:results {\"ns/name\" result} :load-errors
+   {\"ns\" message}}. Both the edn lines and the original tab-separated ones
+   (from older versions of Clojure.MSBuild) are understood."
   [output]
-  (into {}
-    (for [line (str/split-lines output)
-          :when (.StartsWith ^String line (str result-prefix "\t"))
-          :let [[_ full-name outcome ms message] (str/split line #"\t" 5)]]
-      [full-name {:outcome outcome
-                  :ms (try (Int64/Parse ms) (catch Exception _ 0))
-                  :message message}])))
+  (reduce
+    (fn [acc ^String line]
+      (cond
+        (.StartsWith line (str edn-prefix "\t"))
+        (let [r (try (edn/read-string (subs line (inc (count edn-prefix)))) (catch Exception _ nil))]
+          (cond
+            (:load-error r) (assoc-in acc [:load-errors (:load-error r)] (:message r))
+            (:test r) (assoc-in acc [:results (:test r)] r)
+            :else acc))
 
-(defn- record-result! [^IFrameworkHandle framework-handle ^TestCase test-case {:keys [outcome ms message]}]
+        (.StartsWith line (str result-prefix "\t"))
+        (let [[_ full-name outcome ms message] (str/split line #"\t" 5)]
+          (assoc-in acc [:results full-name]
+                    {:test full-name
+                     :outcome outcome
+                     :ms (try (Int64/Parse ms) (catch Exception _ 0))
+                     :message message}))
+
+        :else acc))
+    {:results {} :load-errors {}}
+    (str/split-lines output)))
+
+(defn- record-result! [^IFrameworkHandle framework-handle ^TestCase test-case {:keys [outcome ms message stack output]}]
   (let [result (TestResult. test-case)
         now (DateTimeOffset/Now)
         duration (TimeSpan/FromMilliseconds (double (or ms 0)))]
@@ -145,12 +202,17 @@
                                "pass" TestOutcome/Passed
                                "fail" TestOutcome/Failed
                                "skip" TestOutcome/Skipped
+                               "not-found" TestOutcome/NotFound
                                TestOutcome/None))
     (set! (.-StartTime result) (.Subtract now duration))
     (set! (.-EndTime result) now)
     (set! (.-Duration result) duration)
-    (when (and message (not (str/blank? message)))
+    (when-not (str/blank? message)
       (set! (.-ErrorMessage result) message))
+    (when-not (str/blank? stack)
+      (set! (.-ErrorStackTrace result) stack))
+    (when-not (str/blank? output)
+      (.Add (.-Messages result) (TestResultMessage. TestResultMessage/StandardOutCategory output)))
     (.RecordStart framework-handle test-case)
     (.RecordEnd framework-handle test-case (.-Outcome result))
     (.RecordResult framework-handle result)))
@@ -181,12 +243,24 @@
                     (sys-func [String Object] [property] (test-case-property t property))))
                 cases)))))
 
-(defn- not-run-result [{:keys [exit errors]}]
-  {:outcome "fail"
-   :ms 0
-   :message (str "No result was reported for this test"
-                 (when (not= 0 exit) (str " (test process exited with code " exit ")"))
-                 (when-not (str/blank? errors) (str ": " (str/trim errors))))})
+(defn- missing-result
+  "The result of an expected test that reported nothing: its namespace did
+   not load, the process failed, or (after a clean run) the test does not
+   exist, e.g. a deftest the discovery regex found in a comment."
+  [full-name {:keys [exit errors]} load-errors]
+  (let [ns-name (subs full-name 0 (max 0 (.IndexOf ^String full-name "/")))]
+    (cond
+      (load-errors ns-name)
+      {:outcome "fail" :ms 0 :message (str "Could not load " ns-name ":\n" (load-errors ns-name))}
+
+      (zero? exit)
+      {:outcome "not-found" :ms 0 :message "The test run completed without running this test"}
+
+      :else
+      {:outcome "fail"
+       :ms 0
+       :message (str "No result was reported for this test (test process exited with code " exit ")"
+                     (when-not (str/blank? errors) (str ":\n" (str/trim errors))))})))
 
 (defn- run-and-record!
   "Runs the process and records one result per expected test case. With
@@ -194,13 +268,16 @@
    reported as well."
   [assembly args project-dir framework-handle expected-cases report-extra?]
   (let [{:keys [exit errors output] :as run} (run-process assembly args project-dir framework-handle)
-        results (parse-results output)]
+        {:keys [results load-errors]} (parse-results output)]
     (doseq [[full-name ^TestCase test-case] expected-cases]
-      (record-result! framework-handle test-case (or (results full-name) (not-run-result run))))
+      (record-result! framework-handle test-case
+                      (or (results full-name) (missing-result full-name run load-errors))))
     (doseq [[full-name result] results
             :when (and report-extra? (not (contains? expected-cases full-name)))
             :let [test-case (TestCase. full-name executor-uri assembly)]]
       (set! (.-DisplayName test-case) (subs full-name (inc (.IndexOf ^String full-name "/"))))
+      (when-let [file (:file result)] (set! (.-CodeFilePath test-case) file))
+      (when-let [line (:line result)] (set! (.-LineNumber test-case) (int line)))
       (record-result! framework-handle test-case result))
     (when (and (empty? results) (not= 0 exit))
       (.SendMessage framework-handle TestMessageLevel/Error
@@ -213,9 +290,9 @@
 
 ;; ITestDiscoverer.DiscoverTests
 (defn adapter-DiscoverTests [this sources discovery-context ^IMessageLogger logger ^ITestCaseDiscoverySink discovery-sink]
-  (.SendMessage logger TestMessageLevel/Informational "Clojure Test Discoverer: Starting test discovery")
   (doseq [source sources
-          :let [cases (discover-test-cases source)]]
+          :let [cases (discover-test-cases source)]
+          :when (seq cases)]
     (.SendMessage logger TestMessageLevel/Informational
       (str "Found " (count cases) " Clojure tests in " source))
     (doseq [[_ test-case] cases]
@@ -231,32 +308,25 @@
         first-item (first sources-or-tests)]
     (if (instance? TestCase first-item)
       ;; Overload: RunTests(IEnumerable<TestCase>, ...) - only the selected tests
-      (do
-        (.SendMessage framework-handle TestMessageLevel/Informational
-          "Clojure Test Executor: Starting test execution")
-        (doseq [[source tests] (group-by (fn [^TestCase t] (.Source t)) sources-or-tests)
-                :when (not @cancelled?)
-                :let [expected (into {} (map (fn [^TestCase t] [(.FullyQualifiedName t) t]) tests))
-                      args (str "--clj-mode test-vars " (str/join " " (keys expected)))]]
-          (run-and-record! source args (project-dir source) framework-handle expected false))
-        (.SendMessage framework-handle TestMessageLevel/Informational "Clojure Test Execution completed"))
+      (doseq [[source tests] (group-by (fn [^TestCase t] (.Source t)) sources-or-tests)
+              :when (not @cancelled?)
+              :let [expected (into {} (map (fn [^TestCase t] [(.FullyQualifiedName t) t]) tests))]]
+        (run-and-record! source (cons "test-vars" (keys expected)) (project-dir source) framework-handle expected false))
 
       ;; Overload: RunTests(IEnumerable<string>, ...) - whole assemblies, honouring --filter
-      (do
-        (.SendMessage framework-handle TestMessageLevel/Informational
-          "Clojure Test Executor: Starting full test run")
-        (doseq [source sources-or-tests
-                :when (not @cancelled?)
-                :let [discovered (discover-test-cases source)
-                      selected (apply-filter run-context discovered)]]
-          (cond
-            (= (count selected) (count discovered))
-            (run-and-record! source "--clj-mode test" (project-dir source) framework-handle discovered true)
+      (doseq [source sources-or-tests
+              :when (not @cancelled?)
+              :when (test-dir source)
+              :let [discovered (discover-test-cases source)
+                    selected (apply-filter run-context discovered)]]
+        (cond
+          (= (count selected) (count discovered))
+          (run-and-record! source ["test"] (project-dir source) framework-handle discovered true)
 
-            (seq selected)
-            (run-and-record! source (str "--clj-mode test-vars " (str/join " " (keys selected)))
-                             (project-dir source) framework-handle selected false)
+          (seq selected)
+          (run-and-record! source (cons "test-vars" (keys selected))
+                           (project-dir source) framework-handle selected false)
 
-            :else
-            (.SendMessage framework-handle TestMessageLevel/Informational
-              (str "No Clojure tests match the filter in " source))))))))
+          :else
+          (.SendMessage framework-handle TestMessageLevel/Informational
+            (str "No Clojure tests match the filter in " source)))))))
