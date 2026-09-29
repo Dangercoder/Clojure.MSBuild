@@ -3,14 +3,16 @@
   <!-- Computed at target time so this file also works when imported directly from a csproj -->
   <Target Name="_ClojureInit">
     <PropertyGroup>
-      <!-- Where generated Clojure sources and compiled output live (absolute, trailing slash) -->
-      <_ClojureGenDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'clj'))</_ClojureGenDir>
-      <_ClojureBuildDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'clj-out'))</_ClojureBuildDir>
+      <!-- Where generated Clojure sources and compiled output live (absolute, trailing slash).
+           The slash is always "/": these are passed quoted to the compiler, and on Windows a
+           trailing \" reads as an escaped quote that merges two arguments into one path. -->
+      <_ClojureGenDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'clj').TrimEnd('\').TrimEnd('/'))/</_ClojureGenDir>
+      <_ClojureBuildDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'clj-out').TrimEnd('\').TrimEnd('/'))/</_ClojureBuildDir>
       <_ClojureEntryFile>$(IntermediateOutputPath)ClojureEntry.g.cs</_ClojureEntryFile>
       <_ClojureEntryNsFile>$(_ClojureGenDir)clojure/msbuild/entry.cljr</_ClojureEntryNsFile>
       <_ClojureFileList>$(IntermediateOutputPath)ClojureBuild.FileList.txt</_ClojureFileList>
       <!-- Library layer: precompiled clojure.core, standard library and dependencies, kept between builds -->
-      <_ClojureLibDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'clj-lib'))</_ClojureLibDir>
+      <_ClojureLibDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(IntermediateOutputPath)', 'clj-lib').TrimEnd('\').TrimEnd('/'))/</_ClojureLibDir>
       <_ClojureLibFileList>$(IntermediateOutputPath)ClojureLibs.FileList.txt</_ClojureLibFileList>
       <_ClojureLibStampFile>$(IntermediateOutputPath)ClojureLibs.stamp</_ClojureLibStampFile>
       <_ClojureBuildStampFile>$(IntermediateOutputPath)ClojureBuild.stamp</_ClojureBuildStampFile>
