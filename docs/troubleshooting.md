@@ -24,6 +24,15 @@ not have it, the layer stays IL: everything works, processes just start about tw
 slower. It is tried again the next time the layer is rebuilt. `-p:ClojureReadyToRun=false`
 turns it off.
 
+### `error CLJ0003: Clojure.MSBuild supports Clojure 1.13.0-alpha8 only`
+
+This release of Clojure.MSBuild is built for one ClojureCLR version. Reference exactly that
+version of the `Clojure` package:
+
+```xml
+<PackageReference Include="Clojure" Version="1.13.0-alpha8" />
+```
+
 ### `C# sources (...) cannot be compiled into a Clojure project`
 
 With the default `ClojureEntryPoint=gen-class`, the project assembly is replaced by the

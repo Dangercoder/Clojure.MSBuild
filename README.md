@@ -13,7 +13,8 @@ No non-dotnet tools needed.
 ## Requirements
 
 - .NET 11.0 SDK, 11.0.100 or later
-- ClojureCLR 1.13.0-alpha8 or later (the TestAdapter is compiled against it)
+- ClojureCLR 1.13.0-alpha8, exactly: the tooling and the test adapter are compiled against it, and
+  the build fails with `error CLJ0003` when a project references another version of the `Clojure` package
 - git, only for Clojure dependencies from git
 
 ## Quick Start with templates

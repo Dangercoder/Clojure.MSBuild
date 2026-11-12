@@ -91,6 +91,24 @@
            Text="C# sources (@(_ClojureUserCompile, ', ')) cannot be compiled into a Clojure project with ClojureEntryPoint=gen-class, because the project assembly is replaced by the compiled Clojure entry point. Move the C# into a class library project, or set &lt;ClojureEntryPoint&gt;csharp&lt;/ClojureEntryPoint&gt;." />
   </Target>
 
+  <!-- Clojure.MSBuild supports one ClojureCLR version (ClojureSupportedVersion): its
+       tooling and the test adapter are compiled against it. -->
+  <Target Name="_ClojureCheckVersion" AfterTargets="ResolveAssemblyReferences"
+          Condition="'$(ClojureMainNamespace)' != ''">
+    <ItemGroup>
+      <_ClojurePackageRef Include="@(ReferencePath)" Condition="'%(ReferencePath.NuGetPackageId)' == 'Clojure'" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_ClojurePackageVersion>@(_ClojurePackageRef->'%(NuGetPackageVersion)'->Distinct())</_ClojurePackageVersion>
+    </PropertyGroup>
+    <Error Condition="'$(_ClojurePackageVersion)' == ''"
+           Code="CLJ0003"
+           Text="The project does not reference the Clojure package. Add &lt;PackageReference Include=&quot;Clojure&quot; Version=&quot;$(ClojureSupportedVersion)&quot; /&gt;." />
+    <Error Condition="'$(_ClojurePackageVersion)' != '' And '$(_ClojurePackageVersion)' != '$(ClojureSupportedVersion)'"
+           Code="CLJ0003"
+           Text="Clojure.MSBuild supports Clojure $(ClojureSupportedVersion) only, but the project references Clojure $(_ClojurePackageVersion). Set &lt;PackageReference Include=&quot;Clojure&quot; Version=&quot;$(ClojureSupportedVersion)&quot; /&gt;." />
+  </Target>
+
   <!-- Generate the C# host and the clojure.msbuild.entry namespace.
        The C# host is compiled by the SDK as usual; it bootstraps Clojure and calls
        clojure.msbuild.entry/-main. In gen-class mode the host only lives long enough

@@ -85,6 +85,14 @@ echo "--- publish modes Clojure cannot support fail early"
   if out="$("$DOTNET" publish -nologo -v q -p:PublishSingleFile=true -r linux-x64 2>&1)"; then echo "publish should have failed"; exit 1; fi
   echo "$out" | grep -q "PublishSingleFile is not supported" )
 
+echo "--- another Clojure version is refused"
+( cd My-App
+  sed -i.orig 's/Include="Clojure" Version="[^"]*"/Include="Clojure" Version="1.12.6"/' My-App.csproj
+  if out="$("$DOTNET" build -nologo -v q 2>&1)"; then echo "the build should have failed"; exit 1; fi
+  echo "$out" | grep -m1 "error CLJ0003: Clojure.MSBuild supports Clojure 1.13.0-alpha8 only"
+  mv My-App.csproj.orig My-App.csproj
+  "$DOTNET" build -nologo -v q > /dev/null )
+
 echo "--- clj-run passes arguments to the script"
 ( cd My-App
   printf '(println "args:" *command-line-args*)\n' > script.cljr

@@ -4,6 +4,11 @@
          features (runtime async), so the generated host needs them on. -->
     <EnablePreviewFeatures Condition="'$(EnablePreviewFeatures)' == ''">true</EnablePreviewFeatures>
 
+    <!-- The ClojureCLR version this release of Clojure.MSBuild supports. The tooling and
+         Clojure.MSBuild.TestAdapter are compiled against it, and the build fails when the
+         project references another version of the Clojure package. -->
+    <ClojureSupportedVersion>1.13.0-alpha8</ClojureSupportedVersion>
+
     <!-- Load every assembly next to the application at startup, so that `require` and
          `import` find NuGet-packaged Clojure libraries and .NET types. Set to false to
          load what the application uses itself (assembly-load); tooling always does it. -->
