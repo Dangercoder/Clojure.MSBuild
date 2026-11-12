@@ -14,7 +14,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Clojure" Version="1.12.6" />
+    <PackageReference Include="Clojure" Version="1.13.0-alpha8" />
     <PackageReference Include="Microsoft.Orleans.Sdk" Version="10.4.2" />
     <PackageReference Include="Microsoft.Orleans.Server" Version="10.4.2" />
     <PackageReference Include="Microsoft.Orleans.Reminders" Version="10.4.2" />

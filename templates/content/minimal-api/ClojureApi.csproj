@@ -15,7 +15,7 @@
   <ItemGroup>
     <PackageReference Include="Clojure.MSBuild" Version="0.0.11" />
     <PackageReference Include="Clojure.MSBuild.TestAdapter" Version="0.0.11" />
-    <PackageReference Include="Clojure" Version="1.12.6" />
+    <PackageReference Include="Clojure" Version="1.13.0-alpha8" />
     <PackageReference Include="clojure.data.json" Version="2.5.1" />
     <PackageReference Include="clojure.tools.nrepl" Version="0.1.0-alpha2" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0" />

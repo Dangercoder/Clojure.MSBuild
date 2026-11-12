@@ -13,7 +13,7 @@ No non-dotnet tools needed.
 ## Requirements
 
 - .NET 11.0 SDK, 11.0.100 or later
-- Clojure CLR 1.12.6 or later
+- ClojureCLR 1.13.0-alpha8 or later (the TestAdapter is compiled against it)
 - git, only for Clojure dependencies from git
 
 ## Quick Start with templates
@@ -54,7 +54,7 @@ compiled Clojure entry point (see [How the build works](docs/how-it-works.md)).
 
 ```bash
 dotnet add package Clojure.MSBuild
-dotnet add package Clojure --version 1.12.6
+dotnet add package Clojure --version 1.13.0-alpha8
 ```
 
 ### 3. Update your .csproj
@@ -71,7 +71,7 @@ dotnet add package Clojure --version 1.12.6
 
   <ItemGroup>
     <PackageReference Include="Clojure.MSBuild" Version="0.0.11" />
-    <PackageReference Include="Clojure" Version="1.12.6" />
+    <PackageReference Include="Clojure" Version="1.13.0-alpha8" />
   </ItemGroup>
 
   <ItemGroup>
@@ -135,7 +135,7 @@ Add Clojure libraries from git directly in your `.csproj` — no `deps.edn` need
 ```xml
 <ItemGroup>
   <!-- .NET deps from NuGet -->
-  <PackageReference Include="Clojure" Version="1.12.6" />
+  <PackageReference Include="Clojure" Version="1.13.0-alpha8" />
   <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0" />
 
   <!-- Clojure deps from git -->

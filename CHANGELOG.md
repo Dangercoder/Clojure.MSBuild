@@ -7,6 +7,8 @@
 - Built and tested with the .NET 11.0.100 SDK (GA). The templates and examples use the .NET 11
   packages (Microsoft.Data.Sqlite, Microsoft.AspNetCore.TestHost 11.0.0), Microsoft.NET.Test.Sdk
   and Microsoft.TestPlatform.ObjectModel 18.12, OpenTelemetry 1.21 and Orleans 10.4.
+- ClojureCLR 1.13.0-alpha8: the templates and examples use it, and Clojure.MSBuild.TestAdapter
+  is compiled against it, so test projects need Clojure 1.13.0-alpha8 or later.
 - Clojure.MSBuild turns on `EnablePreviewFeatures` (ClojureCLR's runtime for net11.0 needs it),
   so projects no longer set it themselves.
 
