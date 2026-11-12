@@ -55,11 +55,17 @@
 
   <!-- Build a Clojure deps map from ClojureGitDep items -->
   <Target Name="_BuildClojureGitDeps">
+    <!-- Tag/Sha/Url (git), Root (:deps/root, a subdirectory of the repository) or
+         LocalRoot (a directory, relative to the project). Empty values are ignored.
+         LocalRoot is written with / so that it is a valid EDN string on Windows. -->
+    <ItemGroup>
+      <_ClojureGitDepItem Include="@(ClojureGitDep)">
+        <_LocalRoot>$([System.String]::Copy('%(ClojureGitDep.LocalRoot)').Replace('\', '/'))</_LocalRoot>
+      </_ClojureGitDepItem>
+    </ItemGroup>
     <PropertyGroup>
       <_ClojureGitDeps>nil</_ClojureGitDeps>
-      <!-- Tag/Sha/Url (git), Root (:deps/root, a subdirectory of the repository) or
-           LocalRoot (a directory, relative to the project). Empty values are ignored. -->
-      <_ClojureGitDeps Condition="@(ClojureGitDep->Count()) > 0">{:deps {@(ClojureGitDep->'%(Identity) {:git/tag "%(Tag)" :git/sha "%(Sha)" :git/url "%(Url)" :deps/root "%(Root)" :local/root "$([System.String]::Copy('%(LocalRoot)').Replace('\', '\\'))"}', ' ')}}</_ClojureGitDeps>
+      <_ClojureGitDeps Condition="@(_ClojureGitDepItem->Count()) > 0">{:deps {@(_ClojureGitDepItem->'%(Identity) {:git/tag "%(Tag)" :git/sha "%(Sha)" :git/url "%(Url)" :deps/root "%(Root)" :local/root "%(_LocalRoot)"}', ' ')}}</_ClojureGitDeps>
     </PropertyGroup>
   </Target>
 

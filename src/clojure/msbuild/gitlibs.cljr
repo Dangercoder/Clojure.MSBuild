@@ -168,7 +168,7 @@
                              (do (git-fetch! gd) (resolve-rev gd tag)))]
               (cond
                 (nil? tagged)
-                (println (str "  Warning: " lib ": tag " tag " not found in " url "; using sha " sha))
+                (println (str "Clojure.MSBuild : warning CLJ0002: " lib ": tag " tag " not found in " url "; using sha " sha))
                 (not (sha-matches? tagged sha))
                 (throw (ex-info (str "tag " tag " of " url " is commit " (subs tagged 0 (min 12 (count tagged)))
                                      ", not sha " sha)
@@ -252,9 +252,12 @@
                        :let [k (keyword (str/replace (str/trim (str a)) #"^:" ""))]
                        :when (not= k (keyword ""))]
                    (or (get-in deps-map [:aliases k])
-                       (do (println (str "  Warning: alias " k " is not defined in deps.edn")) nil)))]
+                       (do (println (str "Clojure.MSBuild : warning CLJ0003: alias " k " is not defined in deps.edn")) nil)))]
     {:deps (apply merge (map :extra-deps selected))
      :paths (vec (mapcat :extra-paths selected))}))
+
+(def ^:private clojure-itself
+  '#{org.clojure/clojure org.clojure/clojurescript org.clojure/clojure-clr})
 
 (defn clean-coord
   "A coordinate without blank string values (ClojureGitDep items leave out
@@ -282,6 +285,10 @@
                           (update state :warnings conj
                                   (str lib ": using " (describe (:coord seen)) "; " parent " asks for " (describe coord)))
                           state))
+
+           (and (= :mvn (coord-type lib coord)) (clojure-itself lib))
+           ;; libraries declare the Clojure version they need; the CLR has its own
+           (recur queue (assoc-in state [:libs lib] {:coord coord}))
 
            (= :mvn (coord-type lib coord))
            (recur queue (-> state
@@ -333,7 +340,8 @@
       (do
         (println (str "Resolving " n " Clojure dependencies..."))
         (let [{:keys [paths errors warnings]} (resolve-all roots)]
-          (doseq [w warnings] (println (str "  Warning: " w)))
+          ;; MSBuild's canonical format, so the build lists them as warnings
+          (doseq [w warnings] (println (str "Clojure.MSBuild : warning CLJ0002: " w)))
           (when (seq errors)
             (throw (ex-info (str "could not resolve Clojure dependencies:\n" (str/join "\n" errors))
                             {:errors errors})))

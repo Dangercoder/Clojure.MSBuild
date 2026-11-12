@@ -16,7 +16,7 @@
            [System.Runtime.InteropServices PosixSignal PosixSignalRegistration PosixSignalContext]
            [System.Net IPAddress IPEndPoint]
            [System.Net.Sockets TcpListener SocketException]
-           [System.Threading ManualResetEventSlim]))
+           [System.Threading ManualResetEventSlim Thread ThreadStart]))
 
 (def default-port 1667)
 
@@ -26,9 +26,12 @@
   "A started TcpListener on address:port, or nil if the port is taken or
    the address family is not available."
   [^IPAddress address port]
-  (let [l (TcpListener. address (int port))]
-    (try (.Start l) l
-         (catch SocketException _ nil))))
+  ;; Creating the listener already fails where the address family is not
+  ;; available (no IPv6 in many containers).
+  (try (let [l (TcpListener. address (int port))]
+         (try (.Start l) l
+              (catch SocketException _ (.Stop l) nil)))
+       (catch SocketException _ nil)))
 
 (defn- local-port [^TcpListener l]
   (.Port ^IPEndPoint (.LocalEndpoint l)))
@@ -99,8 +102,13 @@
          port (local-port (first listeners))
          ctx {:sessions (atom #{})}
          opts {:xform xform}]
+     ;; Background threads, so that the server never keeps the process alive
+     ;; (the in-app server must not stop the application from exiting)
      (doseq [l listeners]
-       (future (listen ctx l opts)))
+       (doto (Thread. (gen-delegate ThreadStart [] (listen ctx l opts)))
+         (-> .-IsBackground (set! true))
+         (-> .-Name (set! "nREPL accept loop"))
+         (.Start)))
      {:port port
       :listeners listeners
       :stop (fn [] (doseq [^TcpListener l listeners] (.Stop l)))})))

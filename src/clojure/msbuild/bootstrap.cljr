@@ -221,5 +221,13 @@
         (let [main-fn (ns-resolve main-ns '-main)]
           (when-not main-fn
             (throw (Exception. (str "Namespace " main-ns " has no -main function"))))
-          (binding [*command-line-args* (seq args)]
-            (apply main-fn args)))))))
+          (let [result (binding [*command-line-args* (seq args)]
+                         (apply main-fn args))]
+            (if nrepl-port
+              ;; nREPL sessions run on agent threads, which would keep the process
+              ;; alive after -main (and the Task it returns) has finished.
+              (do (when (instance? System.Threading.Tasks.Task result)
+                    (.Wait ^System.Threading.Tasks.Task result))
+                  (shutdown-agents)
+                  nil)
+              result)))))))

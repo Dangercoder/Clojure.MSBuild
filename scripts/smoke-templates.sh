@@ -5,7 +5,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DOTNET="${DOTNET:-$HOME/.dotnet/dotnet}"
+DOTNET="${DOTNET:-dotnet}"
 SMOKE="$DIR/.smoke"
 PKG="$SMOKE/pkg"
 
@@ -59,6 +59,37 @@ echo "--- rebuild time (console, no changes)"
 echo "--- rebuild time (console, one namespace changed)"
 ( cd My-App && touch src/my_app/core.cljr && time "$DOTNET" build -nologo -v q && "$DOTNET" run --no-build | grep -q "Hello from ClojureCLR" )
 
+echo "--- a compile error is reported in MSBuild's format, at its line"
+( cd My-App
+  cp src/my_app/core.cljr core.cljr.orig
+  printf '\n(defn broken [] (no-such-function))\n' >> src/my_app/core.cljr
+  line="$(wc -l < src/my_app/core.cljr)"
+  if out="$("$DOTNET" build -nologo -v q 2>&1)"; then echo "the build should have failed"; exit 1; fi
+  echo "$out" | grep -E "core.cljr\($line,[0-9]+\): error CLJ0001: compiling my-app.core: .*no-such-function"
+  mv core.cljr.orig src/my_app/core.cljr
+  "$DOTNET" build -nologo -v q > /dev/null )
+
+echo "--- the compiled application does not load sources from the current directory"
+( cd My-App
+  "$DOTNET" build -nologo -v q > /dev/null
+  mkdir -p elsewhere/src/my_app
+  sed 's/Hello from ClojureCLR!/Hello from a stray source file/' src/my_app/core.cljr > elsewhere/src/my_app/core.cljr
+  touch elsewhere/src/my_app/core.cljr
+  out="$(cd elsewhere && "$DOTNET" ../bin/Debug/net11.0/My_App.dll)"
+  echo "$out"
+  [[ "$out" == *"Hello from ClojureCLR!"* ]]
+  rm -rf elsewhere )
+
+echo "--- publish modes Clojure cannot support fail early"
+( cd My-App
+  if out="$("$DOTNET" publish -nologo -v q -p:PublishSingleFile=true -r linux-x64 2>&1)"; then echo "publish should have failed"; exit 1; fi
+  echo "$out" | grep -q "PublishSingleFile is not supported" )
+
+echo "--- clj-run passes arguments to the script"
+( cd My-App
+  printf '(println "args:" *command-line-args*)\n' > script.cljr
+  "$DOTNET" msbuild /t:clj-run -p:ClojureScript=script.cljr '-p:ClojureScriptArgs=a b' -nologo -v m | grep -q 'args: (a b)' )
+
 echo "=== clojure-clr-minimal-api"
 "$DOTNET" new clojure-clr-minimal-api -n orders --root-namespace constructly.se > /dev/null
 ( cd orders
@@ -82,7 +113,12 @@ echo "=== clojure-clr-minimal-api"
   echo "health: $body"
   echo "created: $created"
   [[ "$body" == '{"status":"ok"}' ]]
-  [[ "$created" == *'"title":"smoke"'* ]] )
+  [[ "$created" == *'"title":"smoke"'* ]]
+  echo "--- the in-app nREPL server (Debug)"
+  grep "nREPL server started" run.log
+  test ! -f .nrepl-port   # removed when the application stops
+  echo "--- dotnet test --filter"
+  "$DOTNET" test --no-build -nologo -v q --filter "Namespace~todo-test" | grep -E "Passed!|Failed!" )
 
 echo ""
 echo "Templates OK"

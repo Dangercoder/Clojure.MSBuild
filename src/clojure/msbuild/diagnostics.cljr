@@ -62,7 +62,7 @@
   (let [cause (root-cause e)
         type-name (.Name (.GetType cause))
         msg (or (not-empty (.Message cause)) type-name)]
-    (if (#{"Exception" "ExceptionInfo" "CompilerException"} type-name)
+    (if (#{"Exception" "ExceptionInfo" "CompilerException" "InvalidOperationException"} type-name)
       msg
       (str type-name ": " msg))))
 
