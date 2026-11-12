@@ -1,10 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <Import Project="version.props" />
+
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>Clojure.MSBuild</PackageId>
-    <Version>0.0.10</Version>
     <Authors>Dangercoder</Authors>
     <Description>MSBuild integration for ClojureCLR. Build, test, and run Clojure on .NET with standard dotnet commands. Written entirely in ClojureCLR.</Description>
     <PackageTags>clojure;clr;msbuild;repl;dotnet</PackageTags>
@@ -20,6 +21,8 @@
     <!-- MSBuild integration (auto-imported by NuGet) -->
     <Content Include="build\Clojure.MSBuild.props" PackagePath="build\" />
     <Content Include="build\Clojure.MSBuild.targets" PackagePath="build\" />
+    <!-- Multi-targeted projects (TargetFrameworks): forwards the clj-* targets to one framework -->
+    <Content Include="buildMultiTargeting\Clojure.MSBuild.targets" PackagePath="buildMultiTargeting\" />
 
     <!-- ClojureCLR source (tool, web framework) -->
     <Content Include="src\clojure\**\*.cljr" PackagePath="build\clojure\" />

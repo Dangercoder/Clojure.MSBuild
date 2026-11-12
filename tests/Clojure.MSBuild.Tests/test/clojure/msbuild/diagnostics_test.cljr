@@ -1,0 +1,30 @@
+(ns clojure.msbuild.diagnostics-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [clojure.msbuild.diagnostics :as diag])
+  (:import [System.IO File Path]))
+
+(deftest format-line
+  (testing "a located error in MSBuild's canonical format"
+    (is (= "/src/a.cljr(12,3): error CLJ0001: compiling a: boom"
+           (diag/format-line :error :compile {:file "/src/a.cljr" :line 12 :column 3} "compiling a: boom"))))
+  (testing "without a column"
+    (is (= "/src/a.cljr(12): warning CLJ0004: x"
+           (diag/format-line :warning :library {:file "/src/a.cljr" :line 12 :column 0} "x"))))
+  (testing "without a location, and more lines indented"
+    (is (= "Clojure.MSBuild : error CLJ0002: first\n  second"
+           (diag/format-line :error :git-deps nil "first\nsecond")))))
+
+(deftest location-of-a-compile-error
+  (let [file (Path/Combine (Path/GetTempPath) (str "diag-" (System.Guid/NewGuid) ".cljr"))]
+    (File/WriteAllText file "(ns diag-sample)\n\n(defn f []\n  (no-such-function 1))\n")
+    (try
+      (let [e (try (load-file file) nil (catch Exception e e))
+            loc (diag/location e)]
+        (is (some? e))
+        (is (= 4 (:line loc)))
+        (is (str/ends-with? (str (:file loc)) (Path/GetFileName file)))
+        (is (re-find #"no-such-function" (diag/message e)))
+        (is (re-find #"\(4,\d+\): error CLJ0001: compiling diag-sample: "
+                     (diag/format-line :error :compile loc (str "compiling diag-sample: " (diag/message e))))))
+      (finally (File/Delete file)))))

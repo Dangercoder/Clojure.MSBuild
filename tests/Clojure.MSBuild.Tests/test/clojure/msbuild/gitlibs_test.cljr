@@ -1,0 +1,116 @@
+(ns clojure.msbuild.gitlibs-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.msbuild.gitlibs :as gitlibs])
+  (:import [System Environment Guid]
+           [System.IO Directory File Path]))
+
+(deftest urls
+  (is (= "https://github.com/clojure/clr.data.json.git" (gitlibs/auto-git-url 'io.github.clojure/clr.data.json)))
+  (is (= "https://gitlab.com/a/b.git" (gitlibs/auto-git-url 'io.gitlab.a/b)))
+  (is (= "https://git.sr.ht/~me/lib" (gitlibs/auto-git-url 'ht.sr.me/lib)))
+  (is (nil? (gitlibs/auto-git-url 'org.clojure/data.json)))
+  (is (nil? (gitlibs/auto-git-url 'io.githubx.a/b)) "the prefix must end at a dot")
+  (is (= "https/github.com/a/b" (gitlibs/clean-url "https://github.com/a/b.git")))
+  (is (= "ssh/github.com/a/b" (gitlibs/clean-url "git@github.com:a/b.git"))))
+
+(deftest coordinates
+  (is (= :git (gitlibs/coord-type 'a/b {:git/sha "abc1234"})))
+  (is (= :git (gitlibs/coord-type 'a/b {:git/tag "v1"})))
+  (is (= :local (gitlibs/coord-type 'a/b {:local/root "../b"})))
+  (is (= :mvn (gitlibs/coord-type 'a/b {:mvn/version "1.0"})))
+  (is (nil? (gitlibs/coord-type 'a/b {})))
+  (testing "ClojureGitDep items leave unset metadata empty"
+    (is (= {:git/tag "v1"} (gitlibs/clean-coord {:git/tag "v1" :git/sha "" :git/url " " :deps/root ""})))))
+
+(deftest aliases
+  (let [deps {:aliases {:dev {:extra-deps {'a/b {:local/root "b"}} :extra-paths ["dev"]}
+                        :test {:extra-paths ["test-resources"]}}}]
+    (is (= {:deps {'a/b {:local/root "b"}} :paths ["dev" "test-resources"]}
+           (gitlibs/alias-deps deps [":dev" "test"])))
+    (is (= {:deps nil :paths []} (gitlibs/alias-deps deps [])))))
+
+(defn- temp-dir [name]
+  (let [d (Path/Combine (Path/GetTempPath) (str "gitlibs test " (Guid/NewGuid)) name)]
+    (Directory/CreateDirectory d)
+    d))
+
+(defn- spit-file [dir rel text]
+  (let [f (Path/Combine dir rel)]
+    (Directory/CreateDirectory (Path/GetDirectoryName f))
+    (File/WriteAllText f text)
+    f))
+
+(deftest local-roots-and-transitive-deps
+  (let [root (temp-dir "workspace")
+        app (Path/Combine root "app")
+        lib-a (Path/Combine root "lib-a")
+        lib-b (Path/Combine root "lib-b")]
+    (spit-file lib-b "deps.edn" "{:paths [\"src\" \"resources\"]}")
+    (spit-file lib-a "deps.edn" "{:deps {me/lib-b {:local/root \"../lib-b\"} org.clojure/data.json {:mvn/version \"2.5.0\"}}}")
+    (Directory/CreateDirectory app)
+    (let [{:keys [paths errors warnings libs]}
+          (gitlibs/resolve-all [[{'me/lib-a {:local/root "../lib-a"}} app]])]
+      (is (empty? errors))
+      (is (= [(Path/Combine lib-a "src") (Path/Combine lib-b "src") (Path/Combine lib-b "resources")] paths))
+      (is (= #{'me/lib-a 'me/lib-b 'org.clojure/data.json} (set (keys libs))))
+      (is (some #(re-find #"Maven" %) warnings)))
+    (testing "the first coordinate wins, with a warning"
+      (let [{:keys [warnings]} (gitlibs/resolve-all [[{'me/lib-a {:local/root "../lib-a"}
+                                                       'me/lib-b {:local/root "../lib-b"}} app]])]
+        (is (empty? (filter #(re-find #"lib-b: using" %) warnings)) "the same coordinate is not a conflict")))
+    (testing "errors are collected, not thrown"
+      (let [{:keys [errors]} (gitlibs/resolve-all [[{'x/y {:git/sha "abc1234"}} app]
+                                                   [{'p/q {:weird 1}} app]])]
+        (is (= 2 (count errors)))
+        (is (some #(re-find #"x/y: no :git/url" %) errors))
+        (is (some #(re-find #"p/q: unsupported coordinate" %) errors))))
+    (Directory/Delete (Path/GetDirectoryName root) true)))
+
+(defn- git! [dir & args]
+  (let [{:keys [exit err]} (apply gitlibs/run-git "-C" dir args)]
+    (assert (zero? exit) err)))
+
+(deftest git-checkout-in-a-path-with-spaces
+  ;; A local repository and a GITLIBS cache, both in directories with spaces
+  (let [root (temp-dir "git deps")
+        repo (Path/Combine root "my repo")
+        cache (Path/Combine root "the cache")
+        old-gitlibs (Environment/GetEnvironmentVariable "GITLIBS")]
+    (Directory/CreateDirectory repo)
+    (git! repo "init" "--quiet")
+    (git! repo "config" "user.email" "test@example.com")
+    (git! repo "config" "user.name" "Test")
+    (spit-file repo "src/demo/core.cljr" "(ns demo.core)")
+    (git! repo "add" ".")
+    (git! repo "commit" "--quiet" "-m" "first")
+    (git! repo "tag" "v1")
+    (let [sha (:out (gitlibs/run-git "-C" repo "rev-parse" "HEAD"))]
+      (try
+        (Environment/SetEnvironmentVariable "GITLIBS" cache)
+        (let [{:keys [paths errors]} (gitlibs/resolve-all [[{'demo/lib {:git/url repo :git/sha (subs sha 0 7) :git/tag "v1"}} root]])]
+          (is (empty? errors))
+          (is (= 1 (count paths)))
+          (is (File/Exists (Path/Combine (first paths) "demo" "core.cljr"))))
+        (testing "a tag that is not the sha is an error (checked when the commit is checked out)"
+          (git! repo "commit" "--quiet" "--allow-empty" "-m" "second")
+          (git! repo "tag" "v2")
+          (let [{:keys [errors]} (gitlibs/resolve-all [[{'demo/lib2 {:git/url repo :git/sha (subs sha 0 7) :git/tag "v2"}} root]])]
+            (is (some #(re-find #"tag v2 .* not sha" %) errors))))
+        (testing "an unknown sha is an error"
+          (let [{:keys [errors]} (gitlibs/resolve-all [[{'demo/other {:git/url repo :git/sha "0000000"}} root]])]
+            (is (some #(re-find #"could not find sha 0000000" %) errors))))
+        (finally
+          (Environment/SetEnvironmentVariable "GITLIBS" old-gitlibs)
+          (try (Directory/Delete (Path/GetDirectoryName root) true) (catch Exception _)))))))
+
+(deftest locks-are-exclusive
+  (let [lock (Path/Combine (temp-dir "lock") "x.lock")
+        inside (atom 0)
+        max-inside (atom 0)
+        work (fn [] (gitlibs/with-lock lock
+                      (fn []
+                        (swap! max-inside max (swap! inside inc))
+                        (System.Threading.Thread/Sleep 50)
+                        (swap! inside dec))))]
+    (run! deref (doall (repeatedly 4 #(future (work)))))
+    (is (= 1 @max-inside))))

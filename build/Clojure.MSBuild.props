@@ -1,7 +1,12 @@
 <Project>
   <PropertyGroup>
-    <!-- Default properties for Clojure CLR projects -->
-    <ClojureReplEnabled Condition="'$(ClojureReplEnabled)' == ''">true</ClojureReplEnabled>
+    <!-- ClojureCLR's runtime (Clojure.dll for net11.0) is marked as using preview
+         features (runtime async), so the generated host needs them on. -->
+    <EnablePreviewFeatures Condition="'$(EnablePreviewFeatures)' == ''">true</EnablePreviewFeatures>
+
+    <!-- Load every assembly next to the application at startup, so that `require` and
+         `import` find NuGet-packaged Clojure libraries and .NET types. Set to false to
+         load what the application uses itself (assembly-load); tooling always does it. -->
     <ClojureAutoLoadAssemblies Condition="'$(ClojureAutoLoadAssemblies)' == ''">true</ClojureAutoLoadAssemblies>
 
     <!-- Main namespace — set this in your csproj. Its -main becomes the application entry point. -->
@@ -18,8 +23,15 @@
     <!-- Source directory for Clojure files (added to CLOJURE_LOAD_PATH) -->
     <ClojureSourceDir Condition="'$(ClojureSourceDir)' == ''">src</ClojureSourceDir>
 
-    <!-- Extra source directories (pipe-separated, e.g. for vendor libs) -->
+    <!-- Extra source directories, separated by ; or | (or use ClojureSource items) -->
     <ClojureExtraSourceDirs Condition="'$(ClojureExtraSourceDirs)' == ''"></ClojureExtraSourceDirs>
+
+    <!-- Test directory, and the suffix of test file names (my/app_test.cljr) -->
+    <ClojureTestDir Condition="'$(ClojureTestDir)' == ''">test</ClojureTestDir>
+    <ClojureTestSuffix Condition="'$(ClojureTestSuffix)' == ''">_test</ClojureTestSuffix>
+
+    <!-- deps.edn aliases whose :extra-deps and :extra-paths are used (separated by ;) -->
+    <ClojureDepsAliases Condition="'$(ClojureDepsAliases)' == ''"></ClojureDepsAliases>
 
     <!-- Path to Clojure.MSBuild package source (auto-set, don't override) -->
     <ClojureMSBuildSourceDir>$(MSBuildThisFileDirectory)</ClojureMSBuildSourceDir>
@@ -36,7 +48,16 @@
     <ClojureReadyToRun Condition="'$(ClojureReadyToRun)' == ''">true</ClojureReadyToRun>
 
     <!-- Additional namespaces to AOT compile besides the main namespace and its
-         dependencies (semicolon-separated), e.g. namespaces with gen-class. -->
+         dependencies (separated by ;, or use ClojureCompile items), e.g. namespaces
+         with gen-class or namespaces the application loads by name at runtime. -->
     <ClojureNamespacesToCompile Condition="'$(ClojureNamespacesToCompile)' == ''"></ClojureNamespacesToCompile>
+
+    <!-- nREPL: the port of clj-nrepl/clj-dev and of the in-app server (0 = any free port),
+         extra middleware (qualified var symbols, separated by ;), and whether the
+         application itself starts an nREPL server next to its -main (e.g. only in Debug:
+         <ClojureNReplInApp Condition="'$(Configuration)' == 'Debug'">true</ClojureNReplInApp>). -->
+    <ClojureNReplPort Condition="'$(ClojureNReplPort)' == ''">1667</ClojureNReplPort>
+    <ClojureNReplMiddleware Condition="'$(ClojureNReplMiddleware)' == ''"></ClojureNReplMiddleware>
+    <ClojureNReplInApp Condition="'$(ClojureNReplInApp)' == ''">false</ClojureNReplInApp>
   </PropertyGroup>
 </Project>

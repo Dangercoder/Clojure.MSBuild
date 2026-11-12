@@ -21,7 +21,21 @@
 
 ;; ── Test namespaces ──────────────────────────────────────────────
 
-(defn test-dir [] (Path/Combine (Environment/CurrentDirectory) "test"))
+(defn test-dir
+  "The test directory: ClojureTestDir (CLOJURE_MSBUILD_TEST_DIR), test by
+   default, under the project directory (the current directory)."
+  []
+  (Path/GetFullPath
+    (Path/Combine (Environment/CurrentDirectory)
+                  (or (not-empty (some-> (Environment/GetEnvironmentVariable "CLOJURE_MSBUILD_TEST_DIR") .Trim))
+                      "test"))))
+
+(defn test-suffix
+  "The suffix of test file names: ClojureTestSuffix
+   (CLOJURE_MSBUILD_TEST_SUFFIX), _test by default."
+  []
+  (or (not-empty (some-> (Environment/GetEnvironmentVariable "CLOJURE_MSBUILD_TEST_SUFFIX") .Trim))
+      "_test"))
 
 (defn add-test-dir-to-load-path! []
   (let [dir (test-dir)
@@ -32,16 +46,21 @@
         "CLOJURE_LOAD_PATH"
         (if (seq current) (str current Path/PathSeparator dir) dir)))))
 
-(defn- test-file? [^String file]
-  (boolean (re-find #"_test\.clj[rc]?$" (Path/GetFileName file))))
+(defn test-file?
+  "Is file a test file: name<suffix>.cljr/.cljc/.clj?"
+  ([file] (test-file? (test-suffix) file))
+  ([^String suffix ^String file]
+   (let [name (Path/GetFileName file)]
+     (boolean (some #(.EndsWith name (str suffix %)) [".cljr" ".cljc" ".clj"])))))
 
 (defn test-namespaces
   "Entries (see clojure.msbuild.incremental/project-namespaces) for the
    *_test.cljr/.cljc/.clj files in the test directory."
   []
-  (let [dir (test-dir)]
+  (let [dir (test-dir)
+        suffix (test-suffix)]
     (when (Directory/Exists dir)
-      (filter (comp test-file? :file) (incremental/project-namespaces [dir])))))
+      (filter #(test-file? suffix (:file %)) (incremental/project-namespaces [dir])))))
 
 ;; ── Reporting ────────────────────────────────────────────────────
 
@@ -137,9 +156,20 @@
 (defn- single-line [s]
   (str/replace (or s "") #"[\r\n\t]+" " "))
 
+(defn- emit-edn!
+  "Prints an edn result line for the test adapter, and appends it to the
+   file named by CLOJURE_MSBUILD_TEST_RESULTS when that is set (the adapter
+   reads the file when it cannot read the output, e.g. under a debugger)."
+  [m]
+  (let [line (str edn-prefix "\t" (binding [*print-length* nil *print-level* nil] (pr-str m)))]
+    (println line)
+    (when-let [file (not-empty (Environment/GetEnvironmentVariable "CLOJURE_MSBUILD_TEST_RESULTS"))]
+      (locking emit-edn!
+        (File/AppendAllText file (str line "\n"))))))
+
 (defn- print-result [format r failures]
   (case format
-    :edn (println (str edn-prefix "\t" (binding [*print-length* nil *print-level* nil] (pr-str r))))
+    :edn (emit-edn! r)
     :legacy (println (str legacy-prefix "\t" (:test r) "\t" (:outcome r) "\t" (:ms r) "\t"
                           (single-line (some->> (first failures) (failure-text (name (symbol (:test r))))))))
     nil))
@@ -195,7 +225,7 @@
                      (binding [*out* *err*]
                        (println (str "Error loading " ns-sym ": " text)))
                      (when (= :edn format)
-                       (println (str edn-prefix "\t" (pr-str {:load-error (str ns-sym) :message text})))))
+                       (emit-edn! {:load-error (str ns-sym) :message text})))
                    [loaded (conj errors ns-sym)])))
           [[] []]
           ns-syms))
@@ -285,22 +315,25 @@
     (println (str (if (zero? (+ fail error)) "PASS" "FAIL") ": " test " tests, "
                   (+ pass fail error) " assertions, " fail " failures, " error " errors (" ms " ms)"))))
 
-(defn- watch-dirs [dirs]
-  (let [cwd (Environment/CurrentDirectory)]
-    (->> (concat dirs [(test-dir)])
-         (map #(Path/GetFullPath (Path/Combine cwd %)))
-         (filter #(Directory/Exists %))
-         distinct)))
+(defn watch-dirs
+  "The existing ones of dirs (relative to the project directory) and, with
+   tests? (the default), the test directory, as absolute paths."
+  ([dirs] (watch-dirs dirs true))
+  ([dirs tests?]
+   (let [cwd (Environment/CurrentDirectory)]
+     (->> (concat dirs (when tests? [(test-dir)]))
+          (map #(Path/GetFullPath (Path/Combine cwd %)))
+          (filter #(Directory/Exists %))
+          distinct))))
 
-(defn watch
-  "Runs all tests, then waits for changes to Clojure files in dirs (and the
-   test directory). On each change it reloads the changed namespaces and
-   everything loaded that depends on them, and runs the tests in the
-   affected test namespaces. Runs until the process is stopped."
-  [dirs]
-  (add-test-dir-to-load-path!)
-  (let [dirs (watch-dirs dirs)
-        changes (atom #{})
+(defn watch-changes
+  "Watches the Clojure files in dirs and, whenever some changed (after the
+   editor has finished writing), reloads the changed namespaces and every
+   loaded namespace that depends on them, in dependency order, then calls
+   (on-reload {:changed #{file} :reloaded [ns] :error text-or-nil}).
+   Blocks until the process is stopped."
+  [dirs on-reload]
+  (let [changes (atom #{})
         signal (ManualResetEventSlim. false)
         on-change (fn [^String path]
                     (when (source-file? path)
@@ -315,11 +348,7 @@
                        (.add_Created (gen-delegate FileSystemEventHandler [_ e] (on-change (.FullPath e))))
                        (.add_Deleted (gen-delegate FileSystemEventHandler [_ e] (on-change (.FullPath e))))
                        (.add_Renamed (gen-delegate RenamedEventHandler [_ e] (on-change (.FullPath e))))
-                       (-> .-EnableRaisingEvents (set! true)))))
-        started (DateTime/UtcNow)]
-    (println (str "Watching " (str/join ", " dirs) " (Ctrl-C to stop)"))
-    (print-summary (run :none []) started)
-    (flush)
+                       (-> .-EnableRaisingEvents (set! true)))))]
     (loop []
       ;; Nothing else refers to the watchers; collected, they stop reporting.
       (GC/KeepAlive watchers)
@@ -329,21 +358,42 @@
         (.Reset signal)
         (when (.Wait signal 150) (recur)))
       (let [changed (first (reset-vals! changes #{}))
-            started (DateTime/UtcNow)
             entries (vec (incremental/project-namespaces dirs))
             changed-ns (set (map :ns (filter #(changed (Path/GetFullPath ^String (:file %))) entries)))
             ;; Changed namespaces, and loaded namespaces that depend on them
             affected (set (filter (fn [ns] (or (changed-ns ns) (find-ns ns)))
                                   (incremental/stale-closure entries changed-ns)))
             by-ns (into {} (map (juxt :ns identity)) entries)
-            order (keep by-ns (topological entries affected))
-            tests (filter #(test-file? (:file (by-ns %))) (map :ns order))]
-        (println)
-        (println (str "Changed: " (str/join " " (map #(Path/GetFileName ^String %) (sort changed)))))
-        (if-let [error (reload! order)]
-          (binding [*out* *err*] (println error))
-          (if (seq tests)
-            (print-summary (with-reporting :none #(apply t/run-tests tests)) started)
-            (println "No tests depend on the changed files.")))
+            order (vec (keep by-ns (topological entries affected)))]
+        (on-reload {:changed changed
+                    :reloaded (mapv :ns order)
+                    :entries order
+                    :error (reload! order)})
         (flush)
         (recur)))))
+
+(defn watch
+  "Runs all tests, then waits for changes to Clojure files in dirs (and the
+   test directory). On each change it reloads the changed namespaces and
+   everything loaded that depends on them, and runs the tests in the
+   affected test namespaces. Runs until the process is stopped."
+  [dirs]
+  (add-test-dir-to-load-path!)
+  (let [dirs (watch-dirs dirs)
+        suffix (test-suffix)
+        started (DateTime/UtcNow)]
+    (println (str "Watching " (str/join ", " dirs) " (Ctrl-C to stop)"))
+    (print-summary (run :none []) started)
+    (flush)
+    (watch-changes
+      dirs
+      (fn [{:keys [changed entries error]}]
+        (let [started (DateTime/UtcNow)
+              tests (map :ns (filter #(test-file? suffix (:file %)) entries))]
+          (println)
+          (println (str "Changed: " (str/join " " (map #(Path/GetFileName ^String %) (sort changed)))))
+          (if error
+            (binding [*out* *err*] (println error))
+            (if (seq tests)
+              (print-summary (with-reporting :none #(apply t/run-tests tests)) started)
+              (println "No tests depend on the changed files."))))))))

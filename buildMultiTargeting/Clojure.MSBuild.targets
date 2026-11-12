@@ -1,0 +1,38 @@
+<Project>
+  <!-- Imported (instead of build/) into the outer build of a project with several
+       TargetFrameworks. The Clojure targets live in the per-framework builds; these
+       forward `dotnet msbuild /t:clj-...` to one of them: ClojureTargetFramework, or the
+       first of TargetFrameworks. -->
+
+  <Target Name="_ClojureForwardInit">
+    <ItemGroup>
+      <_ClojureTargetFrameworkItem Include="$(TargetFrameworks)" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_ClojureForwardTfm>$(ClojureTargetFramework)</_ClojureForwardTfm>
+      <_ClojureForwardTfm Condition="'$(_ClojureForwardTfm)' == ''">@(_ClojureTargetFrameworkItem->Trim())</_ClojureForwardTfm>
+      <_ClojureForwardTfm Condition="$(_ClojureForwardTfm.Contains(';'))">$(_ClojureForwardTfm.Substring(0, $(_ClojureForwardTfm.IndexOf(';'))))</_ClojureForwardTfm>
+    </PropertyGroup>
+    <Message Importance="high" Text="Running the Clojure target for $(_ClojureForwardTfm) (set ClojureTargetFramework to pick another)" />
+  </Target>
+
+  <Target Name="clj-repl" DependsOnTargets="_ClojureForwardInit">
+    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="clj-repl" Properties="TargetFramework=$(_ClojureForwardTfm)" />
+  </Target>
+  <Target Name="clj-nrepl" DependsOnTargets="_ClojureForwardInit">
+    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="clj-nrepl" Properties="TargetFramework=$(_ClojureForwardTfm)" />
+  </Target>
+  <Target Name="clj-run" DependsOnTargets="_ClojureForwardInit">
+    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="clj-run" Properties="TargetFramework=$(_ClojureForwardTfm)" />
+  </Target>
+  <Target Name="clj-dev" DependsOnTargets="_ClojureForwardInit">
+    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="clj-dev" Properties="TargetFramework=$(_ClojureForwardTfm)" />
+  </Target>
+  <Target Name="clj-test" DependsOnTargets="_ClojureForwardInit">
+    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="clj-test" Properties="TargetFramework=$(_ClojureForwardTfm)" />
+  </Target>
+  <Target Name="ClojureTest" DependsOnTargets="clj-test" />
+  <Target Name="clj-test-watch" DependsOnTargets="_ClojureForwardInit">
+    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="clj-test-watch" Properties="TargetFramework=$(_ClojureForwardTfm)" />
+  </Target>
+</Project>

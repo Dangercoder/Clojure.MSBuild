@@ -1,0 +1,49 @@
+(ns clojure.msbuild.test-adapter-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.msbuild.test-adapter :as adapter]))
+
+(def sample
+  "(ns my.app-test
+  (:require [clojure.test :as t :refer [deftest is]]
+            [my.model :as model]))
+
+(deftest plain
+  (is (= ::model/todo ::model/todo)))
+
+(t/deftest qualified (is true))
+
+#_(deftest dropped (is false))
+
+(comment
+  (deftest in-a-comment (is false)))
+
+(when true
+  (deftest nested (is true)))
+
+(defmacro make-test [n] `(deftest ~n (is true)))
+
+(defspec a-property 10 (prop/for-all [x gen/int] true))
+")
+
+(deftest finds-tests-with-the-reader
+  (let [{:keys [ns tests]} (adapter/tests-in-source sample)]
+    (is (= "my.app-test" ns))
+    (is (= [["plain" 5] ["qualified" 8] ["nested" 16] ["a-property" 20]] tests))))
+
+(deftest falls-back-to-regular-expressions
+  (let [broken "(ns broken-test (:require [clojure.test :refer :all]))\n\n(deftest one (is (= 1 1)))\n\n(deftest two (is (= 1 1)\n"
+        {:keys [ns tests]} (adapter/tests-in-source broken)]
+    (is (= "broken-test" ns))
+    (is (= [["one" 3] ["two" 5]] tests))))
+
+(deftest quoting
+  (is (= "plain" (adapter/quote-arg "plain")))
+  (is (= "\"with space\"" (adapter/quote-arg "with space")))
+  (is (= "\"\"" (adapter/quote-arg "")))
+  (is (= "\"a\\\"b\"" (adapter/quote-arg "a\"b"))))
+
+(deftest settings
+  (is (= {:timeout-ms 30000}
+         (adapter/run-settings "<RunSettings><ClojureTest><TimeoutSeconds> 30 </TimeoutSeconds></ClojureTest></RunSettings>")))
+  (is (= {:timeout-ms nil} (adapter/run-settings "<RunSettings><RunConfiguration /></RunSettings>")))
+  (is (= {:timeout-ms nil} (adapter/run-settings nil))))

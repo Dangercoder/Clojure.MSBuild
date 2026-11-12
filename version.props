@@ -1,0 +1,8 @@
+<Project>
+  <!-- The version of all three packages (Clojure.MSBuild, Clojure.MSBuild.TestAdapter and
+       Clojure.MSBuild.Templates). scripts/set-version.sh changes it here and in the
+       package references of the templates, the examples and the README. -->
+  <PropertyGroup>
+    <Version>0.0.11</Version>
+  </PropertyGroup>
+</Project>

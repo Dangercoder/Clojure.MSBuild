@@ -1,0 +1,98 @@
+(ns clojure.msbuild.diagnostics
+  "Errors and warnings in MSBuild's canonical format,
+
+     path(line,column): error CLJ0001: message
+
+   which MSBuild's Exec task recognises in the output of the tooling, so
+   that `dotnet build`, Visual Studio, Rider and VS Code list Clojure
+   compile errors as errors with a location you can jump to."
+  (:require [clojure.string :as str])
+  (:import [System Environment Exception]
+           [System.IO File Path]
+           [clojure.lang RT]))
+
+(def codes
+  {:compile "CLJ0001"
+   :git-deps "CLJ0002"
+   :config "CLJ0003"
+   :library "CLJ0004"})
+
+(defn exception-chain
+  "e and its inner exceptions, outermost first."
+  [^Exception e]
+  (take-while some? (iterate #(.InnerException ^Exception %) e)))
+
+(defn root-cause ^Exception [^Exception e]
+  (last (exception-chain e)))
+
+(defn- error-data [^Exception e]
+  (try (ex-data e) (catch Exception _ nil)))
+
+(defn location
+  "{:file :line :column} of the innermost compiler exception in e's chain
+   that knows its line, or nil. The innermost one is the most precise (an
+   error in a macro expansion is wrapped by the form that used the macro)."
+  [^Exception e]
+  (->> (exception-chain e)
+       (keep (fn [ex]
+               (let [d (error-data ex)
+                     line (:clojure.error/line d)]
+                 (when (and (:clojure.error/source d) (number? line) (pos? line))
+                   {:file (str (:clojure.error/source d))
+                    :line (long line)
+                    :column (let [c (:clojure.error/column d)] (if (number? c) (long c) 0))}))))
+       last))
+
+(defn resolve-file
+  "An absolute path for a source file named by the compiler, which can be
+   relative to the load path (acme/core.cljr) or to the current directory."
+  [^String file]
+  (cond
+    (str/blank? file) nil
+    (and (Path/IsPathRooted file) (File/Exists file)) file
+    :else (or (some-> (try (RT/FindFile file) (catch Exception _ nil)) (.FullName))
+              (let [f (Path/GetFullPath (Path/Combine (Environment/CurrentDirectory) file))]
+                (when (File/Exists f) f))
+              file)))
+
+(defn message
+  "The most useful message of an exception: the root cause's, prefixed with
+   its type unless it is a plain Exception or ExceptionInfo."
+  [^Exception e]
+  (let [cause (root-cause e)
+        type-name (.Name (.GetType cause))
+        msg (or (not-empty (.Message cause)) type-name)]
+    (if (#{"Exception" "ExceptionInfo" "CompilerException"} type-name)
+      msg
+      (str type-name ": " msg))))
+
+(defn format-line
+  "One canonical diagnostic line. severity is :error or :warning; kind one of
+   the keys of codes; loc an optional {:file :line :column}."
+  [severity kind loc ^String text]
+  (let [[first-line & more] (str/split-lines (or (not-empty text) "unknown error"))
+        origin (if-let [file (:file loc)]
+                 (str (resolve-file file)
+                      (when (pos? (or (:line loc) 0))
+                        (str "(" (:line loc)
+                             (when (pos? (or (:column loc) 0)) (str "," (:column loc)))
+                             ")")))
+                 "Clojure.MSBuild ")]
+    (str/join "\n" (cons (str origin ": " (name severity) " " (codes kind "CLJ0000") ": " first-line)
+                         (map #(str "  " %) more)))))
+
+(defn report!
+  "Prints a canonical diagnostic to stderr."
+  ([severity kind text] (report! severity kind nil text))
+  ([severity kind loc text]
+   (binding [*out* *err*]
+     (println (format-line severity kind loc text))
+     (flush))))
+
+(defn report-exception!
+  "Prints a canonical diagnostic for exception e, located at the compiler
+   error's source position when there is one. context (e.g. \"compiling
+   acme.core\") is put in front of the message."
+  [severity kind context ^Exception e]
+  (report! severity kind (location e)
+           (str (when context (str context ": ")) (message e))))

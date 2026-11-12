@@ -15,11 +15,11 @@
    reported individually with its failures, stack trace and output."
   (:require [clojure.string :as str]
             [clojure.edn :as edn])
-  (:import [System Uri DateTimeOffset TimeSpan Environment]
+  (:import [System Uri DateTimeOffset TimeSpan Environment Guid Int64]
            [System.Diagnostics Process ProcessStartInfo]
-           [System.IO Directory Path File SearchOption]
+           [System.IO Directory Path File SearchOption StringReader]
            [System.Text StringBuilder]
-           [System.Text.RegularExpressions Regex RegexOptions]
+           [System.Text.RegularExpressions Regex RegexOptions Match]
            [Microsoft.VisualStudio.TestPlatform.ObjectModel
             TestCase TestResult TestOutcome TestResultMessage
             FileExtensionAttribute DefaultExecutorUriAttribute ExtensionUriAttribute]
@@ -69,8 +69,11 @@
 
 (defn- test-dir [source]
   (when-let [{:keys [project-dir test-dir]} (project-config source)]
-    (let [dir (Path/Combine ^String project-dir (or test-dir "test"))]
+    (let [dir (Path/Combine ^String project-dir (or (not-empty test-dir) "test"))]
       (when (Directory/Exists dir) dir))))
+
+(defn- test-suffix [source]
+  (or (not-empty (:test-suffix (project-config source))) "_test"))
 
 (defn- file->ns-name [test-dir test-file]
   (let [relative (Path/GetRelativePath test-dir test-file)
@@ -79,16 +82,105 @@
         (.Replace (char Path/DirectorySeparatorChar) \.)
         (.Replace \_ \-))))
 
+;; ── Finding tests: with the reader ───────────────────────────────
+
+(def ^:private test-macros #{"deftest" "defspec"})
+
+;; ::alias/kw needs the alias to be known to read; the resolver accepts any
+;; alias without creating namespaces in the test host process.
+(def ^:private reader-resolver
+  (reify clojure.lang.LispReader+Resolver
+    (CurrentNS [_] 'user)
+    (ResolveClass [_ sym] sym)
+    (ResolveAlias [_ sym] sym)
+    (ResolveVar [_ sym] sym)))
+
+(defn read-forms
+  "All top-level forms of a source string, with :line metadata. Nothing is
+   evaluated. Throws if the source cannot be read."
+  [^String content]
+  (let [rdr (clojure.lang.LineNumberingTextReader. (StringReader. content))
+        resolver-var (resolve 'clojure.core/*reader-resolver*)]
+    (with-bindings (cond-> {#'*read-eval* false
+                            #'*default-data-reader-fn* (fn [_ v] v)}
+                     resolver-var (assoc resolver-var reader-resolver))
+      (loop [forms []]
+        (let [form (read {:read-cond :allow :features #{:cljr} :eof ::eof} rdr)]
+          (if (= ::eof form)
+            forms
+            (recur (conj forms form))))))))
+
+(defn- form-head [form]
+  (when (and (seq? form) (symbol? (first form)))
+    (name (first form))))
+
+(defn find-tests
+  "{:ns name-or-nil :tests [[name line] ...]} of source forms: deftest and
+   defspec forms (also qualified, e.g. t/deftest), at the top level or
+   inside other forms such as when, but not inside comment, quote or a
+   macro definition. #_ forms are dropped by the reader."
+  [forms]
+  (let [ns-form (first (filter #(= "ns" (form-head %)) forms))
+        tests (atom [])]
+    (letfn [(walk [form]
+              (when (seq? form)
+                (let [head (form-head form)]
+                  (cond
+                    (#{"comment" "quote" "defmacro"} head) nil
+                    (and (test-macros head) (symbol? (second form)))
+                    (swap! tests conj [(name (second form)) (or (:line (meta form)) 1)])
+                    :else (run! walk form)))))]
+      (run! walk forms))
+    {:ns (when (symbol? (second ns-form)) (str (second ns-form)))
+     :tests @tests}))
+
+;; ── Finding tests: with regular expressions (unreadable files) ───
+
 (def ^:private ns-pattern
   (Regex. "^\\s*\\(ns\\s+(?:\\^(?:\\{[^}]*\\}|\\S+)\\s+)*([^\\s()\\[\\]{}]+)" RegexOptions/Multiline))
 
 ;; deftest/defspec forms that are not commented out with #_
 (def ^:private test-pattern
-  (Regex. "(?<!#_\\s*)\\((?:deftest|defspec)\\s+(?:\\^(?:\\{[^}]*\\}|\\S+)\\s+)*([^\\s()\\[\\]{}]+)"))
+  (Regex. "(?<!#_\\s*)\\((?:[\\w.\\-]+/)?(?:deftest|defspec)\\s+(?:\\^(?:\\{[^}]*\\}|\\S+)\\s+)*([^\\s()\\[\\]{}]+)"))
 
-(defn- test-files [dir]
-  (mapcat #(Directory/GetFiles dir % SearchOption/AllDirectories)
-          ["*_test.cljr" "*_test.cljc" "*_test.clj"]))
+(defn- line-starts
+  "Indexes at which the lines of content start."
+  [^String content]
+  (loop [i 0 starts [0]]
+    (let [j (.IndexOf content \newline i)]
+      (if (neg? j) starts (recur (inc j) (conj starts (inc j)))))))
+
+(defn- line-of
+  "The 1-based line of index: the number of line starts at or before it."
+  [starts index]
+  (loop [lo 0 hi (count starts)]
+    (if (< lo hi)
+      (let [mid (quot (+ lo hi) 2)]
+        (if (<= (nth starts mid) index) (recur (inc mid) hi) (recur lo mid)))
+      lo)))
+
+(defn find-tests-by-regex
+  "Like find-tests, for a file the reader cannot read (e.g. a syntax error:
+   its tests are still listed, and then fail with the compiler error)."
+  [^String content]
+  (let [ns-match (.Match ^Regex ns-pattern content)
+        starts (line-starts content)]
+    {:ns (when (.Success ns-match) (.Value (.get_Item (.Groups ns-match) 1)))
+     :tests (vec (for [^Match m (.Matches ^Regex test-pattern content)]
+                   [(str (.Value (.get_Item (.Groups m) 1))) (line-of starts (.Index m))]))}))
+
+(defn tests-in-source
+  "{:ns :tests} of a source string, with the reader when it can read it."
+  [^String content]
+  (try (find-tests (read-forms content))
+       (catch Exception _ (find-tests-by-regex content))))
+
+(defn- test-files [dir suffix]
+  (->> [".cljr" ".cljc" ".clj"]
+       (mapcat (fn [ext]
+                 (filter #(.EndsWith ^String % (str suffix ext))
+                         (Directory/GetFiles dir (str "*" suffix ext) SearchOption/AllDirectories))))
+       distinct))
 
 (defn discover-test-cases
   "Scans the project's test directory and returns a map of
@@ -96,23 +188,16 @@
   [source]
   (if-let [dir (test-dir source)]
     (into {}
-      (for [test-file (test-files dir)
-            :let [content (File/ReadAllText test-file)
-                  ns-match (.Match ns-pattern content)
-                  ns-name (if (.Success ns-match)
-                            (.Value (.get_Item (.Groups ns-match) 1))
-                            (file->ns-name dir test-file))]
-            m (.Matches test-pattern content)
-            :let [test-name (str (.Value (.get_Item (.Groups m) 1)))
-                  line-num (-> (.Substring content 0 (.Index m))
-                               (.Split (char-array "\n"))
-                               count)
-                  full-name (str ns-name "/" test-name)
+      (for [test-file (test-files dir (test-suffix source))
+            :let [{:keys [ns tests]} (tests-in-source (File/ReadAllText test-file))
+                  ns-name (or ns (file->ns-name dir test-file))]
+            [test-name line-num] (distinct tests)
+            :let [full-name (str ns-name "/" test-name)
                   test-case (TestCase. full-name executor-uri source)]]
         (do
           (set! (.-DisplayName test-case) test-name)
           (set! (.-CodeFilePath test-case) test-file)
-          (set! (.-LineNumber test-case) line-num)
+          (set! (.-LineNumber test-case) (int line-num))
           (.Add (.-Traits test-case) "Namespace" ns-name)
           [full-name test-case])))
     {}))
@@ -131,41 +216,87 @@
 (defn- result-line? [^String line]
   (.StartsWith line result-prefix))
 
+(defn quote-arg
+  "One command-line argument, quoted for a Windows-style command line (the
+   form LaunchProcessWithDebuggerAttached takes)."
+  [^String a]
+  (if (and (seq a) (not (re-find #"[\s\"]" a)))
+    a
+    (str "\"" (-> a (str/replace #"(\\*)\"" "$1$1\\\"") (str/replace #"(\\+)$" "$1$1")) "\"")))
+
+(defn- kill-tree! [^Process p]
+  (try (when-not (.HasExited p) (.Kill p true)) (catch Exception _)))
+
 (defn- run-process
   "Runs the test assembly with the given --clj-mode arguments, streaming its
-   output to the framework handle. Returns {:exit :output :errors}."
-  [assembly args project-dir ^IFrameworkHandle framework-handle]
-  (let [start-info (doto (ProcessStartInfo.)
-                     (-> .-FileName (set! (dotnet-host)))
-                     (-> .-WorkingDirectory (set! project-dir))
-                     (-> .-RedirectStandardOutput (set! true))
-                     (-> .-RedirectStandardError (set! true))
-                     (-> .-UseShellExecute (set! false))
-                     (-> .-CreateNoWindow (set! true)))
-        _ (doseq [a (concat [assembly "--clj-mode"] args)]
-            (.Add (.ArgumentList start-info) a))
-        _ (.set_Item (.Environment start-info) "CLOJURE_MSBUILD_TEST_FORMAT" "edn")
+   output to the framework handle. Returns {:exit :output :errors :results-file
+   :timed-out? :cancelled?}.
+
+   The test runner also appends its result lines to results-file, which is
+   what is read when it exists: the output can interleave a line with what a
+   test printed, and under a debugger it is not captured at all.
+
+   opts: :debug? (start through the IDE's debugger), :timeout-ms (kill the
+   process after that), :state (the adapter's state atom; the process is
+   kept there so that Cancel can kill it)."
+  [assembly args project-dir ^IFrameworkHandle framework-handle {:keys [debug? timeout-ms state]}]
+  (let [results-file (Path/Combine (Path/GetTempPath) (str "clojure-tests-" (Guid/NewGuid) ".edn"))
+        env {"CLOJURE_MSBUILD_TEST_FORMAT" "edn"
+             "CLOJURE_MSBUILD_TEST_RESULTS" results-file}
+        argv (concat [assembly "--clj-mode"] args)
         output (StringBuilder.)
         errors (StringBuilder.)
-        process (Process/Start start-info)]
-    (.add_OutputDataReceived process
-      (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
-        (when-let [data (.-Data e)]
-          (locking output (.AppendLine output data))
-          (when-not (or (String/IsNullOrEmpty data) (result-line? data))
-            (.SendMessage framework-handle TestMessageLevel/Informational data)))))
-    (.add_ErrorDataReceived process
-      (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
-        (when-let [data (.-Data e)]
-          (locking errors (.AppendLine errors data))
-          (when-not (String/IsNullOrEmpty data)
-            (.SendMessage framework-handle TestMessageLevel/Warning data)))))
-    (.BeginOutputReadLine process)
-    (.BeginErrorReadLine process)
-    (.WaitForExit process)
-    {:exit (.ExitCode process)
+        ^Process process
+        (if debug?
+          (let [vars (|System.Collections.Generic.Dictionary`2[System.String,System.String]|.)]
+            (doseq [[k v] env] (.set_Item vars k v))
+            (let [pid (.LaunchProcessWithDebuggerAttached framework-handle (dotnet-host) project-dir
+                                                          (str/join " " (map quote-arg argv)) vars)]
+              (try (Process/GetProcessById pid) (catch Exception _ nil))))
+          (let [start-info (doto (ProcessStartInfo.)
+                             (-> .-FileName (set! (dotnet-host)))
+                             (-> .-WorkingDirectory (set! project-dir))
+                             (-> .-RedirectStandardOutput (set! true))
+                             (-> .-RedirectStandardError (set! true))
+                             (-> .-UseShellExecute (set! false))
+                             (-> .-CreateNoWindow (set! true)))]
+            (doseq [a argv] (.Add (.ArgumentList start-info) a))
+            (doseq [[k v] env] (.set_Item (.Environment start-info) k v))
+            (let [p (Process/Start start-info)]
+              (.add_OutputDataReceived p
+                (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
+                  (when-let [data (.-Data e)]
+                    (locking output (.AppendLine output data))
+                    (when-not (or (String/IsNullOrEmpty data) (result-line? data))
+                      (.SendMessage framework-handle TestMessageLevel/Informational data)))))
+              (.add_ErrorDataReceived p
+                (gen-delegate System.Diagnostics.DataReceivedEventHandler [s e]
+                  (when-let [data (.-Data e)]
+                    (locking errors (.AppendLine errors data))
+                    (when-not (String/IsNullOrEmpty data)
+                      (.SendMessage framework-handle TestMessageLevel/Warning data)))))
+              (.BeginOutputReadLine p)
+              (.BeginErrorReadLine p)
+              p)))
+        _ (when state (swap! state assoc :process process))
+        exited? (cond
+                  (nil? process) true
+                  timeout-ms (.WaitForExit process (int timeout-ms))
+                  :else (do (.WaitForExit process) true))]
+    (when-not exited?
+      (kill-tree! process)
+      (.WaitForExit process))
+    (when (and process exited? (not debug?))
+      ;; drain the asynchronous output readers
+      (.WaitForExit process))
+    (when state (swap! state assoc :process nil))
+    {:exit (when (and process (not debug?)) (try (.ExitCode process) (catch Exception _ nil)))
      :output (locking output (.ToString output))
-     :errors (locking errors (.ToString errors))}))
+     :errors (locking errors (.ToString errors))
+     :results-file results-file
+     :timed-out? (not exited?)
+     :timeout-ms timeout-ms
+     :cancelled? (boolean (and state (:cancelled? @state)))}))
 
 (defn- parse-results
   "Parses the result lines into {:results {\"ns/name\" result} :load-errors
@@ -245,15 +376,24 @@
 
 (defn- missing-result
   "The result of an expected test that reported nothing: its namespace did
-   not load, the process failed, or (after a clean run) the test does not
-   exist, e.g. a deftest the discovery regex found in a comment."
-  [full-name {:keys [exit errors]} load-errors]
+   not load, the run was cancelled or timed out, the process failed, or
+   (after a clean run) the test does not exist, e.g. one that a macro only
+   defines under some condition."
+  [full-name {:keys [exit errors timed-out? timeout-ms cancelled?]} load-errors]
   (let [ns-name (subs full-name 0 (max 0 (.IndexOf ^String full-name "/")))]
     (cond
       (load-errors ns-name)
       {:outcome "fail" :ms 0 :message (str "Could not load " ns-name ":\n" (load-errors ns-name))}
 
-      (zero? exit)
+      cancelled?
+      {:outcome "skip" :ms 0 :message "The test run was cancelled"}
+
+      timed-out?
+      {:outcome "fail" :ms 0
+       :message (str "The test run was stopped after " (quot timeout-ms 1000)
+                     " s (ClojureTest/TimeoutSeconds in the run settings, or CLOJURE_MSBUILD_TEST_TIMEOUT) before this test reported a result")}
+
+      (or (nil? exit) (zero? exit))
       {:outcome "not-found" :ms 0 :message "The test run completed without running this test"}
 
       :else
@@ -262,13 +402,34 @@
        :message (str "No result was reported for this test (test process exited with code " exit ")"
                      (when-not (str/blank? errors) (str ":\n" (str/trim errors))))})))
 
+(defn- read-results-file [^String file]
+  (when (File/Exists file)
+    (try (let [text (File/ReadAllText file)]
+           (when-not (str/blank? text) text))
+         (catch Exception _ nil)
+         (finally (try (File/Delete file) (catch Exception _))))))
+
+(defn run-settings
+  "{:timeout-ms ..} from the run settings XML (<RunSettings><ClojureTest>
+   <TimeoutSeconds>60</TimeoutSeconds></ClojureTest>) or the
+   CLOJURE_MSBUILD_TEST_TIMEOUT environment variable (seconds)."
+  [^String settings-xml]
+  (let [from-xml (when settings-xml
+                   (some->> (re-find #"(?s)<ClojureTest>.*?<TimeoutSeconds>\s*(\d+)\s*</TimeoutSeconds>.*?</ClojureTest>" settings-xml)
+                            second))
+        from-env (some->> (Environment/GetEnvironmentVariable "CLOJURE_MSBUILD_TEST_TIMEOUT")
+                          (re-matches #"\s*(\d+)\s*") second)
+        seconds (some-> (or from-xml from-env) Int64/Parse)]
+    {:timeout-ms (when (and seconds (pos? seconds)) (* 1000 seconds))}))
+
 (defn- run-and-record!
   "Runs the process and records one result per expected test case. With
-   report-extra?, tests that ran but were not discovered (e.g. new files) are
-   reported as well."
-  [assembly args project-dir framework-handle expected-cases report-extra?]
-  (let [{:keys [exit errors output] :as run} (run-process assembly args project-dir framework-handle)
-        {:keys [results load-errors]} (parse-results output)]
+   report-extra?, tests that ran but were not discovered (e.g. generated by
+   a macro) are reported as well."
+  [assembly args project-dir framework-handle expected-cases report-extra? opts]
+  (let [{:keys [exit errors output results-file] :as run}
+        (run-process assembly args project-dir framework-handle opts)
+        {:keys [results load-errors]} (parse-results (or (read-results-file results-file) output))]
     (doseq [[full-name ^TestCase test-case] expected-cases]
       (record-result! framework-handle test-case
                       (or (results full-name) (missing-result full-name run load-errors))))
@@ -279,14 +440,15 @@
       (when-let [file (:file result)] (set! (.-CodeFilePath test-case) file))
       (when-let [line (:line result)] (set! (.-LineNumber test-case) (int line)))
       (record-result! framework-handle test-case result))
-    (when (and (empty? results) (not= 0 exit))
+    (when (and (empty? results) exit (not= 0 exit))
       (.SendMessage framework-handle TestMessageLevel/Error
         (str "Test run failed with exit code " exit ": " errors)))))
 
 ;; ── Adapter implementation ───────────────────────────────────────
 
+;; state: an atom {:cancelled? bool :process the running test process}
 (defn adapter-init []
-  [[] (atom false)])
+  [[] (atom {:cancelled? false :process nil})])
 
 ;; ITestDiscoverer.DiscoverTests
 (defn adapter-DiscoverTests [this sources discovery-context ^IMessageLogger logger ^ITestCaseDiscoverySink discovery-sink]
@@ -298,34 +460,43 @@
     (doseq [[_ test-case] cases]
       (.SendTestCase discovery-sink test-case))))
 
-;; ITestExecutor.Cancel
+;; ITestExecutor.Cancel: stop the running test process too
 (defn adapter-Cancel [this]
-  (reset! (.state this) true))
+  (let [{:keys [process]} (swap! (.state this) assoc :cancelled? true)]
+    (when process (kill-tree! process))))
+
+(defn- run-options [this ^IRunContext run-context]
+  (merge {:state (.state this)
+          :debug? (boolean (try (.IsBeingDebugged run-context) (catch Exception _ false)))}
+         (run-settings (try (some-> run-context .RunSettings .SettingsXml) (catch Exception _ nil)))))
 
 ;; ITestExecutor.RunTests (handles both overloads via type dispatch)
-(defn adapter-RunTests [this sources-or-tests run-context ^IFrameworkHandle framework-handle]
-  (let [cancelled? (.state this)
+(defn adapter-RunTests [this sources-or-tests ^IRunContext run-context ^IFrameworkHandle framework-handle]
+  (swap! (.state this) assoc :cancelled? false)
+  (let [state (.state this)
+        cancelled? #(:cancelled? @state)
+        opts (run-options this run-context)
         first-item (first sources-or-tests)]
     (if (instance? TestCase first-item)
       ;; Overload: RunTests(IEnumerable<TestCase>, ...) - only the selected tests
       (doseq [[source tests] (group-by (fn [^TestCase t] (.Source t)) sources-or-tests)
-              :when (not @cancelled?)
+              :when (not (cancelled?))
               :let [expected (into {} (map (fn [^TestCase t] [(.FullyQualifiedName t) t]) tests))]]
-        (run-and-record! source (cons "test-vars" (keys expected)) (project-dir source) framework-handle expected false))
+        (run-and-record! source (cons "test-vars" (keys expected)) (project-dir source) framework-handle expected false opts))
 
       ;; Overload: RunTests(IEnumerable<string>, ...) - whole assemblies, honouring --filter
       (doseq [source sources-or-tests
-              :when (not @cancelled?)
+              :when (not (cancelled?))
               :when (test-dir source)
               :let [discovered (discover-test-cases source)
                     selected (apply-filter run-context discovered)]]
         (cond
           (= (count selected) (count discovered))
-          (run-and-record! source ["test"] (project-dir source) framework-handle discovered true)
+          (run-and-record! source ["test"] (project-dir source) framework-handle discovered true opts)
 
           (seq selected)
           (run-and-record! source (cons "test-vars" (keys selected))
-                           (project-dir source) framework-handle selected false)
+                           (project-dir source) framework-handle selected false opts)
 
           :else
           (.SendMessage framework-handle TestMessageLevel/Informational

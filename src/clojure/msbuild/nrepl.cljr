@@ -61,52 +61,104 @@
       (File/Delete file))
     (catch Exception _)))
 
+(defn middleware-xform
+  "The server's transducer: clojure.tools.nrepl's default middleware plus
+   the middleware named by extra, qualified symbols of vars (strings work
+   too). A var may hold one middleware or a collection of middleware vars
+   (like default-middleware); each namespace is required first."
+  [extra]
+  (let [default @(resolve 'clojure.tools.nrepl.server.middleware/default-middleware)
+        ->xform @(resolve 'clojure.tools.nrepl.server.middleware/middleware->xform)
+        extra-vars (for [s extra
+                         :let [sym (symbol (str s))]
+                         :when (namespace sym)
+                         :let [_ (require (symbol (namespace sym)))
+                               v (or (resolve sym)
+                                     (throw (Exception. (str "nREPL middleware " sym " not found"))))]
+                         m (if (coll? @v) @v [v])]
+                     m)]
+    (if (seq extra-vars)
+      (->xform (into (set default) extra-vars))
+      @(resolve 'clojure.tools.nrepl.server.middleware/default-xform))))
+
+(defn parse-middleware
+  "Middleware symbols from a string separated by ; , or whitespace."
+  [s]
+  (when s
+    (vec (remove empty? (map #(.Trim ^String %) (.Split (str s) (char-array ";, \t\n")))))))
+
 (defn start!
   "Starts the server. Returns {:port :listeners :stop}. Throws if
-   clojure.tools.nrepl is not available."
-  [port]
-  (require 'clojure.tools.nrepl.impl.server 'clojure.tools.nrepl.server.middleware)
-  (let [listen (resolve 'clojure.tools.nrepl.impl.server/listen)
-        xform @(resolve 'clojure.tools.nrepl.server.middleware/default-xform)
-        listeners (open-listeners port)
-        port (local-port (first listeners))
-        ctx {:sessions (atom #{})}
-        opts {:xform xform}]
-    (doseq [l listeners]
-      (future (listen ctx l opts)))
-    {:port port
-     :listeners listeners
-     :stop (fn [] (doseq [^TcpListener l listeners] (.Stop l)))}))
+   clojure.tools.nrepl is not available. middleware: see middleware-xform."
+  ([port] (start! port nil))
+  ([port middleware]
+   (require 'clojure.tools.nrepl.impl.server 'clojure.tools.nrepl.server.middleware)
+   (let [listen (resolve 'clojure.tools.nrepl.impl.server/listen)
+         xform (middleware-xform middleware)
+         listeners (open-listeners port)
+         port (local-port (first listeners))
+         ctx {:sessions (atom #{})}
+         opts {:xform xform}]
+     (doseq [l listeners]
+       (future (listen ctx l opts)))
+     {:port port
+      :listeners listeners
+      :stop (fn [] (doseq [^TcpListener l listeners] (.Stop l)))})))
 
-(defn run
-  "Runs the nREPL server until the process is stopped (Ctrl-C)."
-  [port-arg]
-  (let [{:keys [port stop]}
-        (try (start! (parse-port port-arg))
-             (catch Exception e
-               (binding [*out* *err*]
-                 (if (re-find #"clojure/tools/nrepl" (str (.Message e)))
-                   (do (println "clojure.tools.nrepl is not referenced by this project. Add it with:")
-                       (println "  dotnet add package clojure.tools.nrepl --prerelease"))
-                   (println (str "Could not start the nREPL server: " (.Message e)))))
-               (Environment/Exit 1)))
-        file (port-file)
-        done (ManualResetEventSlim. false)
-        cleanup (fn [] (remove-port-file! file port))]
+(defn- missing-nrepl? [^Exception e]
+  (boolean (re-find #"clojure/tools/nrepl|clojure\.tools\.nrepl" (str (.Message e)))))
+
+(defn- write-port-file! [port]
+  (let [file (port-file)]
     (File/WriteAllText file (str port))
     (.add_ProcessExit (AppDomain/CurrentDomain)
-                      (gen-delegate EventHandler [_ _] (cleanup)))
-    ;; Ctrl-C, kill and a closed terminal stop the server the same way.
-    ;; The registrations must stay reachable to stay registered.
-    (let [stop! (sys-action [PosixSignalContext] [ctx]
-                  (set! (.-Cancel ctx) true)
-                  (.Set done))]
-      (reset! signal-registrations
-              (vec (for [signal [PosixSignal/SIGINT PosixSignal/SIGTERM PosixSignal/SIGHUP]]
-                     (PosixSignalRegistration/Create signal stop!)))))
-    ;; The message nREPL clients (and editors' jack-in) look for
-    (println (str "nREPL server started on port " port " on host 127.0.0.1 - nrepl://127.0.0.1:" port))
-    (.Wait done)
-    (stop)
-    (cleanup)
-    (Environment/Exit 0)))
+                      (gen-delegate EventHandler [_ _] (remove-port-file! file port)))
+    file))
+
+(defn start-in-app!
+  "Starts the nREPL server inside the running application, next to its
+   -main (ClojureNReplInApp). Never fails the application: problems are
+   printed as warnings. Returns the server map or nil."
+  [port middleware]
+  (try
+    (let [{:keys [port] :as server} (start! (parse-port port) (parse-middleware middleware))]
+      (write-port-file! port)
+      (println (str "nREPL server started on port " port " on host 127.0.0.1 - nrepl://127.0.0.1:" port))
+      server)
+    (catch Exception e
+      (binding [*out* *err*]
+        (if (missing-nrepl? e)
+          (println "warning: ClojureNReplInApp is on, but clojure.tools.nrepl is not referenced (dotnet add package clojure.tools.nrepl --prerelease)")
+          (println (str "warning: could not start the nREPL server: " (.Message e)))))
+      nil)))
+
+(defn run
+  "Runs the nREPL server until the process is stopped (Ctrl-C).
+   middleware: see middleware-xform (a string, separated by ; or ,)."
+  ([port-arg] (run port-arg nil))
+  ([port-arg middleware]
+   (let [{:keys [port stop]}
+         (try (start! (parse-port port-arg) (parse-middleware middleware))
+              (catch Exception e
+                (binding [*out* *err*]
+                  (if (missing-nrepl? e)
+                    (do (println "clojure.tools.nrepl is not referenced by this project. Add it with:")
+                        (println "  dotnet add package clojure.tools.nrepl --prerelease"))
+                    (println (str "Could not start the nREPL server: " (.Message e)))))
+                (Environment/Exit 1)))
+         file (write-port-file! port)
+         done (ManualResetEventSlim. false)]
+     ;; Ctrl-C, kill and a closed terminal stop the server the same way.
+     ;; The registrations must stay reachable to stay registered.
+     (let [stop! (sys-action [PosixSignalContext] [ctx]
+                   (set! (.-Cancel ctx) true)
+                   (.Set done))]
+       (reset! signal-registrations
+               (vec (for [signal [PosixSignal/SIGINT PosixSignal/SIGTERM PosixSignal/SIGHUP]]
+                      (PosixSignalRegistration/Create signal stop!)))))
+     ;; The message nREPL clients (and editors' jack-in) look for
+     (println (str "nREPL server started on port " port " on host 127.0.0.1 - nrepl://127.0.0.1:" port))
+     (.Wait done)
+     (stop)
+     (remove-port-file! file port)
+     (Environment/Exit 0))))

@@ -1,0 +1,32 @@
+(ns clojure.msbuild.incremental-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.msbuild.incremental :as inc]))
+
+(deftest ns-decl-deps
+  (testing "plain, vector and prefix-list libspecs, :use and :as-alias"
+    (is (= '#{a.b c.d e.f.g e.f.h i.j k.l}
+           (inc/ns-decl-deps
+             '(ns x.y
+                "doc"
+                (:require a.b
+                          [c.d :as d]
+                          (e.f [g :as g] h)
+                          [i.j :as-alias j])
+                (:use k.l)
+                (:import [System String])))))))
+
+(deftest stale-closure
+  (let [entries [{:ns 'a :deps #{} :parsed? true}
+                 {:ns 'b :deps '#{a} :parsed? true}
+                 {:ns 'c :deps '#{b} :parsed? true}
+                 {:ns 'd :deps #{} :parsed? true}
+                 {:ns 'e :deps #{} :parsed? false}]]
+    (testing "dependents are added transitively"
+      (is (= '#{a b c e} (inc/stale-closure entries '#{a}))))
+    (testing "an unreadable file depends on everything"
+      (is (contains? (inc/stale-closure entries '#{d}) 'e)))
+    (testing "nothing stale, nothing to do"
+      (is (= #{} (inc/stale-closure entries #{}))))))
+
+(deftest dll-name
+  (is (= "acme.shop_web.cljr.dll" (inc/dll-name "acme/shop_web" ".cljr"))))

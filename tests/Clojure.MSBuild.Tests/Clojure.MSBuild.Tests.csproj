@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Unit tests of the Clojure.MSBuild tooling, built with the targets in this repository
+       (not a package): dotnet msbuild /t:clj-test -->
+  <Import Project="../../build/Clojure.MSBuild.props" />
+  <Import Project="../../build/Clojure.MSBuild.targets" />
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <AssemblyName>Clojure.MSBuild.Tests</AssemblyName>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <ClojureMainNamespace>clojure.msbuild.tool</ClojureMainNamespace>
+    <ClojureSourceDir>../../src</ClojureSourceDir>
+    <!-- The tooling namespaces come from this repository's src/, not from a package -->
+    <ClojureMSBuildSourceDir>$(MSBuildThisFileDirectory)../../src/</ClojureMSBuildSourceDir>
+    <!-- bootstrap is loaded before the build runs, so it is only emitted when listed -->
+    <ClojureNamespacesToCompile>clojure.msbuild.bootstrap;clojure.msbuild.test-adapter</ClojureNamespacesToCompile>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Clojure" Version="1.12.6" />
+    <PackageReference Include="Microsoft.TestPlatform.ObjectModel" Version="18.12.0" />
+  </ItemGroup>
+
+</Project>

@@ -1,98 +1,119 @@
 (ns clojure.msbuild.gitlibs
-  "Minimal git dependency resolver for deps.edn.
-   Clones git repos to ~/.gitlibs and checks out source at specific SHAs.
-   Compatible with clojure.tools.gitlibs cache layout."
+  "Git dependency resolver for ClojureGitDep items and deps.edn.
+
+   Clones repos to ~/.gitlibs (the clojure.tools.gitlibs cache layout, so
+   the cache is shared with cljr and the JVM tools) and checks out source
+   at specific SHAs. Dependencies of dependencies are resolved from their
+   deps-clr.edn/deps.edn; the first coordinate seen for a library wins
+   (the project's own ones come first). Supported coordinates:
+
+     {:git/url .. :git/sha .. :git/tag .. :deps/root ..}  (the url can be
+                                         inferred from io.github/... names)
+     {:local/root \"../path\"}           relative to the declaring deps file
+     {:mvn/version ..}                   not supported on the CLR: a warning
+                                         says to use the NuGet package
+
+   Resolution errors are collected and thrown together as one ex-info, so
+   that a typo in a tag or SHA stops the build with a clear message
+   instead of a missing namespace later."
   (:require [clojure.edn :as edn]
             [clojure.string :as str])
-  (:import [System Environment]
+  (:import [System Environment DateTime]
+           [System.ComponentModel Win32Exception]
            [System.Diagnostics Process ProcessStartInfo]
-           [System.IO Directory Path File]
-           [System.Threading Thread ThreadStart]))
+           [System.IO Directory Path File FileStream FileMode FileAccess FileShare IOException]
+           [System.Threading Thread]))
 
 ;; ── Config ───────────────────────────────────────────────────────
 
-(def ^:private gitlibs-dir
-  (delay
-    (let [env (Environment/GetEnvironmentVariable "GITLIBS")]
-      (or env
-          (Path/Join (Environment/GetFolderPath
-                       Environment+SpecialFolder/UserProfile)
-                     ".gitlibs")))))
+(defn gitlibs-dir []
+  (or (not-empty (Environment/GetEnvironmentVariable "GITLIBS"))
+      (Path/Join (Environment/GetFolderPath Environment+SpecialFolder/UserProfile) ".gitlibs")))
 
-(defn- repos-dir [] (Path/Join @gitlibs-dir "_repos"))
-(defn- libs-dir [] (Path/Join @gitlibs-dir "libs"))
+(defn- repos-dir [] (Path/Join (gitlibs-dir) "_repos"))
+(defn- libs-dir [] (Path/Join (gitlibs-dir) "libs"))
 
 ;; ── Git command execution ────────────────────────────────────────
 
-(defn- read-stream [stream]
-  (let [sw (System.IO.StringWriter.)]
-    (loop []
-      (let [line (.ReadLine stream)]
-        (when line
-          (.WriteLine sw line)
-          (recur))))
-    (let [s (.ToString sw)]
-      (when-not (String/IsNullOrWhiteSpace s)
-        (.Trim s)))))
-
-(defn- run-git [& args]
-  (let [psi (doto (ProcessStartInfo.)
-              (-> .-FileName (set! "git"))
-              (-> .-Arguments (set! (String/Join " " (into-array String args))))
+(defn run-git
+  "Runs git with args (each passed as one argument, so paths with spaces
+   work). Returns {:exit :out :err}."
+  [& args]
+  (let [psi (doto (ProcessStartInfo. "git")
               (-> .-RedirectStandardOutput (set! true))
               (-> .-RedirectStandardError (set! true))
               (-> .-UseShellExecute (set! false))
               (-> .-CreateNoWindow (set! true)))
-        proc (Process/Start psi)
-        ;; Read stdout/stderr on background threads to avoid deadlock
-        out-p (promise)
-        err-p (promise)
-        out-t (doto (Thread. (gen-delegate ThreadStart [] (deliver out-p (read-stream (.StandardOutput proc))))) (.Start))
-        err-t (doto (Thread. (gen-delegate ThreadStart [] (deliver err-p (read-stream (.StandardError proc))))) (.Start))]
+        _ (doseq [a args] (.Add (.ArgumentList psi) (str a)))
+        proc (try (Process/Start psi)
+                  (catch Win32Exception _
+                    (throw (ex-info "git was not found. Git dependencies need git on the PATH." {}))))
+        ;; Read both streams concurrently to avoid a full-pipe deadlock
+        out (.ReadToEndAsync (.StandardOutput proc))
+        err (.ReadToEndAsync (.StandardError proc))]
     (.WaitForExit proc)
-    (.Join out-t)
-    (.Join err-t)
     {:exit (.ExitCode proc)
-     :out @out-p
-     :err @err-p}))
+     :out (some-> (.Result out) str/trim not-empty)
+     :err (some-> (.Result err) str/trim not-empty)}))
+
+;; ── Cross-process locking ────────────────────────────────────────
+
+(defn with-lock
+  "Calls f while holding an exclusive lock on lock-file, so that builds
+   running at the same time (parallel builds, CI jobs sharing ~/.gitlibs)
+   do not clone or check out the same repository at once."
+  [^String lock-file f]
+  (Directory/CreateDirectory (Path/GetDirectoryName lock-file))
+  (let [deadline (.AddMinutes DateTime/UtcNow 10.0)
+        stream (loop [waiting? false]
+                 (let [s (try (FileStream. lock-file FileMode/OpenOrCreate FileAccess/ReadWrite FileShare/None)
+                              (catch IOException e
+                                (when (> (.Ticks DateTime/UtcNow) (.Ticks deadline))
+                                  (throw (ex-info (str "Timed out waiting for the lock " lock-file) {} e)))
+                                nil))]
+                   (or s
+                       (do (when-not waiting?
+                             (println (str "Waiting for another build to finish with " lock-file)))
+                           (Thread/Sleep 200)
+                           (recur true)))))]
+    (try (f)
+         (finally (.Dispose ^FileStream stream)))))
 
 ;; ── URL helpers ──────────────────────────────────────────────────
 
 (def ^:private git-services
-  {"io.github"      (fn [org repo] (str "https://github.com/" org "/" repo ".git"))
-   "com.github"     (fn [org repo] (str "https://github.com/" org "/" repo ".git"))
-   "io.gitlab"      (fn [org repo] (str "https://gitlab.com/" org "/" repo ".git"))
-   "com.gitlab"     (fn [org repo] (str "https://gitlab.com/" org "/" repo ".git"))
-   "org.bitbucket"  (fn [org repo] (str "https://bitbucket.org/" org "/" repo ".git"))
-   "ht.sr"          (fn [org repo] (str "https://git.sr.ht/~" org "/" repo))})
+  [["io.github"     (fn [org repo] (str "https://github.com/" org "/" repo ".git"))]
+   ["com.github"    (fn [org repo] (str "https://github.com/" org "/" repo ".git"))]
+   ["io.gitlab"     (fn [org repo] (str "https://gitlab.com/" org "/" repo ".git"))]
+   ["com.gitlab"    (fn [org repo] (str "https://gitlab.com/" org "/" repo ".git"))]
+   ["org.bitbucket" (fn [org repo] (str "https://bitbucket.org/" org "/" repo ".git"))]
+   ["io.bitbucket"  (fn [org repo] (str "https://bitbucket.org/" org "/" repo ".git"))]
+   ["ht.sr"         (fn [org repo] (str "https://git.sr.ht/~" org "/" repo))]])
 
-(defn- auto-git-url [lib]
+(defn auto-git-url
+  "The url of io.github/org/repo-style library names, or nil."
+  [lib]
   (let [lib-ns (namespace lib)
         lib-name (name lib)]
     (when lib-ns
       (some (fn [[prefix url-fn]]
-              (when (.StartsWith lib-ns prefix)
-                (let [org (subs lib-ns (inc (count prefix)))]
-                  (url-fn org lib-name))))
+              (when (.StartsWith ^String lib-ns (str prefix "."))
+                (url-fn (subs lib-ns (inc (count prefix))) lib-name)))
             git-services))))
 
-(defn- clean-url [url]
-  (let [;; Strip scheme
-        url (cond
+(defn clean-url
+  "The cache directory of a url, relative to _repos (tools.gitlibs layout)."
+  [^String url]
+  (let [url (cond
               (.StartsWith url "https://") (str "https/" (subs url 8))
               (.StartsWith url "http://")  (str "http/" (subs url 7))
               (.StartsWith url "ssh://")   (str "ssh/" (subs url 6))
               (.StartsWith url "git@")     (str "ssh/" (subs url 4))
               (.StartsWith url "file:///") (str "file/" (subs url 8))
               :else url)
-        ;; Normalize ssh-style colon (only for ssh paths, not port numbers)
-        url (if (.StartsWith url "ssh/")
-              (.Replace url ":" "/")
-              url)]
-    ;; Strip trailing .git only at the end
-    (if (.EndsWith url ".git")
-      (subs url 0 (- (count url) 4))
-      url)))
+        ;; ssh-style host:path (not a port number)
+        url (if (.StartsWith url "ssh/") (.Replace url ":" "/") url)]
+    (if (.EndsWith url ".git") (subs url 0 (- (count url) 4)) url)))
 
 ;; ── Cache operations ─────────────────────────────────────────────
 
@@ -106,48 +127,62 @@
   (let [dir (git-dir url)]
     (when-not (Directory/Exists dir)
       (println (str "Cloning: " url))
-      (let [parent (Path/GetDirectoryName dir)]
-        (when (and parent (not (Directory/Exists parent)))
-          (Directory/CreateDirectory parent)))
-      (let [result (run-git "clone" "--quiet" "--mirror" url dir)]
+      (Directory/CreateDirectory (Path/GetDirectoryName dir))
+      ;; Clone next to the final directory and move it into place, so an
+      ;; interrupted clone never looks like a complete one.
+      (let [tmp (str dir ".tmp-" (.Id (Process/GetCurrentProcess)))
+            _ (when (Directory/Exists tmp) (Directory/Delete tmp true))
+            result (run-git "clone" "--quiet" "--mirror" url tmp)]
         (when (not= 0 (:exit result))
-          (throw (Exception. (str "git clone failed: " (:err result)))))))
+          (when (Directory/Exists tmp) (try (Directory/Delete tmp true) (catch Exception _)))
+          (throw (ex-info (str "git clone " url " failed: " (:err result)) {})))
+        (Directory/Move tmp dir)))
     dir))
 
 (defn- git-fetch! [git-dir-path]
   (run-git "--git-dir" git-dir-path "fetch" "--quiet" "--all" "--tags" "--prune"))
 
-(defn- resolve-sha [git-dir-path rev]
-  (let [result (run-git "--git-dir" git-dir-path "rev-parse" (str rev "^{commit}"))]
+(defn- resolve-rev [git-dir-path rev]
+  (let [result (run-git "--git-dir" git-dir-path "rev-parse" "--verify" "--quiet" (str rev "^{commit}"))]
     (when (= 0 (:exit result))
       (:out result))))
 
-(defn- procure! [url lib rev]
-  (let [gd (ensure-repo! url)
-        sha (or (resolve-sha gd rev)
-                (do (git-fetch! gd) (resolve-sha gd rev)))]
-    (when-not sha
-      (throw (Exception. (str "Could not resolve " rev " in " url))))
-    (let [sha-dir (Path/Join (lib-path lib) sha)]
-      (when-not (Directory/Exists sha-dir)
-        (println (str "Checking out: " url " at " rev))
-        (let [parent (Path/GetDirectoryName sha-dir)]
-          (when (and parent (not (Directory/Exists parent)))
-            (Directory/CreateDirectory parent)))
-        (let [result (run-git "--git-dir" gd "worktree" "add" "--force" "--detach" sha-dir sha)]
-          (when (not= 0 (:exit result))
-            (throw (Exception. (str "git checkout failed: " (:err result)))))))
-      sha-dir)))
+(defn- sha-matches? [^String full ^String sha]
+  (.StartsWith (str/lower-case full) (str/lower-case (str/trim sha))))
 
-;; ── deps.edn resolution ─────────────────────────────────────────
-
-(defn- read-deps-edn [project-dir]
-  (let [deps-clr (Path/Join project-dir "deps-clr.edn")
-        deps     (Path/Join project-dir "deps.edn")]
-    (cond
-      (File/Exists deps-clr) (edn/read-string (File/ReadAllText deps-clr))
-      (File/Exists deps)     (edn/read-string (File/ReadAllText deps))
-      :else nil)))
+(defn- procure!
+  "Checks out lib at the commit (sha, else tag) into the cache and returns
+   the checkout directory."
+  [url lib {:keys [sha tag]}]
+  (let [gd (git-dir url)]
+    (with-lock (str gd ".lock")
+      (fn []
+        (ensure-repo! url)
+        (let [rev (or sha tag)
+              commit (or (resolve-rev gd rev)
+                         (do (git-fetch! gd) (resolve-rev gd rev)))]
+          (when-not commit
+            (throw (ex-info (str "could not find " (if sha (str "sha " sha) (str "tag " tag)) " in " url) {})))
+          (when (and sha tag)
+            (let [tagged (or (resolve-rev gd tag)
+                             (do (git-fetch! gd) (resolve-rev gd tag)))]
+              (cond
+                (nil? tagged)
+                (println (str "  Warning: " lib ": tag " tag " not found in " url "; using sha " sha))
+                (not (sha-matches? tagged sha))
+                (throw (ex-info (str "tag " tag " of " url " is commit " (subs tagged 0 (min 12 (count tagged)))
+                                     ", not sha " sha)
+                                {})))))
+          (let [sha-dir (Path/Join (lib-path lib) commit)]
+            (when-not (Directory/Exists sha-dir)
+              (println (str "Checking out: " url " at " rev))
+              (Directory/CreateDirectory (Path/GetDirectoryName sha-dir))
+              (let [result (run-git "--git-dir" gd "worktree" "add" "--force" "--detach" sha-dir commit)]
+                (when (not= 0 (:exit result))
+                  (when (Directory/Exists sha-dir) (try (Directory/Delete sha-dir true) (catch Exception _)))
+                  (run-git "--git-dir" gd "worktree" "prune")
+                  (throw (ex-info (str "git checkout of " url " at " rev " failed: " (:err result)) {})))))
+            sha-dir))))))
 
 (defn- existing-checkout
   "The checkout of lib at sha (full or abbreviated, at least 7 characters)
@@ -161,53 +196,164 @@
         (when (= 1 (count matches))
           (first matches))))))
 
-(defn- resolve-coord [lib coord]
-  (let [url (or (not-empty (:git/url coord)) (auto-git-url lib))
-        rev (or (not-empty (:git/tag coord)) (not-empty (:git/sha coord)))]
-    (when (and url rev)
-      (let [sha-dir (or (existing-checkout lib (:git/sha coord))
-                        (procure! url lib rev))
-            nested-deps (or (let [f (Path/Join sha-dir "deps-clr.edn")]
-                              (when (File/Exists f) (edn/read-string (File/ReadAllText f))))
-                            (let [f (Path/Join sha-dir "deps.edn")]
-                              (when (File/Exists f) (edn/read-string (File/ReadAllText f)))))
-            paths (or (:paths nested-deps) ["src"])]
-        (mapv #(Path/Join sha-dir %) paths)))))
+;; ── deps files ───────────────────────────────────────────────────
 
-(defn- resolve-deps-map [deps-map]
-  (let [deps (:deps deps-map)]
-    (when (seq deps)
-      (into []
-        (mapcat (fn [[lib coord]]
-                  (try
-                    (let [paths (resolve-coord lib coord)]
-                      (when paths
-                        (println (str "  " lib " -> " (first paths)))
-                        paths))
-                    (catch Exception e
-                      (println (str "  Error resolving " lib ": " (.Message e)))
-                      nil))))
-        deps))))
+(defn read-deps-file
+  "The deps-clr.edn (preferred) or deps.edn in dir, or nil."
+  [dir]
+  (some (fn [name]
+          (let [f (Path/Join dir name)]
+            (when (File/Exists f)
+              (try (edn/read-string {:default (fn [_ v] v)} (File/ReadAllText f))
+                   (catch Exception e
+                     (throw (ex-info (str "could not read " f ": " (.Message e)) {})))))))
+        ["deps-clr.edn" "deps.edn"]))
+
+(defn coord-type
+  "What kind of coordinate this is: :git, :local, :mvn or nil."
+  [lib coord]
+  (cond
+    (or (:git/url coord) (:git/sha coord) (:git/tag coord) (:sha coord) (:tag coord)) :git
+    (:local/root coord) :local
+    (:mvn/version coord) :mvn
+    :else nil))
+
+(defn- git-coord [lib coord]
+  {:url (or (not-empty (:git/url coord)) (not-empty (:url coord)) (auto-git-url lib))
+   :sha (or (not-empty (:git/sha coord)) (not-empty (:sha coord)))
+   :tag (or (not-empty (:git/tag coord)) (not-empty (:tag coord)))})
+
+(defn- coord-root
+  "The directory a coordinate points at (checked out if needed)."
+  [lib coord base-dir]
+  (case (coord-type lib coord)
+    :git (let [{:keys [url sha tag] :as c} (git-coord lib coord)]
+           (when-not url
+             (throw (ex-info "no :git/url, and the url cannot be inferred from the name" {})))
+           (when-not (or sha tag)
+             (throw (ex-info "needs a :git/sha or :git/tag" {})))
+           (let [dir (or (existing-checkout lib sha) (procure! url lib c))]
+             (if-let [root (not-empty (:deps/root coord))]
+               (Path/GetFullPath (Path/Join dir root))
+               dir)))
+    :local (Path/GetFullPath (Path/Combine ^String base-dir ^String (:local/root coord)))))
+
+(defn- describe [coord]
+  (or (some-> (or (:git/sha coord) (:sha coord)) (subs 0 (min 7 (count (or (:git/sha coord) (:sha coord))))))
+      (:git/tag coord) (:tag coord) (:local/root coord) (:mvn/version coord) (pr-str coord)))
+
+;; ── Resolution ───────────────────────────────────────────────────
+
+(defn alias-deps
+  "The :extra-deps and :extra-paths of the selected aliases of deps-map.
+   aliases are keywords or strings (with or without the leading colon)."
+  [deps-map aliases]
+  (let [selected (for [a aliases
+                       :let [k (keyword (str/replace (str/trim (str a)) #"^:" ""))]
+                       :when (not= k (keyword ""))]
+                   (or (get-in deps-map [:aliases k])
+                       (do (println (str "  Warning: alias " k " is not defined in deps.edn")) nil)))]
+    {:deps (apply merge (map :extra-deps selected))
+     :paths (vec (mapcat :extra-paths selected))}))
+
+(defn clean-coord
+  "A coordinate without blank string values (ClojureGitDep items leave out
+   metadata as empty strings)."
+  [coord]
+  (into {} (remove (fn [[_ v]] (and (string? v) (str/blank? v)))) coord))
+
+(defn resolve-all
+  "Resolves the dependencies in roots, a sequence of [deps base-dir] (deps a
+   map lib -> coord, base-dir the directory :local/root paths are relative
+   to), with their own dependencies, breadth first. Returns {:paths [dir ..]
+   :libs {lib {:coord .. :root ..}} :errors [msg ..] :warnings [msg ..]}.
+   coord-root is the function that finds a coordinate's directory."
+  ([roots] (resolve-all roots coord-root))
+  ([roots coord-root]
+   (loop [queue (vec (for [[deps base-dir] roots, [lib coord] deps] [lib (clean-coord coord) base-dir nil]))
+          state {:paths [] :libs {} :errors [] :warnings []}]
+     (if-let [[lib coord base-dir parent] (first queue)]
+       (let [queue (subvec queue 1)
+             lib (symbol lib)
+             seen (get-in state [:libs lib])]
+         (cond
+           seen
+           (recur queue (if (and parent (not= (:coord seen) coord))
+                          (update state :warnings conj
+                                  (str lib ": using " (describe (:coord seen)) "; " parent " asks for " (describe coord)))
+                          state))
+
+           (= :mvn (coord-type lib coord))
+           (recur queue (-> state
+                            (assoc-in [:libs lib] {:coord coord})
+                            (update :warnings conj
+                                    (str lib " " (:mvn/version coord) " is a Maven dependency, which ClojureCLR cannot use"
+                                         (when parent (str " (required by " parent ")"))
+                                         ": reference the library's NuGet package, or a git coordinate, instead"))))
+
+           (nil? (coord-type lib coord))
+           (recur queue (-> state
+                            (assoc-in [:libs lib] {:coord coord})
+                            (update :errors conj (str lib ": unsupported coordinate " (pr-str coord)))))
+
+           :else
+           (let [result (try {:root (coord-root lib coord base-dir)}
+                             (catch Exception e {:error (.Message e)}))]
+             (if-let [error (:error result)]
+               (recur queue (-> state
+                                (assoc-in [:libs lib] {:coord coord})
+                                (update :errors conj (str lib (when parent (str " (required by " parent ")")) ": " error))))
+               (let [root (:root result)
+                     nested (try (read-deps-file root) (catch Exception e {::error (.Message e)}))
+                     paths (mapv #(Path/GetFullPath (Path/Join ^String root ^String %))
+                                 (or (:paths nested) ["src"]))]
+                 (println (str "  " lib " -> " root))
+                 (recur (into queue (for [[l c] (:deps nested)] [l (clean-coord c) root lib]))
+                        (cond-> (-> state
+                                    (assoc-in [:libs lib] {:coord coord :root root})
+                                    (update :paths into paths))
+                          (::error nested) (update :errors conj (str lib ": " (::error nested))))))))))
+       (update state :paths (comp vec distinct))))))
+
+(defn resolve-project!
+  "Resolves the project's dependencies: csproj-deps ({:deps {lib coord}} from
+   the ClojureGitDep items) first, then deps-clr.edn/deps.edn in project-dir
+   with the selected aliases. Returns the source paths to add to the load
+   path. Prints warnings; throws an ex-info listing every error."
+  [project-dir csproj-deps aliases]
+  (let [deps-file (read-deps-file project-dir)
+        {alias-extra :deps alias-paths :paths} (alias-deps deps-file aliases)
+        roots [[(:deps csproj-deps) project-dir]
+               [(:deps deps-file) project-dir]
+               [alias-extra project-dir]]
+        n (count (distinct (mapcat keys (map first roots))))]
+    (if (zero? n)
+      (vec (for [p (concat (:paths deps-file) alias-paths)]
+             (Path/GetFullPath (Path/Combine ^String project-dir ^String p))))
+      (do
+        (println (str "Resolving " n " Clojure dependencies..."))
+        (let [{:keys [paths errors warnings]} (resolve-all roots)]
+          (doseq [w warnings] (println (str "  Warning: " w)))
+          (when (seq errors)
+            (throw (ex-info (str "could not resolve Clojure dependencies:\n" (str/join "\n" errors))
+                            {:errors errors})))
+          (vec (distinct (concat (for [p (concat (:paths deps-file) alias-paths)]
+                                   (Path/GetFullPath (Path/Combine ^String project-dir ^String p)))
+                                 paths))))))))
+
+;; ── Older entry points (kept for compatibility) ──────────────────
 
 (defn resolve-deps!
-  "Reads deps.edn from project-dir, resolves all git dependencies,
-   returns a vector of source paths to add to CLOJURE_LOAD_PATH.
-   Note: does not resolve transitive git deps (deps of deps)."
+  "Reads deps.edn from project-dir and resolves its dependencies. Returns
+   the source paths to add to CLOJURE_LOAD_PATH."
   [project-dir]
-  (when-let [deps-map (read-deps-edn project-dir)]
-    (let [deps (:deps deps-map)]
-      (when (seq deps)
-        (println (str "Resolving " (count deps) " git deps from deps.edn..."))
-        (resolve-deps-map deps-map)))))
+  (resolve-project! project-dir nil nil))
 
 (defn resolve-deps-from-map!
-  "Resolves git deps from a deps map ({:deps {lib coord}}), e.g. the
-   ClojureGitDep items from the .csproj. Returns a vector of source paths."
+  "Resolves a deps map ({:deps {lib coord}}), e.g. the ClojureGitDep items
+   from the .csproj. Returns the source paths."
   [deps-map]
-  (let [deps (:deps deps-map)]
-    (when (seq deps)
-      (println (str "Resolving " (count deps) " git deps from .csproj..."))
-      (resolve-deps-map deps-map))))
+  (:paths (resolve-all [[(:deps deps-map) (Environment/CurrentDirectory)]])))
 
 (defn resolve-deps-from-edn!
   "Resolves git deps from an EDN string. Returns a vector of source paths."

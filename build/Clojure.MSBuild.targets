@@ -21,9 +21,26 @@
       <_ClojureEntryExe>$(_ClojureBuildDir)$(AssemblyName).exe</_ClojureEntryExe>
       <_ClojureGenClassMode>false</_ClojureGenClassMode>
       <_ClojureGenClassMode Condition="'$(ClojureEntryPoint)' == 'gen-class'">true</_ClojureGenClassMode>
-      <_ClojureNamespacesToBuild>clojure.msbuild.entry;$(ClojureMainNamespace);$(ClojureNamespacesToCompile)</_ClojureNamespacesToBuild>
+      <!-- The dotnet host that runs the tooling. DOTNET_HOST_PATH is set by the dotnet CLI;
+           a build started otherwise (e.g. by Visual Studio's MSBuild) falls back to the SDK's
+           own host, then to dotnet on the PATH. -->
+      <_ClojureDotnetHost>$(DOTNET_HOST_PATH)</_ClojureDotnetHost>
+      <_ClojureDotnetHost Condition="'$(_ClojureDotnetHost)' == '' And '$(NetCoreRoot)' != '' And Exists('$([MSBuild]::EnsureTrailingSlash($(NetCoreRoot)))dotnet.exe')">$([MSBuild]::EnsureTrailingSlash($(NetCoreRoot)))dotnet.exe</_ClojureDotnetHost>
+      <_ClojureDotnetHost Condition="'$(_ClojureDotnetHost)' == '' And '$(NetCoreRoot)' != '' And Exists('$([MSBuild]::EnsureTrailingSlash($(NetCoreRoot)))dotnet')">$([MSBuild]::EnsureTrailingSlash($(NetCoreRoot)))dotnet</_ClojureDotnetHost>
+      <_ClojureDotnetHost Condition="'$(_ClojureDotnetHost)' == ''">dotnet</_ClojureDotnetHost>
+      <!-- Extra source directories: ClojureExtraSourceDirs (; or |) and ClojureSource items, |-separated -->
+      <_ClojureExtraSourceDirs>$(ClojureExtraSourceDirs.Replace(';', '|'))</_ClojureExtraSourceDirs>
+      <_ClojureExtraSourceDirs Condition="'@(ClojureSource)' != ''">$(_ClojureExtraSourceDirs)|@(ClojureSource->'%(Identity)', '|')</_ClojureExtraSourceDirs>
+      <_ClojureExtraSourceDirs>$(_ClojureExtraSourceDirs.Trim('|'))</_ClojureExtraSourceDirs>
+      <_ClojureNamespacesToCompile>$(ClojureNamespacesToCompile)</_ClojureNamespacesToCompile>
+      <_ClojureNamespacesToCompile Condition="'@(ClojureCompile)' != ''">$(_ClojureNamespacesToCompile);@(ClojureCompile)</_ClojureNamespacesToCompile>
+      <_ClojureNamespacesToBuild>clojure.msbuild.entry;$(ClojureMainNamespace);$(_ClojureNamespacesToCompile)</_ClojureNamespacesToBuild>
+      <_ClojureTestDir>$(ClojureTestDir)</_ClojureTestDir>
+      <_ClojureTestDir Condition="'$(_ClojureTestDir)' == ''">test</_ClojureTestDir>
+      <_ClojureTestSuffix>$(ClojureTestSuffix)</_ClojureTestSuffix>
+      <_ClojureTestSuffix Condition="'$(_ClojureTestSuffix)' == ''">_test</_ClojureTestSuffix>
       <!-- Namespaces whose source lives in these directories are project code -->
-      <_ClojureProjectDirs>$(ClojureSourceDir)|$(ClojureExtraSourceDirs)|test|$(_ClojureGenDir)</_ClojureProjectDirs>
+      <_ClojureProjectDirs>$(ClojureSourceDir)|$(_ClojureExtraSourceDirs)|$(_ClojureTestDir)|$(_ClojureGenDir)</_ClojureProjectDirs>
       <_ClojureCompileOutputs>$(_ClojureBuildStampFile)</_ClojureCompileOutputs>
       <_ClojureCompileOutputs Condition="'$(_ClojureGenClassMode)' == 'true'">$(_ClojureBuildStampFile);$(_ClojureEntryExe)</_ClojureCompileOutputs>
     </PropertyGroup>
@@ -40,7 +57,9 @@
   <Target Name="_BuildClojureGitDeps">
     <PropertyGroup>
       <_ClojureGitDeps>nil</_ClojureGitDeps>
-      <_ClojureGitDeps Condition="@(ClojureGitDep->Count()) > 0">{:deps {@(ClojureGitDep->'%(Identity) {:git/tag "%(Tag)" :git/sha "%(Sha)" :git/url "%(Url)"}', ' ')}}</_ClojureGitDeps>
+      <!-- Tag/Sha/Url (git), Root (:deps/root, a subdirectory of the repository) or
+           LocalRoot (a directory, relative to the project). Empty values are ignored. -->
+      <_ClojureGitDeps Condition="@(ClojureGitDep->Count()) > 0">{:deps {@(ClojureGitDep->'%(Identity) {:git/tag "%(Tag)" :git/sha "%(Sha)" :git/url "%(Url)" :deps/root "%(Root)" :local/root "$([System.String]::Copy('%(LocalRoot)').Replace('\', '\\'))"}', ' ')}}</_ClojureGitDeps>
     </PropertyGroup>
   </Target>
 
@@ -54,6 +73,14 @@
       <_ClojureUserCompile Include="@(Compile)" Exclude="$(GeneratedProgramFile)"
                            Condition="!$([MSBuild]::NormalizePath('%(Compile.FullPath)').StartsWith($([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(BaseIntermediateOutputPath)'))))" />
     </ItemGroup>
+    <!-- Clojure loads namespaces (and the types they define) dynamically at runtime, which
+         single-file bundles, trimming and Native AOT cannot follow. -->
+    <Error Condition="'$(PublishAot)' == 'true'"
+           Text="PublishAot is not supported for Clojure projects: ClojureCLR compiles and loads code at runtime, which Native AOT cannot do. Publish framework-dependent or self-contained instead (ReadyToRun is used for the Clojure runtime automatically)." />
+    <Error Condition="'$(PublishTrimmed)' == 'true'"
+           Text="PublishTrimmed is not supported for Clojure projects: Clojure finds types and namespaces by name at runtime, which the trimmer cannot see, so it would remove code the application needs." />
+    <Error Condition="'$(PublishSingleFile)' == 'true'"
+           Text="PublishSingleFile is not supported for Clojure projects: compiled Clojure namespaces are loaded from separate assemblies next to the application, which a single-file bundle does not have." />
     <Error Condition="'$(_ClojureGenClassMode)' == 'true' And '@(_ClojureUserCompile)' != ''"
            Text="C# sources (@(_ClojureUserCompile, ', ')) cannot be compiled into a Clojure project with ClojureEntryPoint=gen-class, because the project assembly is replaced by the compiled Clojure entry point. Move the C# into a class library project, or set &lt;ClojureEntryPoint&gt;csharp&lt;/ClojureEntryPoint&gt;." />
   </Target>
@@ -73,6 +100,11 @@ using System.IO%3B
 using System.Threading.Tasks%3B
 
 // Generated by Clojure.MSBuild. Bootstraps the Clojure runtime and hands off to clojure.msbuild.entry/-main.
+// The generated sources and the Clojure.MSBuild namespaces are only put on the load path for
+// tooling (--clj-mode), or when the application has not been compiled (yet): a compiled
+// application loads them from the assemblies next to it.
+var tooling = args.Length > 0 &amp;&amp; args[0] == "--clj-mode"%3B
+if (tooling || !File.Exists(Path.Combine(AppContext.BaseDirectory, "clojure.msbuild.entry.cljr.dll")))
 {
     var generated = @"$(_ClojureGenDir)"%3B
     var packageSrc = @"$(ClojureMSBuildSourceDir)"%3B
@@ -90,6 +122,10 @@ var result = clojure.lang.RT.var("clojure.msbuild.entry", "-main").applyTo(cloju
 if (result is Task task) task.GetAwaiter().GetResult()%3B
       </_ClojureEntrySource>
 
+      <_ClojurePreloadAssemblies>true</_ClojurePreloadAssemblies>
+      <_ClojurePreloadAssemblies Condition="'$(ClojureAutoLoadAssemblies)' == 'false'">false</_ClojurePreloadAssemblies>
+      <_ClojureNReplInApp>false</_ClojureNReplInApp>
+      <_ClojureNReplInApp Condition="'$(ClojureNReplInApp)' == 'true'">true</_ClojureNReplInApp>
       <_ClojureGenClassClause Condition="'$(_ClojureGenClassMode)' == 'true'">(:gen-class :name $(AssemblyName) :main true)</_ClojureGenClassClause>
       <_ClojureEntryNsSource>
 (ns clojure.msbuild.entry
@@ -100,9 +136,16 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
 (def config
   {:main-ns (quote $(ClojureMainNamespace))
    :source-dir "$(ClojureSourceDir.Replace('\', '\\'))"
-   :extra-source-dirs "$(ClojureExtraSourceDirs.Replace('\', '\\'))"
+   :extra-source-dirs "$(_ClojureExtraSourceDirs.Replace('\', '\\'))"
    :msbuild-source-dir "$(ClojureMSBuildSourceDir.Replace('\', '\\'))"
-   :git-deps (quote $(_ClojureGitDeps))})
+   :git-deps (quote $(_ClojureGitDeps))
+   :deps-aliases "$(ClojureDepsAliases)"
+   :test-dir "$(_ClojureTestDir.Replace('\', '\\'))"
+   :test-suffix "$(_ClojureTestSuffix)"
+   :preload-assemblies $(_ClojurePreloadAssemblies)
+   :nrepl-in-app $(_ClojureNReplInApp)
+   :nrepl-port "$(ClojureNReplPort)"
+   :nrepl-middleware "$(ClojureNReplMiddleware)"})
 
 (defn -main [&amp; args]
   (bootstrap/run config args))
@@ -208,7 +251,7 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
     </PropertyGroup>
     <Message Importance="high" Text="Downloading crossgen2 ($(_ClojureCrossgenPackage) $(_ClojureCrossgenVersion)) to compile the Clojure library layer to native code" />
     <WriteLinesToFile File="$(_ClojureCrossgenProject)" Lines="$(_ClojureCrossgenProjectSource)" Overwrite="true" />
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; restore &quot;$(_ClojureCrossgenProject)&quot; -nologo -v q &quot;-p:RestorePackagesPath=$(NuGetPackageRoot.TrimEnd('/').TrimEnd('\'))&quot; -p:ImportDirectoryBuildProps=false -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryPackagesProps=false"
+    <Exec Command="&quot;$(_ClojureDotnetHost)&quot; restore &quot;$(_ClojureCrossgenProject)&quot; -nologo -v q &quot;-p:RestorePackagesPath=$(NuGetPackageRoot.TrimEnd('/').TrimEnd('\'))&quot; -p:ImportDirectoryBuildProps=false -p:ImportDirectoryBuildTargets=false -p:ImportDirectoryPackagesProps=false"
           WorkingDirectory="$(MSBuildProjectDirectory)" ContinueOnError="true" />
   </Target>
 
@@ -239,7 +282,7 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
     <Copy Condition="'$(_ClojureLibsUpToDate)' != 'true' And '$(_ClojureSharedLibReady)' == 'true'" SourceFiles="@(_ClojureSharedLibFile)" DestinationFolder="$(_ClojureLibDir)" />
     <Copy Condition="'$(_ClojureLibsUpToDate)' != 'true' And '$(_ClojureSharedLibReady)' == 'true'" SourceFiles="@(_ClojureSharedLibFile)" DestinationFolder="$(TargetDir)" />
     <Exec Condition="'$(_ClojureLibsUpToDate)' != 'true'"
-          Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode build-libs &quot;$(_ClojureLibDir)&quot; &quot;$(ClojureMainNamespace)&quot; &quot;$(_ClojureProjectDirs)&quot; &quot;$(_ClojureSharedLibDir)&quot; &quot;$(_ClojureCrossgenPath)&quot; &quot;@(_ClojureIlRuntime)&quot;"
+          Command="&quot;$(_ClojureDotnetHost)&quot; &quot;$(TargetPath)&quot; --clj-mode build-libs &quot;$(_ClojureLibDir)&quot; &quot;$(ClojureMainNamespace)&quot; &quot;$(_ClojureProjectDirs)&quot; &quot;$(_ClojureSharedLibDir)&quot; &quot;$(_ClojureCrossgenPath)&quot; &quot;@(_ClojureIlRuntime)&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           ConsoleToMSBuild="false" ContinueOnError="true" />
     <WriteLinesToFile Condition="'$(_ClojureLibsUpToDate)' != 'true'" File="$(_ClojureLibStampFile)" Lines="$(_ClojureLibStamp)" Overwrite="true" />
@@ -270,7 +313,7 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
        deleting, renaming or restoring an older copy of a file also rebuilds. -->
   <Target Name="_ClojureCollectSources" DependsOnTargets="_ClojureInit">
     <PropertyGroup>
-      <_ClojureSourceDirs>$(ClojureSourceDir)|$(ClojureExtraSourceDirs)</_ClojureSourceDirs>
+      <_ClojureSourceDirs>$(ClojureSourceDir)|$(_ClojureExtraSourceDirs)</_ClojureSourceDirs>
       <_ClojureSourceDirs>$([System.Text.RegularExpressions.Regex]::Replace('$(_ClojureSourceDirs)', '\|\s*(?=\||$)|^\s*\|', ''))</_ClojureSourceDirs>
       <_ClojureSourceDirs>$(_ClojureSourceDirs.Trim('|'))</_ClojureSourceDirs>
       <_ClojureSourceGlobs Condition="'$(_ClojureSourceDirs)' != ''">$(_ClojureSourceDirs.Replace('|', '/**/*.cljr;'))/**/*.cljr;$(_ClojureSourceDirs.Replace('|', '/**/*.cljc;'))/**/*.cljc;$(_ClojureSourceDirs.Replace('|', '/**/*.clj;'))/**/*.clj</_ClojureSourceGlobs>
@@ -291,7 +334,7 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
          to the gen-class type, which the C# host (same assembly name) does not contain. -->
     <Delete Files="$(TargetDir)clojure.msbuild.entry.cljr.dll;$(TargetDir)clojure.msbuild.entry.cljr.pdb" ContinueOnError="true" />
     <MakeDir Directories="$(_ClojureBuildDir)" />
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode build &quot;$(_ClojureNamespacesToBuild)&quot; &quot;$(_ClojureBuildDir)&quot; &quot;$(_ClojureLibDir)&quot; &quot;$(_ClojureProjectDirs)&quot;"
+    <Exec Command="&quot;$(_ClojureDotnetHost)&quot; &quot;$(TargetPath)&quot; --clj-mode build &quot;$(_ClojureNamespacesToBuild)&quot; &quot;$(_ClojureBuildDir)&quot; &quot;$(_ClojureLibDir)&quot; &quot;$(_ClojureProjectDirs)&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           ConsoleToMSBuild="false" />
     <Error Condition="'$(_ClojureGenClassMode)' == 'true' And !Exists('$(_ClojureEntryExe)')"
@@ -328,8 +371,8 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
     <Copy Condition="'$(_ClojureGenClassMode)' == 'true'" SourceFiles="$(_ClojureEntryExe)" DestinationFiles="$(TargetPath)" />
     <Message Condition="'$(_ClojureGenClassMode)' == 'true'" Text="Clojure entry point $(AssemblyName).Main -> $(TargetPath)" Importance="high" />
     <!-- Tells Clojure.MSBuild.TestAdapter where the project and its tests are -->
-    <WriteLinesToFile Condition="Exists('$(MSBuildProjectDirectory)/test')" File="$(_ClojureTestConfigFile)"
-                      Lines="{:project-dir &quot;$(MSBuildProjectDirectory.Replace('\', '\\'))&quot; :test-dir &quot;test&quot;}"
+    <WriteLinesToFile Condition="Exists('$(MSBuildProjectDirectory)/$(_ClojureTestDir)')" File="$(_ClojureTestConfigFile)"
+                      Lines="{:project-dir &quot;$(MSBuildProjectDirectory.Replace('\', '\\'))&quot; :test-dir &quot;$(_ClojureTestDir.Replace('\', '\\'))&quot; :test-suffix &quot;$(_ClojureTestSuffix)&quot;}"
                       Overwrite="true" WriteOnlyWhenDifferent="true" />
   </Target>
 
@@ -366,36 +409,52 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
   </Target>
 
   <!-- Target to run Clojure REPL with all dependencies loaded -->
-  <Target Name="clj-repl" DependsOnTargets="Build">
+  <Target Name="clj-repl" DependsOnTargets="Build;_ClojureInit">
     <Message Text="Starting Clojure REPL with project dependencies..." Importance="high" />
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode repl"
+    <Exec Command="&quot;$(_ClojureDotnetHost)&quot; &quot;$(TargetPath)&quot; --clj-mode repl"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           ConsoleToMSBuild="false" />
   </Target>
 
   <!-- Target to run Clojure nREPL server: -p:ClojureNReplPort=7888 (0 = any free port).
        The port is written to .nrepl-port for editors. -->
-  <Target Name="clj-nrepl" DependsOnTargets="Build">
+  <Target Name="clj-nrepl" DependsOnTargets="Build;_ClojureInit">
     <Message Text="Starting Clojure nREPL server..." Importance="high" />
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode nrepl $(ClojureNReplPort)"
+    <Exec Command="&quot;$(_ClojureDotnetHost)&quot; &quot;$(TargetPath)&quot; --clj-mode nrepl &quot;$(ClojureNReplPort)&quot; &quot;$(ClojureNReplMiddleware)&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           ConsoleToMSBuild="false" />
   </Target>
 
-  <!-- Target to run a Clojure file -->
-  <Target Name="clj-run" DependsOnTargets="Build">
-    <Error Text="Please provide a file path using -p:File=path/to/file.clj"
-           Condition="'$(File)' == ''" />
-    <Message Text="Running Clojure file: $(File)" Importance="high" />
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode script &quot;$(File)&quot;"
+  <!-- Target to run a Clojure script: -p:ClojureScript=path/to/script.cljr
+       -p:ClojureScriptArgs="a b" (*command-line-args*). File is the older name. -->
+  <Target Name="clj-run" DependsOnTargets="Build;_ClojureInit">
+    <PropertyGroup>
+      <_ClojureScript>$(ClojureScript)</_ClojureScript>
+      <_ClojureScript Condition="'$(_ClojureScript)' == ''">$(File)</_ClojureScript>
+    </PropertyGroup>
+    <Error Text="Please provide a script with -p:ClojureScript=path/to/script.cljr"
+           Condition="'$(_ClojureScript)' == ''" />
+    <Exec Command="&quot;$(_ClojureDotnetHost)&quot; &quot;$(TargetPath)&quot; --clj-mode script &quot;$(_ClojureScript)&quot; $(ClojureScriptArgs)"
           WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="false" />
+  </Target>
+
+  <!-- Development mode: run the application and reload the namespaces you change into it,
+       with the nREPL server inside when ClojureNReplInApp is on: dotnet msbuild /t:clj-dev -->
+  <Target Name="clj-dev" DependsOnTargets="Build;_ClojureInit">
+    <PropertyGroup>
+      <_ClojureDevNRepl Condition="'$(ClojureNReplInApp)' == 'true'">$(ClojureNReplPort)</_ClojureDevNRepl>
+    </PropertyGroup>
+    <Exec Command="&quot;$(_ClojureDotnetHost)&quot; &quot;$(TargetPath)&quot; --clj-mode dev &quot;$(_ClojureDevNRepl)&quot; $(ClojureRunArgs)"
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          StandardOutputImportance="high"
           ConsoleToMSBuild="false" />
   </Target>
 
   <!-- Run the Clojure tests without VSTest: dotnet msbuild /t:clj-test
        -p:ClojureTests="my.app-test my.app-test/one-test" selects namespaces and tests. -->
-  <Target Name="clj-test" DependsOnTargets="Build">
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode test $(ClojureTests)"
+  <Target Name="clj-test" DependsOnTargets="Build;_ClojureInit">
+    <Exec Command="&quot;$(_ClojureDotnetHost)&quot; &quot;$(TargetPath)&quot; --clj-mode test $(ClojureTests.Replace(';', ' '))"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           EnvironmentVariables="CLOJURE_MSBUILD_TEST_FORMAT=none"
           ConsoleToMSBuild="false" IgnoreExitCode="true">
@@ -408,8 +467,8 @@ if (result is Task task) task.GetAwaiter().GetResult()%3B
 
   <!-- Run the tests, then again whenever a Clojure file changes, reloading only what
        changed and what depends on it: dotnet msbuild /t:clj-test-watch -->
-  <Target Name="clj-test-watch" DependsOnTargets="Build">
-    <Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; &quot;$(TargetPath)&quot; --clj-mode test-watch &quot;$(ClojureSourceDir)|$(ClojureExtraSourceDirs)&quot;"
+  <Target Name="clj-test-watch" DependsOnTargets="Build;_ClojureInit">
+    <Exec Command="&quot;$(_ClojureDotnetHost)&quot; &quot;$(TargetPath)&quot; --clj-mode test-watch &quot;$(ClojureSourceDir)|$(_ClojureExtraSourceDirs)&quot;"
           WorkingDirectory="$(MSBuildProjectDirectory)"
           StandardOutputImportance="high"
           ConsoleToMSBuild="false" />

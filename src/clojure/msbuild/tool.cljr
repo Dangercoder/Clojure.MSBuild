@@ -4,6 +4,7 @@
    and set up CLOJURE_LOAD_PATH, so no bootstrap is needed here."
   (:require [clojure.string :as str]
             [clojure.test]
+            [clojure.msbuild.diagnostics :as diag]
             [clojure.msbuild.incremental :as incremental]
             [clojure.msbuild.ready-to-run :as r2r]
             [clojure.msbuild.nrepl :as nrepl]
@@ -21,18 +22,55 @@
 
 (defn run-nrepl
   "Start the nREPL server (see clojure.msbuild.nrepl) on port, 1667 by
-   default, 0 for any free port."
-  [port]
-  (nrepl/run port))
+   default, 0 for any free port, with the extra middleware (a string of
+   qualified var symbols separated by ; or ,)."
+  ([port] (run-nrepl port nil))
+  ([port middleware]
+   (nrepl/run port middleware)))
 
 (defn run-script
-  "Run a Clojure script file."
-  [path]
-  (println (str "Running script: " path))
-  (if (File/Exists path)
-    (load-file path)
-    (do (println (str "Error: Script file not found: " path))
+  "Run a Clojure script file, with *command-line-args* bound to args."
+  [path & args]
+  (if (and path (File/Exists path))
+    (binding [*command-line-args* (seq args)]
+      (load-file path))
+    (do (binding [*out* *err*]
+          (println (str "Clojure.MSBuild : error CLJ0003: script file not found: " path)))
         (Environment/Exit 1))))
+
+(defn run-dev
+  "Development mode: starts the application's -main on a background thread
+   and keeps the process running; whenever a Clojure file in dirs is
+   saved, the namespaces that changed, and the loaded ones that depend on
+   them, are reloaded into the running application. Code that refers to
+   functions through vars (#'handler, or a call by name at request time)
+   sees the new definitions at once. With an nREPL port the nREPL server
+   runs in the same process."
+  [main-ns dirs nrepl-port middleware args]
+  (let [dirs (test-runner/watch-dirs dirs false)]
+    (when-not (str/blank? (str nrepl-port))
+      (nrepl/start-in-app! nrepl-port middleware))
+    (let [main-ns (symbol (str main-ns))]
+      (require main-ns)
+      (let [main-fn (or (ns-resolve main-ns '-main)
+                        (throw (Exception. (str "Namespace " main-ns " has no -main function"))))]
+        (future
+          (try
+            (let [result (binding [*command-line-args* (seq args)] (apply main-fn args))]
+              (when (instance? System.Threading.Tasks.Task result)
+                (.Wait ^System.Threading.Tasks.Task result)))
+            (catch Exception e
+              (binding [*out* *err*]
+                (println (str "-main failed: " (test-runner/error-text e)))))))))
+    (println (str "Reloading changes in " (str/join ", " dirs) " (Ctrl-C to stop)"))
+    (test-runner/watch-changes
+      dirs
+      (fn [{:keys [changed reloaded error]}]
+        (if error
+          (binding [*out* *err*] (println error))
+          (println (str "Reloaded " (str/join " " reloaded)
+                        (when (empty? reloaded)
+                          (str " nothing (" (str/join " " (map #(Path/GetFileName ^String %) changed)) ")")))))))))
 
 (defn run-tests
   "Run the tests selected by args (namespaces and ns/name; all when empty)
@@ -43,7 +81,7 @@
     (Environment/Exit (test-runner/exit-code summary))))
 
 (defn- split-dirs [dirs]
-  (remove str/blank? (map #(.Trim ^String %) (.Split (or dirs "src") (char-array "|")))))
+  (remove str/blank? (map #(.Trim ^String %) (.Split (or dirs "src") (char-array "|;")))))
 
 (defn- root-cause [^Exception e]
   (loop [e e]
@@ -67,7 +105,7 @@
   "Pipe-separated directories, made absolute against the current directory;
    blanks and missing directories are dropped."
   [dirs]
-  (->> (.Split (or dirs "") (char-array "|") StringSplitOptions/RemoveEmptyEntries)
+  (->> (.Split (or dirs "") (char-array "|;") StringSplitOptions/RemoveEmptyEntries)
        (map #(.Trim ^String %))
        (remove empty?)
        (map #(Path/GetFullPath (Path/Combine (Environment/CurrentDirectory) %)))
@@ -120,22 +158,26 @@
 ;; ── Compilation ──────────────────────────────────────────────────
 
 (defn- compile-one!
-  "Compiles one namespace into compile-path. Returns true on success; failures
-   are reported on stderr and any partially written assembly is removed."
-  [ns-sym compile-path]
-  (try
-    (binding [*compile-path* compile-path
-              *compile-files* true]
-      (compile ns-sym))
-    true
-    (catch Exception e
-      (warn "  Error compiling " ns-sym ": " (.Message (root-cause e)))
-      (let [stem (-> (str ns-sym) (.Replace \- \_))]
-        (doseq [ext source-extensions
-                :let [dll (Path/Combine compile-path (str stem ext ".dll"))]
-                :when (File/Exists dll)]
-          (delete-with-pdb! dll)))
-      false)))
+  "Compiles one namespace into compile-path. Returns true on success. A
+   failure is reported as a canonical MSBuild diagnostic (see
+   clojure.msbuild.diagnostics) of the given severity, located at the
+   compiler error, and any partially written assembly is removed."
+  ([ns-sym compile-path] (compile-one! ns-sym compile-path :error))
+  ([ns-sym compile-path severity]
+   (try
+     (binding [*compile-path* compile-path
+               *compile-files* true]
+       (compile ns-sym))
+     true
+     (catch Exception e
+       (diag/report-exception! severity (if (= severity :error) :compile :library)
+                               (str "compiling " ns-sym) e)
+       (let [stem (-> (str ns-sym) (.Replace \- \_))]
+         (doseq [ext source-extensions
+                 :let [dll (Path/Combine compile-path (str stem ext ".dll"))]
+                 :when (File/Exists dll)]
+           (delete-with-pdb! dll)))
+       false))))
 
 (defn- split-namespaces [namespaces]
   (->> (.Split (or namespaces "") (char-array ";") StringSplitOptions/RemoveEmptyEntries)
@@ -183,7 +225,7 @@
   (let [started DateTime/UtcNow
         compile-path (Path/GetFullPath compile-path)
         project-dirs (parse-dirs project-dirs)
-        test-dir (Path/GetFullPath (Path/Combine (Environment/CurrentDirectory) "test"))
+        test-dir (test-runner/test-dir)
         _ (Directory/CreateDirectory compile-path)
         {:keys [entries fresh]} (incremental/prepare! (remove #{test-dir} project-dirs) compile-path)
         failures (compile-namespaces namespaces compile-path)]
@@ -312,7 +354,7 @@
         failures (atom [])
         compile! (fn [ns-sym]
                    (println (str "  Compiling " ns-sym "..."))
-                   (when-not (compile-one! ns-sym lib-dir)
+                   (when-not (compile-one! ns-sym lib-dir :warning)
                      (swap! failures conj ns-sym)))
         dlls #(set (Directory/GetFiles lib-dir "*.dll"))]
     (println (str "Compiling the Clojure library layer to: " lib-dir))
@@ -392,26 +434,33 @@
 
 ;; ── Entry point (--clj-mode dispatch) ────────────────────────────
 
+(defn- source-dirs-of [{:keys [source-dir extra-source-dirs]}]
+  (str (or (not-empty source-dir) "src") "|" extra-source-dirs))
+
 (defn -main
-  "Dispatch based on --clj-mode argument. Called by the generated entry point
-   when the project is invoked with --clj-mode instead of normal app startup."
-  [& args]
+  "Dispatch based on --clj-mode argument. Called by clojure.msbuild.bootstrap
+   with the project's config map (see bootstrap/run) and the arguments after
+   --clj-mode."
+  [config & args]
   (let [args-vec (vec args)
         mode (first args-vec)
         rest-args (rest args-vec)]
     (case mode
       "repl"           (run-repl)
-      "nrepl"          (run-nrepl (first rest-args))
-      "script"         (run-script (first rest-args))
+      "nrepl"          (run-nrepl (first rest-args) (or (second rest-args) (:nrepl-middleware config)))
+      "script"         (apply run-script rest-args)
       "test"           (run-tests rest-args)
       "test-namespace" (run-tests (take 1 rest-args))
       "test-vars"      (run-tests rest-args)
-      "test-watch"     (test-runner/watch (split-dirs (first rest-args)))
+      "test-watch"     (test-runner/watch (split-dirs (or (first rest-args) (source-dirs-of config))))
+      "dev"            (run-dev (:main-ns config) (split-dirs (source-dirs-of config))
+                                (or (not-empty (first rest-args)) (when (:nrepl-in-app config) (:nrepl-port config)))
+                                (:nrepl-middleware config) (rest rest-args))
       "build"          (let [[namespaces compile-path lib-dir project-dirs] rest-args]
                          (build namespaces compile-path lib-dir project-dirs))
       "build-libs"     (let [[lib-dir main-ns project-dirs shared-dir crossgen clojure-dll] rest-args]
                          (build-libs lib-dir main-ns project-dirs shared-dir crossgen clojure-dll))
       "compile"        (compile-namespaces (first rest-args) (second rest-args))
       (do (println (str "Unknown mode: " mode))
-          (println "Valid modes: repl, nrepl, script, test, test-watch, test-namespace, test-vars, build, build-libs, compile")
+          (println "Valid modes: repl, nrepl, script, test, test-watch, test-namespace, test-vars, dev, build, build-libs, compile")
           (Environment/Exit 1)))))

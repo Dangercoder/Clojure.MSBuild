@@ -43,17 +43,42 @@
     (when (seq new)
       (set-load-path! (into current new)))))
 
-(defn- setup-load-path! [{:keys [source-dir extra-source-dirs msbuild-source-dir]}]
-  (let [source-dir (or (not-empty source-dir) "src")
-        cwd (Environment/CurrentDirectory)
-        extras (when-not (str/blank? extra-source-dirs)
-                 (map #(Path/Combine cwd (str/trim %))
-                      (.Split extra-source-dirs (char-array "|") StringSplitOptions/RemoveEmptyEntries)))]
+(defn- split-dirs
+  "Directories separated by | or ; (blanks dropped)."
+  [s]
+  (when-not (str/blank? s)
+    (->> (.Split ^String s (char-array "|;") StringSplitOptions/RemoveEmptyEntries)
+         (map str/trim)
+         (remove str/blank?))))
+
+(defn- source-dirs [{:keys [source-dir extra-source-dirs]}]
+  (cons (or (not-empty source-dir) "src") (split-dirs extra-source-dirs)))
+
+(defn- setup-tooling-load-path!
+  "Tooling (build, tests, REPL) works from the project's sources: the
+   source directories under the project directory (the current directory)
+   and the Clojure.MSBuild namespaces."
+  [{:keys [msbuild-source-dir] :as config}]
+  (let [cwd (Environment/CurrentDirectory)
+        dirs (source-dirs config)]
     (add-to-load-path!
-      (concat [(Path/Combine (base-directory) source-dir)
-               (Path/Combine cwd source-dir)]
-              extras
+      (concat (map #(Path/Combine cwd %) dirs)
+              (map #(Path/Combine (base-directory) %) dirs)
               [msbuild-source-dir]))))
+
+(defn- setup-app-load-path!
+  "The compiled application loads its namespaces from the assemblies next
+   to it. Only source directories copied next to it (Content items) are on
+   the load path, so that `require :reload` from a REPL can find them. A
+   source directory under the current directory is deliberately not added:
+   RT.load prefers a source file that is newer than its assembly, so an
+   application started from a directory with a src/ folder could otherwise
+   run that code instead of its own. With dev? (the in-app nREPL is on)
+   the project's sources are added as for tooling, to reload edited files."
+  [config dev?]
+  (if dev?
+    (setup-tooling-load-path! config)
+    (add-to-load-path! (map #(Path/Combine (base-directory) %) (source-dirs config)))))
 
 ;; ── Assemblies ───────────────────────────────────────────────────
 
@@ -76,22 +101,63 @@
 
 ;; ── Git deps ─────────────────────────────────────────────────────
 
-(defn- resolve-git-deps! [{:keys [git-deps]}]
+(defn- fail!
+  "Reports a canonical MSBuild error (see clojure.msbuild.diagnostics) and
+   exits: the tooling cannot work without what failed."
+  [kind ^String text]
+  (binding [*out* *err*]
+    (println (str "Clojure.MSBuild : error " (case kind :git-deps "CLJ0002" :config "CLJ0003" "CLJ0000")
+                  ": " (first (str/split-lines text))))
+    (doseq [line (rest (str/split-lines text))]
+      (println (str "  " line)))
+    (flush))
+  (Environment/Exit 1))
+
+(defn- resolve-git-deps!
+  "Resolves the ClojureGitDep items and deps-clr.edn/deps.edn (with the
+   ClojureDepsAliases) and puts their source paths on the load path. A
+   dependency that cannot be resolved stops the process with an error."
+  [{:keys [git-deps deps-aliases]}]
   (let [cwd (Environment/CurrentDirectory)
         has-csproj-deps (seq (:deps git-deps))
         has-deps-file (or (File/Exists (Path/Combine cwd "deps-clr.edn"))
                           (File/Exists (Path/Combine cwd "deps.edn")))]
     (when (or has-csproj-deps has-deps-file)
-      (try
-        (require 'clojure.msbuild.gitlibs)
-        (let [from-map (resolve 'clojure.msbuild.gitlibs/resolve-deps-from-map!)
-              from-file (resolve 'clojure.msbuild.gitlibs/resolve-deps!)
-              paths (concat (when has-csproj-deps (from-map git-deps))
-                            (when has-deps-file (from-file cwd)))]
-          (add-to-load-path! paths))
-        (catch Exception e
-          (binding [*out* *err*]
-            (println (str "Warning: git deps resolution failed: " (.Message e)))))))))
+      (require 'clojure.msbuild.gitlibs)
+      (let [resolve-project! (resolve 'clojure.msbuild.gitlibs/resolve-project!)
+            paths (try (resolve-project! cwd git-deps (split-dirs deps-aliases))
+                       (catch Exception e
+                         (fail! :git-deps (.Message e))))]
+        (add-to-load-path! paths)))))
+
+;; ── Settings for the tooling ─────────────────────────────────────
+
+(defn- export-settings!
+  "Settings the tooling reads from the environment (so that `dotnet run --
+   --clj-mode ...` and the test adapter's processes see them too). A value
+   already in the environment wins."
+  [{:keys [test-dir test-suffix]}]
+  (doseq [[k v] [["CLOJURE_MSBUILD_TEST_DIR" test-dir]
+                 ["CLOJURE_MSBUILD_TEST_SUFFIX" test-suffix]]
+          :when (and (not (str/blank? v))
+                     (str/blank? (Environment/GetEnvironmentVariable k)))]
+    (Environment/SetEnvironmentVariable k v)))
+
+;; ── In-app nREPL ─────────────────────────────────────────────────
+
+(defn- in-app-nrepl
+  "The port of the in-app nREPL server (ClojureNReplInApp), or nil when it
+   is off. CLOJURE_MSBUILD_NREPL in the environment overrides the build:
+   false/off/0 turns it off, true/on turns it on, a number picks the port."
+  [{:keys [nrepl-in-app nrepl-port]}]
+  (let [env (some-> (Environment/GetEnvironmentVariable "CLOJURE_MSBUILD_NREPL") str/trim str/lower-case)
+        port (or (not-empty (str nrepl-port)) "1667")]
+    (cond
+      (#{"false" "off" "no" "0"} env) nil
+      (#{"true" "on" "yes"} env) port
+      (and env (re-matches #"\d+" env)) env
+      (true? nrepl-in-app) port
+      :else nil)))
 
 ;; ── clojure.core ─────────────────────────────────────────────────
 
@@ -110,9 +176,16 @@
   "Start the process. `config` is the map generated by the build:
      :main-ns            symbol of the namespace whose -main to run
      :source-dir         Clojure source directory (relative)
-     :extra-source-dirs  pipe-separated extra source directories
+     :extra-source-dirs  extra source directories, separated by | or ;
      :msbuild-source-dir directory containing the Clojure.MSBuild namespaces
      :git-deps           {:deps {lib {:git/tag .. :git/sha .. :git/url ..}}}
+     :deps-aliases       deps.edn aliases whose :extra-deps/:extra-paths to use
+     :test-dir           the test directory (relative), \"test\" by default
+     :test-suffix        suffix of test file names, \"_test\" by default
+     :preload-assemblies false to not load every assembly next to the app
+     :nrepl-in-app       true to start an nREPL server inside the app
+     :nrepl-port         its port
+     :nrepl-middleware   extra nREPL middleware (qualified var symbols)
 
    If the first argument is --clj-mode, the remaining arguments are handed
    to clojure.msbuild.tool (repl, nrepl, script, test, build, ...).
@@ -120,20 +193,33 @@
    the arguments. The return value is returned so the caller can await a
    Task result."
   [config args]
-  (let [args (vec args)]
+  (let [args (vec args)
+        tooling? (= "--clj-mode" (first args))
+        nrepl-port (when-not tooling? (in-app-nrepl config))]
     (mark-core-loaded!)
-    (setup-load-path! config)
-    (preload-assemblies!)
-    (if (= "--clj-mode" (first args))
+    (export-settings! config)
+    (if tooling?
+      (setup-tooling-load-path! config)
+      (setup-app-load-path! config (some? nrepl-port)))
+    ;; Tooling needs every assembly (it loads the project's NuGet libraries
+    ;; from source); an application can opt out and load what it uses.
+    (when (or tooling? (not (false? (:preload-assemblies config))))
+      (preload-assemblies!))
+    (if tooling?
       (do
         ;; Tooling (REPL, tests, build) works from source, so it needs git deps
         ;; on the load path. The compiled application already contains them.
         (resolve-git-deps! config)
         (require 'clojure.msbuild.tool)
-        (apply (resolve 'clojure.msbuild.tool/-main) (rest args)))
+        (binding [*command-line-args* (seq (drop 2 args))]
+          (apply (resolve 'clojure.msbuild.tool/-main) config (rest args))))
       (let [main-ns (symbol (str (:main-ns config)))]
+        (when nrepl-port
+          (require 'clojure.msbuild.nrepl)
+          ((resolve 'clojure.msbuild.nrepl/start-in-app!) nrepl-port (:nrepl-middleware config)))
         (require main-ns)
         (let [main-fn (ns-resolve main-ns '-main)]
           (when-not main-fn
             (throw (Exception. (str "Namespace " main-ns " has no -main function"))))
-          (apply main-fn args))))))
+          (binding [*command-line-args* (seq args)]
+            (apply main-fn args)))))))

@@ -1,0 +1,16 @@
+(ns clojure.msbuild.test-runner-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.msbuild.test-runner :as runner]
+            [clojure.msbuild.nrepl :as nrepl]))
+
+(deftest test-files
+  (is (runner/test-file? "_test" "/p/test/a/b_test.cljr"))
+  (is (runner/test-file? "_test" "b_test.cljc"))
+  (is (not (runner/test-file? "_test" "b_test.cljs")))
+  (is (not (runner/test-file? "_test" "b.cljr")))
+  (is (runner/test-file? "_spec" "b_spec.clj")))
+
+(deftest middleware-lists
+  (is (= ["a.b/c" "d/e"] (nrepl/parse-middleware "a.b/c; d/e")))
+  (is (= ["x/y"] (nrepl/parse-middleware "x/y")))
+  (is (nil? (nrepl/parse-middleware nil))))
